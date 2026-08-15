@@ -10,7 +10,17 @@ import os
 import shutil
 from pathlib import Path
 
+from . import paths
+
 IMAGE = os.environ.get("SDSS_COMPOSITOR_IMAGE", "localhost/sdss-compositor:latest")
+
+
+def x11_socket_dir() -> Path:
+    """Xwayland refuses an /tmp/.X11-unix it does not own, and the host's belongs to root."""
+    directory = paths.data_dir() / "x11"
+    directory.mkdir(parents=True, exist_ok=True)
+    directory.chmod(0o1777)
+    return directory
 
 
 def native_sway() -> str | None:
@@ -45,10 +55,13 @@ def compositor_command(config: Path, runtime_dir: Path, home: Path | None = None
         "run",
         "--rm",
         "--userns=keep-id",
+        # host networking shares the abstract socket namespace, which is how host X11
+        # clients reach the nested Xwayland.
         "--network=host",
         "--ipc=host",
         f"--volume={runtime_dir}:{runtime_dir}",
         f"--volume={home}:{home}",
+        f"--volume={x11_socket_dir()}:/tmp/.X11-unix",
         "--device=/dev/dri",
         f"--env=XDG_RUNTIME_DIR={runtime_dir}",
         f"--env=HOME={home}",

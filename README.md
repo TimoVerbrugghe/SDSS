@@ -34,11 +34,11 @@ Rejected alternatives:
 
 ## Supported emulators
 
-| System | Emulator | Second-screen mechanism |
-| --- | --- | --- |
-| Wii U | Cemu (AppImage) | `settings.xml` → `<open_pad>true</open_pad>` |
-| 3DS | Azahar (AppImage) | `qt-config.ini` → `layout_option=4` (SeparateWindows) + `secondary_display_layout=2` (BottomScreenOnly) |
-| DS | melonDS (Flatpak) | `melonDS.toml` → `Instance0.Window1.ScreenSizing` (bottom only) |
+| System | Emulator | Second-screen mechanism | Verified |
+| --- | --- | --- | --- |
+| Wii U | Cemu (AppImage) | `settings.xml` → `<open_pad>true</open_pad>`, window `GamePad View` | yes (needs Xwayland) |
+| 3DS | Azahar (AppImage) | `qt-config.ini` → `layout_option=4` + `secondary_display_layout=2`, window `… \| Secondary Window` | yes |
+| DS | melonDS (Flatpak) | `melonDS.toml` → `Instance0.Window1.ScreenSizing` | no |
 
 RetroArch DS cores are **not** supported — they render both screens into one framebuffer.
 
@@ -49,9 +49,9 @@ Early development. See [docs/PLAN.md](docs/PLAN.md) for the phased plan and
 
 | Phase | State |
 | --- | --- |
-| P0 spikes | partial — compositor, dual output and capture proven; see [docs/spikes](docs/spikes) |
+| P0 spikes | compositor, dual output, capture, and Cemu/Azahar second windows proven; see [docs/spikes](docs/spikes) |
 | P1 `sdss run` | implemented, not yet run end-to-end |
-| P2 emulator profiles | implemented, window matchers unverified |
+| P2 emulator profiles | Cemu and Azahar verified; melonDS open |
 | P3 touch bridge | not started |
 | P4 Decky plugin | not started |
 | P5 Deck helper | not started |

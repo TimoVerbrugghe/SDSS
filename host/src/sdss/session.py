@@ -49,7 +49,8 @@ class Session:
         dump = runtime / "dump-env.sh"
         dump.write_text(
             "#!/bin/sh\n"
-            f'printf "WAYLAND_DISPLAY=%s\\nSWAYSOCK=%s\\n" "$WAYLAND_DISPLAY" "$SWAYSOCK" > {env_file}\n'
+            'printf "WAYLAND_DISPLAY=%s\\nDISPLAY=%s\\nSWAYSOCK=%s\\n" '
+            f'"$WAYLAND_DISPLAY" "$DISPLAY" "$SWAYSOCK" > {env_file}\n'
         )
         dump.chmod(0o755)
 
@@ -92,9 +93,9 @@ class Session:
         self.patch_configs()
         try:
             compositor = self._start_sway(artifacts["sway_config"])
-            nested_display = self._await_nested_display(artifacts["sway_env"])
-            self._start_sunshine(nested_display)
-            emulator = self._start_emulator(nested_display)
+            nested = self._await_nested_display(artifacts["sway_env"])
+            self._start_sunshine(nested["WAYLAND_DISPLAY"])
+            emulator = self._start_emulator(nested)
             code = emulator.wait()
             log.info("emulator exited with %s — tearing down the session", code)
             if compositor.poll() is None:
@@ -103,11 +104,25 @@ class Session:
         finally:
             self.cleanup()
 
-    def _start_emulator(self, nested_display: str) -> subprocess.Popen:
+    def _start_emulator(self, nested: dict[str, str]) -> subprocess.Popen:
+        wayland_display = nested["WAYLAND_DISPLAY"]
+        x11_display = nested.get("DISPLAY") or None
+        if self.profile.needs_x11 and not x11_display:
+            raise SessionError(
+                f"{self.profile.name} needs Xwayland but the compositor reported no DISPLAY"
+            )
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR", str(paths.runtime_dir()))
-        command = launch.build_command(self.command, nested_display)
-        env = launch.build_env(dict(os.environ), nested_display, runtime_dir)
-        log.info("launching emulator on %s", nested_display)
+        command = launch.build_command(self.command, wayland_display)
+        env = launch.build_env(
+            dict(os.environ),
+            wayland_display,
+            runtime_dir,
+            x11_display=x11_display,
+            prefer_x11=self.profile.needs_x11,
+        )
+        log.info(
+            "launching emulator on %s", x11_display if self.profile.needs_x11 else wayland_display
+        )
         proc = subprocess.Popen(command, env=env)
         self._processes.append(proc)
         return proc
@@ -126,7 +141,7 @@ class Session:
         self._processes.append(proc)
         return proc
 
-    def _await_nested_display(self, env_file: Path) -> str:
+    def _await_nested_display(self, env_file: Path) -> dict[str, str]:
         env_file.unlink(missing_ok=True)
         deadline = time.monotonic() + ENV_DUMP_TIMEOUT
         while time.monotonic() < deadline:
@@ -136,10 +151,13 @@ class Session:
                     for line in env_file.read_text().splitlines()
                     if "=" in line
                 )
-                display = values.get("WAYLAND_DISPLAY")
-                if display:
-                    log.info("nested compositor is on %s", display)
-                    return display
+                if values.get("WAYLAND_DISPLAY"):
+                    log.info(
+                        "nested compositor on %s (xwayland %s)",
+                        values["WAYLAND_DISPLAY"],
+                        values.get("DISPLAY") or "none",
+                    )
+                    return values
             time.sleep(0.2)
         raise SessionError("nested compositor did not report its Wayland socket")
 

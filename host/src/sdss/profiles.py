@@ -63,6 +63,8 @@ class Profile:
     second_size: tuple[int, int] = (1280, 800)
     notes: str = ""
     verified: bool = False
+    # Cemu's AppImage GTK build cannot talk Wayland, so it needs the nested Xwayland.
+    needs_x11: bool = False
     extra_env: dict[str, str] = field(default_factory=dict)
 
 
@@ -78,10 +80,14 @@ CEMU = Profile(
             edits=(Edit(key="open_pad", value="true"),),
         ),
     ),
-    # Cemu's separate GamePad window is titled "GamePad View". UNVERIFIED (S4).
-    second_window=WindowMatch(title_regex="GamePad View"),
+    # Verified on hardware: "GamePad View - FPS: 60.10", class Cemu.
+    second_window=WindowMatch(app_id=("Cemu",), title_regex="^GamePad View"),
     second_size=(854, 480),
-    notes="Separate GamePad view renders the Wii U GamePad screen at 854x480.",
+    verified=True,
+    needs_x11=True,
+    notes="Separate GamePad view renders the Wii U GamePad screen at 854x480. The official "
+    "AppImage has no working GTK Wayland backend (cemu-project/Cemu#1809), so it runs on "
+    "the nested Xwayland.",
 )
 
 AZAHAR = Profile(
@@ -103,9 +109,12 @@ AZAHAR = Profile(
             ),
         ),
     ),
-    # UNVERIFIED (S4): Azahar's secondary render window title.
-    second_window=WindowMatch(title_regex="Secondary"),
+    # Verified on hardware: "Azahar 2126.0 | <game> | Secondary Window".
+    second_window=WindowMatch(
+        app_id=("org.azahar_emu.Azahar",), title_regex="Secondary Window$"
+    ),
     second_size=(320, 240),
+    verified=True,
     notes="Qt writes a `key\\default` marker next to every setting; it must be false or "
     "Azahar restores its own default on launch.",
 )

@@ -23,9 +23,14 @@ class TestDetection(unittest.TestCase):
 
 
 class TestWindowMatch(unittest.TestCase):
-    def test_title_only_match_produces_one_rule(self):
+    def test_verified_profiles_match_on_app_id_and_title(self):
         rules = profiles.CEMU.second_window.rules()
-        self.assertEqual(rules, ('title="GamePad View"',))
+        self.assertIn('app_id="^Cemu$" title="^GamePad View"', rules)
+        self.assertIn('class="^Cemu$" title="^GamePad View"', rules)
+
+    def test_azahar_matches_only_the_secondary_window(self):
+        rules = profiles.AZAHAR.second_window.rules()
+        self.assertTrue(all(rule.endswith('title="Secondary Window$"') for rule in rules))
 
     def test_app_id_match_covers_wayland_and_xwayland(self):
         rules = profiles.MELONDS.second_window.rules()
@@ -35,6 +40,14 @@ class TestWindowMatch(unittest.TestCase):
     def test_app_id_and_title_are_anded_so_the_main_window_is_not_matched(self):
         for rule in profiles.MELONDS.second_window.rules():
             self.assertIn("title=", rule)
+
+
+class TestX11Requirement(unittest.TestCase):
+    def test_only_cemu_needs_xwayland(self):
+        # cemu-project/Cemu#1809: the AppImage has no working GTK Wayland backend.
+        self.assertTrue(profiles.CEMU.needs_x11)
+        self.assertFalse(profiles.AZAHAR.needs_x11)
+        self.assertFalse(profiles.MELONDS.needs_x11)
 
 
 class TestSwayConfig(unittest.TestCase):
@@ -55,8 +68,13 @@ class TestSwayConfig(unittest.TestCase):
     def test_second_window_moves_to_headless_workspace(self):
         config = self.render(profiles.CEMU)
         self.assertIn(
-            'for_window [title="GamePad View"] move container to workspace second, '
-            "fullscreen enable",
+            'for_window [app_id="^Cemu$" title="^GamePad View"] move container to '
+            "workspace second, fullscreen enable",
+            config,
+        )
+        self.assertIn(
+            'for_window [class="^Cemu$" title="^GamePad View"] move container to '
+            "workspace second, fullscreen enable",
             config,
         )
 

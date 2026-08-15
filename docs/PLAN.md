@@ -55,9 +55,9 @@ window rules by `app_id`/class/title, multi-seat, and the `swaymsg` IPC.
 
 | Emulator | Install | Config | Second-screen edit |
 | --- | --- | --- | --- |
-| Cemu | `~/Applications/Cemu.AppImage` | `~/.config/Cemu/settings.xml` | `<open_pad>true</open_pad>` |
-| Azahar | `~/Applications/azahar.AppImage` | `~/.config/azahar-emu/qt-config.ini` | `[Layout] layout_option=4` (SeparateWindows), `secondary_display_layout=2` (BottomScreenOnly) |
-| melonDS | Flatpak `net.kuribo64.melonDS` | `~/.var/app/net.kuribo64.melonDS/config/melonDS/melonDS.toml` | `Instance0.Window1.ScreenSizing` = bottom-only |
+| Cemu | `~/Applications/Cemu.AppImage` | `~/.config/Cemu/settings.xml` | `<open_pad>true</open_pad>` — **verified**, window `GamePad View` (X11 only) |
+| Azahar | `~/Applications/azahar.AppImage` | `~/.config/azahar-emu/qt-config.ini` | `[Layout] layout_option=4` (SeparateWindows), `secondary_display_layout=2` (BottomScreenOnly) — **verified**, window `… | Secondary Window` |
+| melonDS | Flatpak `net.kuribo64.melonDS` | `~/.var/app/net.kuribo64.melonDS/config/melonDS/melonDS.toml` | `Instance0.Window1.ScreenSizing` = bottom-only — unverified |
 | RetroArch DS | — | — | **Not viable** — one framebuffer, no second toplevel |
 
 All config edits go through a backup journal so the user's config is restored
@@ -93,13 +93,13 @@ Results so far: [spikes/S1-compositor.md](spikes/S1-compositor.md).
 | ID | Question | State |
 | --- | --- | --- |
 | S1a | Nested wlroots compositor with two outputs | **pass** |
-| S1b | Nested sway as a client of the gamescope session | open (needs Game Mode) |
+| S1b | Nested sway as a client of the gamescope session | **blocked** — gamescope needs a connected display |
 | S2a | Headless output can be captured (wlroots screencopy) | **pass** (grim) |
 | S2b | Sunshine `capture = wlr` against `HEADLESS-1` | open |
 | S3a | Host clients render into the containerized compositor | **pass** (AppImage) |
 | S3b | Flatpak emulator renders into it | open (melonDS connects, maps no window) |
-| S3c | Cemu needs Xwayland; container Xwayland does not start yet | open |
-| S4 | Exact second-window `app_id`/title per emulator | open |
+| S3c | Xwayland inside the container (needed by Cemu) | **pass** |
+| S4 | Exact second-window `app_id`/title per emulator | **pass** for Cemu and Azahar |
 | S5 | `EVIOCGRAB` hides Sunshine virtual input from gamescope | open |
 | S6 | wlr virtual pointer bound to an output drives the headless window | open |
 | S7 | End-to-end latency and Moonlight touch mode | open |

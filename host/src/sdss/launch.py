@@ -40,11 +40,26 @@ def build_command(command: list[str], wayland_display: str) -> list[str]:
     return command[: run_at + 1] + injected + command[run_at + 1 :]
 
 
-def build_env(base: dict[str, str], wayland_display: str, runtime_dir: str) -> dict[str, str]:
+def build_env(
+    base: dict[str, str],
+    wayland_display: str,
+    runtime_dir: str,
+    *,
+    x11_display: str | None = None,
+    prefer_x11: bool = False,
+) -> dict[str, str]:
     env = dict(base)
     env["WAYLAND_DISPLAY"] = wayland_display
     env["XDG_RUNTIME_DIR"] = runtime_dir
-    # Qt would otherwise fall back to xcb and land on the desktop session instead.
+
+    if prefer_x11 and x11_display:
+        # Reached through the abstract X socket, shared with the container via host networking.
+        env["DISPLAY"] = x11_display
+        env["GDK_BACKEND"] = "x11"
+        env["QT_QPA_PLATFORM"] = "xcb"
+        return env
+
+    # Without this the toolkit falls back to xcb and lands on the desktop session instead.
     env.setdefault("QT_QPA_PLATFORM", "wayland")
     env.setdefault("GDK_BACKEND", "wayland")
     env.pop("DISPLAY", None)

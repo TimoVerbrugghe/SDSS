@@ -86,18 +86,25 @@ The device currently only has the legacy flat `melonDS.ini` (`ScreenLayout=3`,
 
 ## Open questions
 
-- S1b: does nested sway attach to `gamescope-0` as a plain Wayland client? The machine was
-  in **Desktop Mode** (Plasma/X11, `plasmashell` running, no gamescope process and no
-  `gamescope-0` socket) during the first round of spikes, so this is untested. Switch with
-  `steamos-session-select gamescope` — disruptive, so ask first.
+- S1b: does nested sway attach to `gamescope-0` as a plain Wayland client? **Blocked**:
+  gamescope refuses to start with no display connected (`HDMI-A-1` and `DP-1` both
+  disconnected) and segfaults on `cannot find any connected connector`. Connect the TV or a
+  dummy HDMI plug first. Note `steamos-session-select gamescope` *persists* the default
+  login mode, so returning to the desktop needs
+  `steamosctl set-default-login-mode desktop` as well.
 - S3b: why does the melonDS Flatpak connect to the compositor but map no window?
-- S3c: Xwayland inside the container (needed by Cemu, whose bundled GTK has no Wayland
-  backend) does not start yet.
-- S4: exact `app_id` / window titles of each emulator's second window.
 
 ## Verified during spikes
 
-- Native AppImages map into the containerized compositor with `WAYLAND_DISPLAY` alone;
-  `app_id` for Azahar is `org.azahar_emu.Azahar`, main window title `Azahar 2126.0`.
-- Cemu's AppImage GTK build has **no Wayland backend** — it needs Xwayland.
+- Native AppImages map into the containerized compositor with `WAYLAND_DISPLAY` alone.
+- **Azahar** is a native Wayland client. `app_id=org.azahar_emu.Azahar`; the second window is
+  titled `Azahar <ver> | <game> | Secondary Window`.
+- **Cemu 2.6** requires X11 (`class=Cemu`, second window `GamePad View - FPS: …`). Its
+  AppImage bundles a Wayland-capable `libgdk-3.so.0` but still fails with
+  `Unable to initialize GTK+, is DISPLAY set properly?` — see
+  [cemu-project/Cemu#1809](https://github.com/cemu-project/Cemu/issues/1809).
+- Xwayland runs in the container when it is given an X11 socket dir owned by `deck`; host
+  clients reach it over the abstract socket with `DISPLAY=:1`.
 - `melonDS.toml` now exists on the device (melonDS migrated it on a clean exit).
+- ROMs: `~/Emulation/roms/n3ds` (`.cci`), `~/Emulation/roms/nds` (`.nds`),
+  `~/Emulation/roms/wiiu/roms` (`.wua`).

@@ -51,6 +51,23 @@ class TestEnv(unittest.TestCase):
         env = launch.build_env({"QT_QPA_PLATFORM": "xcb"}, "wayland-1", "/run/user/1000")
         self.assertEqual(env["QT_QPA_PLATFORM"], "xcb")
 
+    def test_x11_clients_target_the_nested_xwayland(self):
+        env = launch.build_env(
+            {"DISPLAY": ":0"},
+            "wayland-1",
+            "/run/user/1000",
+            x11_display=":1",
+            prefer_x11=True,
+        )
+        self.assertEqual(env["DISPLAY"], ":1")
+        self.assertEqual(env["GDK_BACKEND"], "x11")
+        self.assertEqual(env["QT_QPA_PLATFORM"], "xcb")
+
+    def test_x11_preference_without_a_display_falls_back_to_wayland(self):
+        env = launch.build_env({"DISPLAY": ":0"}, "wayland-1", "/run/user/1000", prefer_x11=True)
+        self.assertNotIn("DISPLAY", env)
+        self.assertEqual(env["GDK_BACKEND"], "wayland")
+
 
 if __name__ == "__main__":
     unittest.main()
