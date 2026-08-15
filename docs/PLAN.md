@@ -39,17 +39,38 @@ window rules by `app_id`/class/title, multi-seat, and the `swaymsg` IPC.
 
 ## Touch routing
 
-1. Moonlight sends touch/pen; the SDSS Sunshine instance injects virtual uinput devices.
-2. Those devices are global, so the session gamescope would consume them and map them to
-   the TV.
-3. `sdss-inputd` watches for the SDSS Sunshine virtual devices, `EVIOCGRAB`s them
-   exclusively, normalizes coordinates, and injects into sway through
-   `zwlr_virtual_pointer_manager_v1.create_virtual_pointer_with_output` bound to
-   `HEADLESS-1` — absolute motion plus button, which every one of these emulators accepts
-   as touch/stylus.
-4. The virtual pointer is attached to a **second sway seat** so the main window keeps
-   keyboard focus. Fallback: pinned focus — gamepads are read globally through evdev, so
-   controller input is unaffected either way.
+Moonlight and Sunshine already carry input natively. While a stream is running, Sunshine
+materialises these devices on the Steam Machine (verified):
+
+```
+Mouse passthrough          Keyboard passthrough      Touch passthrough
+Mouse passthrough (absolute)   Pen passthrough       Sunshine X-Box One (virtual) pad
+```
+
+So SDSS writes no networking and no input protocol. Two categories fall out of that:
+
+- **Gamepad and keyboard need nothing.** Emulators read gamepads through evdev globally, so
+  the Deck can act as an extra controller with zero SDSS code.
+- **Touch and stylus need a bridge**, for two reasons:
+  1. *Ownership.* Those devices belong to the host seat. The nested compositor reports
+     **0 input devices** (`swaymsg -t get_inputs`), because it runs on the wayland/headless
+     backends and never opens libinput. In the gamescope session the events go to gamescope,
+     which forwards them to its focused surface — sway's **TV** output. The headless output
+     can never receive them.
+  2. *Coordinate space.* The absolute devices are normalised across the whole output layout
+     (TV `1920x1080` at `0,0` plus the second screen `1280x800` at `1920,0`). A tap at the
+     top-left of the Deck would land at the top-left of the TV.
+
+`sdss-inputd` therefore has a narrow job: take `Touch passthrough` (and the absolute mouse),
+`EVIOCGRAB` it so gamescope cannot also act on it, rescale onto the second output, and inject
+through `zwlr_virtual_pointer_manager_v1.create_virtual_pointer_with_output` bound to
+`HEADLESS-1`. Every emulator here accepts an absolute pointer as touch/stylus.
+
+`/dev/uinput` already carries an ACL granting `user:deck:rw`, so no root and no udev rule.
+
+Rejected alternative: sway's own `input <id> map_to_output HEADLESS-1` would do the mapping
+for free, but only for devices sway owns through a libinput backend. Adding libinput to a
+nested sway would make it open *every* device and fight gamescope for them.
 
 ## Emulator profiles
 
