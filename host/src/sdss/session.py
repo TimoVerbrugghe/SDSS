@@ -166,9 +166,20 @@ class Session:
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR", str(paths.runtime_dir()))
         command = stream.launch_command(spec, nested_display, runtime_dir)
         log.info("starting Sunshine on port %s", spec.port)
-        proc = subprocess.Popen(command)
+        proc = subprocess.Popen(command, stdin=self._pin_fifo())
         self._processes.append(proc)
         return proc
+
+    def _pin_fifo(self) -> int:
+        """FIFO Sunshine reads pairing PINs from, so pairing needs no web UI.
+
+        Opened read-write so it has a permanent writer and never returns EOF.
+        """
+        path = paths.ensure(self.runtime) / "pin"
+        if path.exists():
+            path.unlink()
+        os.mkfifo(path, 0o600)
+        return os.open(path, os.O_RDWR | os.O_NONBLOCK)
 
     def cleanup(self) -> None:
         for proc in reversed(self._processes):

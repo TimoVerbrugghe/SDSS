@@ -13,7 +13,9 @@ from .compositor import HEADLESS_OUTPUT
 
 APP_NAME = "Second Screen"
 FLATPAK_ID = "dev.lizardbyte.app.Sunshine"
-DEFAULT_PORT = 47999
+# Moonlight's CLI takes only a host, with no way to address a custom port, so SDSS owns the
+# default port on the Steam Machine rather than running alongside another Sunshine.
+DEFAULT_PORT = 47989
 
 
 @dataclass(frozen=True)
@@ -65,15 +67,22 @@ def write_config(spec: SunshineSpec) -> Path:
 
 
 def launch_command(spec: SunshineSpec, wayland_display: str, runtime_dir: str) -> list[str]:
-    """Flatpak Sunshine, pointed at the nested sway socket instead of the gamescope one."""
+    """Flatpak Sunshine, pointed at the nested sway socket instead of the gamescope one.
+
+    `--socket=wayland` alone binds the wrong display name, so the socket is exposed
+    explicitly. `-0` makes Sunshine read a pairing PIN from stdin, which is what lets the
+    Deck pair without anyone touching the web UI.
+    """
     return [
         "flatpak",
         "run",
+        "--socket=wayland",
+        f"--filesystem=xdg-run/{wayland_display}",
         f"--env=WAYLAND_DISPLAY={wayland_display}",
         f"--env=XDG_RUNTIME_DIR={runtime_dir}",
-        f"--filesystem={runtime_dir}",
         f"--filesystem={spec.config_dir}",
         "--device=all",
         FLATPAK_ID,
         str(spec.config_dir / "sunshine.conf"),
+        "-0",
     ]

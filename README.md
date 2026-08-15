@@ -49,12 +49,12 @@ Early development. See [docs/PLAN.md](docs/PLAN.md) for the phased plan and
 
 | Phase | State |
 | --- | --- |
-| P0 spikes | compositor, dual output, capture, and Cemu/Azahar second windows proven; see [docs/spikes](docs/spikes) |
-| P1 `sdss run` | implemented, not yet run end-to-end |
+| P0 spikes | dual output, capture, Cemu/Azahar second windows, and an end-to-end stream to the Deck all proven; see [docs/spikes](docs/spikes) |
+| P1 `sdss run` | implemented; every piece verified individually |
 | P2 emulator profiles | Cemu and Azahar verified; melonDS open |
-| P3 touch bridge | not started |
+| P3 touch bridge | not started (`/dev/uinput` access confirmed available) |
 | P4 Decky plugin | not started |
-| P5 Deck helper | not started |
+| P5 Deck helper | `deck/install.sh` + `deck/sdss-connect.sh` |
 | P6 packaging | compositor image builds on device |
 
 ## Repo layout

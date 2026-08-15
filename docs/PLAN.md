@@ -95,14 +95,17 @@ Results so far: [spikes/S1-compositor.md](spikes/S1-compositor.md).
 | S1a | Nested wlroots compositor with two outputs | **pass** |
 | S1b | Nested sway as a client of the gamescope session | **blocked** — gamescope needs a connected display |
 | S2a | Headless output can be captured (wlroots screencopy) | **pass** (grim) |
-| S2b | Sunshine `capture = wlr` against `HEADLESS-1` | open |
+| S2b | Sunshine `capture = wlr` against `HEADLESS-1` | **pass** (VA-API hardware encode) |
 | S3a | Host clients render into the containerized compositor | **pass** (AppImage) |
 | S3b | Flatpak emulator renders into it | open (melonDS connects, maps no window) |
 | S3c | Xwayland inside the container (needed by Cemu) | **pass** |
 | S4 | Exact second-window `app_id`/title per emulator | **pass** for Cemu and Azahar |
 | S5 | `EVIOCGRAB` hides Sunshine virtual input from gamescope | open |
 | S6 | wlr virtual pointer bound to an output drives the headless window | open |
-| S7 | End-to-end latency and Moonlight touch mode | open |
+| S7 | End-to-end stream to the Deck, and Moonlight touch mode | **pass** for streaming; touch mode open |
+
+`/dev/uinput` on the Steam Machine already carries an ACL granting `user:deck:rw`, so the
+touch bridge will not need root or a udev rule.
 
 The compositor is delivered as a **container image** built with the podman that SteamOS
 already ships (`runtime/`), so nothing is installed outside `$HOME`. Because sway runs in a
