@@ -1,0 +1,30 @@
+# Nested dual-output compositor for SDSS.
+#
+# SteamOS has no sway and a read-only rootfs, so the compositor ships as a container image.
+# It runs nested: it connects to the gamescope session's Wayland socket and renders through
+# the host GPU via /dev/dri. Emulators keep running on the host and connect to the sway
+# socket that appears in the shared XDG_RUNTIME_DIR.
+FROM docker.io/library/archlinux:base
+
+RUN pacman -Sy --noconfirm --needed \
+        sway \
+        xorg-xwayland \
+        mesa \
+        vulkan-radeon \
+        libva-mesa-driver \
+        wayland \
+        seatd \
+        grim \
+        foot \
+        wayland-utils \
+    && pacman -Scc --noconfirm \
+    # rootless podman refuses to exec a file with capabilities; sway only wants
+    # cap_sys_nice for realtime scheduling, which a nested compositor does not need.
+    && setcap -r /usr/bin/sway
+
+# wlroots needs a writable runtime dir even when it only draws into the parent compositor.
+ENV XDG_RUNTIME_DIR=/run/user/1000 \
+    WLR_BACKENDS=wayland,headless \
+    WLR_NO_HARDWARE_CURSORS=1
+
+ENTRYPOINT ["/usr/bin/sway"]

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sdss"
+version = "0.1.0"
+description = "Steam Deck Second Screen — second-screen streaming for DS/3DS/Wii U emulation on SteamOS"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+input = ["evdev>=1.6", "pywayland>=0.4.17"]
+
+[project.scripts]
+sdss = "sdss.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
