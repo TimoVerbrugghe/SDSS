@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1340 320" width="1340" height="320" role="img" aria-label="SDSS — Steam Deck Second Screen">
+  <defs>
+    <linearGradient id="w-tv" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b6ec2"/>
+      <stop offset="1" stop-color="#0d3f75"/>
+    </linearGradient>
+    <linearGradient id="w-deck" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2fb8a8"/>
+      <stop offset="1" stop-color="#12786e"/>
+    </linearGradient>
+  </defs>
+
+  <g transform="translate(20,8) scale(0.6)">
+    <!-- TV: the main screen, on the Steam Machine -->
+    <g stroke="#c8d2dd" stroke-width="12" stroke-linejoin="round" stroke-linecap="round" fill="none">
+      <rect x="58" y="16" width="396" height="238" rx="20" fill="#2b3440"/>
+      <rect x="82" y="40" width="348" height="190" rx="8" fill="url(#w-tv)" stroke="none"/>
+      <path d="M256 254v30"/>
+      <path d="M198 288h116"/>
+    </g>
+
+    <!-- Steam Deck: the second screen, in the foreground -->
+    <g>
+      <!-- body: one wide rounded slab -->
+      <rect x="40" y="320" width="432" height="176" rx="46"
+            fill="#2b3440" stroke="#c8d2dd" stroke-width="12"/>
+
+      <!-- the second screen dominates the centre -->
+      <rect x="152" y="336" width="208" height="144" rx="8"
+            fill="url(#w-deck)" stroke="#c8d2dd" stroke-width="10"/>
+
+      <!-- left panel: D-pad, thumbstick, trackpad -->
+      <g fill="#c8d2dd">
+        <rect x="60" y="355" width="34" height="11" rx="4"/>
+        <rect x="71" y="344" width="11" height="34" rx="4"/>
+      </g>
+      <circle cx="124" cy="368" r="17" fill="none" stroke="#c8d2dd" stroke-width="9"/>
+      <rect x="76" y="404" width="48" height="44" rx="12" fill="none" stroke="#c8d2dd" stroke-width="9"/>
+
+      <!-- right panel: thumbstick, ABXY, trackpad (mirrors the left) -->
+      <circle cx="388" cy="368" r="17" fill="none" stroke="#c8d2dd" stroke-width="9"/>
+      <g fill="#c8d2dd">
+        <circle cx="433" cy="345" r="7"/>
+        <circle cx="449" cy="361" r="7"/>
+        <circle cx="417" cy="361" r="7"/>
+        <circle cx="433" cy="377" r="7"/>
+      </g>
+      <rect x="388" y="404" width="48" height="44" rx="12" fill="none" stroke="#c8d2dd" stroke-width="9"/>
+
+      <!-- stylus touch on the second screen -->
+      <circle cx="256" cy="408" r="13" fill="#ffffff" fill-opacity="0.9"/>
+      <circle cx="256" cy="408" r="25" fill="none" stroke="#ffffff" stroke-opacity="0.55" stroke-width="6"/>
+    </g>
+  </g>
+
+  <g font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif" fill="#c8d2dd">
+    <text x="360" y="160" font-size="130" font-weight="700" letter-spacing="6">SDSS</text>
+    <text x="366" y="218" font-size="40" fill="#2fb8a8" letter-spacing="2">Steam Deck Second Screen</text>
+  </g>
+</svg>

@@ -1,7 +1,11 @@
-# SDSS — Steam Deck Second Screen
+<p align="center">
+  <img src="assets/logo-wide.svg" alt="SDSS — Steam Deck Second Screen" width="620">
+</p>
 
-Use a **Steam Deck as the second screen** for DS / 3DS / Wii U emulation running on a
-**Steam Machine** (SteamOS, gamescope session).
+<p align="center">
+  Use a <b>Steam Deck as the second screen</b> for DS / 3DS / Wii U emulation running on a
+  <b>Steam Machine</b> (SteamOS, gamescope session).
+</p>
 
 The TV shows the main screen. The Deck shows the DS bottom screen / 3DS bottom screen /
 Wii U GamePad — and its touchscreen acts as the stylus.
@@ -66,6 +70,7 @@ deck/       Steam Deck side helper (Moonlight auto-connect)
 runtime/    Build recipes for the bundled sway/wlroots compositor
 packaging/  Install scripts and systemd user units
 docs/       Plan, architecture, spike results
+assets/     Logo and other artwork
 ```
 
 ## Install
