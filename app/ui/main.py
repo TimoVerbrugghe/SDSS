@@ -128,18 +128,18 @@ class Dashboard(QWidget):
     def __init__(self, window: "MainWindow") -> None:
         super().__init__()
         self.window = window
-        self.layout = QVBoxLayout(self)
+        self._layout = QVBoxLayout(self)
         self.summary = QLabel()
         self.summary.setTextFormat(Qt.TextFormat.RichText)
-        self.layout.addWidget(self.summary)
+        self._layout.addWidget(self.summary)
 
         self.health = QGroupBox("Health")
         self.health_layout = QVBoxLayout(self.health)
-        self.layout.addWidget(self.health)
+        self._layout.addWidget(self.health)
 
         self.emulators = QGroupBox("Second screen")
         self.emulators_layout = QVBoxLayout(self.emulators)
-        self.layout.addWidget(self.emulators)
+        self._layout.addWidget(self.emulators)
 
         buttons = QHBoxLayout()
         for text, slot in (
@@ -152,8 +152,8 @@ class Dashboard(QWidget):
             button = QPushButton(text)
             button.clicked.connect(slot)
             buttons.addWidget(button)
-        self.layout.addLayout(buttons)
-        self.layout.addStretch(1)
+        self._layout.addLayout(buttons)
+        self._layout.addStretch(1)
 
     @staticmethod
     def _clear(layout) -> None:
