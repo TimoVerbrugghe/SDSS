@@ -190,7 +190,7 @@ class Bridge:
         self._devices: dict[str, object] = {}
         self._states: dict[str, dict] = {}
         self._unopenable: set[str] = set()
-        self._identities: dict[str, tuple[int, int] | None] = {}
+        self._identities: dict[str, tuple[int, int, int] | None] = {}
         # Nodes we looked at and did not want, keyed by identity so a rescan does not
         # reopen every /dev/input node on every pass through the event loop.
         self._ignored: dict[str, tuple[int, int] | None] = {}
@@ -294,13 +294,13 @@ class Bridge:
             self._states[path] = self._fresh_state()
 
     @staticmethod
-    def _identity(path: str) -> tuple[int, int] | None:
-        """(device number, inode) for `path`, so a recreated node is recognised as new."""
+    def _identity(path: str) -> tuple[int, int, int] | None:
+        """Return identity fields that distinguish a recreated device node."""
         try:
             info = os.stat(path)
         except OSError:
             return None
-        return info.st_rdev, info.st_ino
+        return info.st_rdev, info.st_ino, info.st_ctime_ns
 
     def _release(self, path: str) -> None:
         """Let go of a contact held by `path` so sway is never left with a latched button."""
