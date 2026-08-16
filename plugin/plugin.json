@@ -1,0 +1,10 @@
+{
+  "name": "SDSS",
+  "author": "SDSS contributors",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["emulation", "streaming"],
+    "description": "Controls Steam Deck Second Screen on the Steam Machine."
+  }
+}

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -87,6 +88,13 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _write_atomic(path: Path, data: bytes) -> None:
+    """Write `data` to `path` via temp file + rename so a kill mid-write can't corrupt it."""
+    tmp = path.with_name(f".{path.name}.sdss-tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
 class Journal:
     """Records original file contents so a session can be undone exactly."""
 
@@ -102,10 +110,25 @@ class Journal:
     def _load(self) -> list[dict]:
         if not self.exists:
             return []
-        return json.loads(self.manifest.read_text())
+        try:
+            entries = json.loads(self.manifest.read_text())
+        except (json.JSONDecodeError, OSError) as exc:
+            # A kill mid-write (SteamOS SIGKILLs the whole session on logout) can leave the
+            # manifest truncated. Treating that as "nothing recorded" would be worse than
+            # failing: `restore` would report success having restored nothing, then
+            # `discard` would delete the backup files that are still perfectly intact.
+            raise PatchError(
+                f"backup manifest {self.manifest} is unreadable ({exc}); "
+                f"the backups in {self.files} are untouched — recover them by hand, "
+                f"then remove {self.dir}"
+            ) from exc
+        if not isinstance(entries, list):
+            raise PatchError(f"backup manifest {self.manifest} is not a list of entries")
+        return entries
 
     def _save(self, entries: list[dict]) -> None:
-        self.manifest.write_text(json.dumps(entries, indent=2))
+        self.dir.mkdir(parents=True, exist_ok=True)
+        _write_atomic(self.manifest, json.dumps(entries, indent=2).encode())
 
     def record(self, path: Path) -> None:
         """Snapshot `path` before it is modified. Recording twice keeps the first snapshot."""
@@ -116,7 +139,10 @@ class Journal:
         entry: dict = {"path": str(path), "existed": path.is_file()}
         if entry["existed"]:
             data = path.read_bytes()
-            backup = self.files / f"{len(entries):03d}-{path.name}"
+            # Named from the path, not the entry count: a count-derived name collides with
+            # an existing backup whenever entries are ever re-numbered, silently
+            # overwriting the only copy of an earlier file.
+            backup = self.files / f"{_digest(str(path).encode())[:16]}-{path.name}"
             backup.write_bytes(data)
             entry["backup"] = backup.name
             entry["sha256"] = _digest(data)
@@ -129,7 +155,18 @@ class Journal:
             path = Path(entry["path"])
             if entry["existed"]:
                 backup = self.files / entry["backup"]
-                shutil.copyfile(backup, path)
+                try:
+                    data = backup.read_bytes()
+                except FileNotFoundError as exc:
+                    raise PatchError(
+                        f"backup for {path} is missing (expected at {backup}) — refusing to restore"
+                    ) from exc
+                expected = entry.get("sha256")
+                if expected is not None and _digest(data) != expected:
+                    raise PatchError(
+                        f"backup for {path} is corrupted (sha256 mismatch) — refusing to restore"
+                    )
+                _write_atomic(path, data)
             elif path.exists():
                 path.unlink()
             restored.append(path)
@@ -150,5 +187,7 @@ def patch_file(path: Path, fmt: str, edits: tuple[Edit, ...], journal: Journal) 
     journal.record(path)
     if patched == original:
         return False
-    path.write_text(patched)
+    # Atomic for the same reason `restore` is: SteamOS SIGKILLs the whole session on
+    # logout, and a truncated emulator config is exactly what the journal exists to avoid.
+    _write_atomic(path, patched.encode())
     return True

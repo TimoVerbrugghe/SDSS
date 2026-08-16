@@ -1,6 +1,6 @@
 # S2 / S7 — Sunshine capture and end-to-end streaming to the Deck
 
-Run: 2026-08-15, Steam Machine (10.10.10.161) headless + Steam Deck (10.10.10.199).
+Run: 2026-08-15, Steam Machine (<steam-machine>) headless + Steam Deck (<deck>).
 No display was attached to the Steam Machine for any of this.
 
 ## Verdict
@@ -38,7 +38,7 @@ are needed. `sdss` gives Sunshine a FIFO as stdin (`$XDG_RUNTIME_DIR/sdss/sessio
 
 ```
 # Deck
-moonlight pair 10.10.10.161 --pin 1234
+moonlight pair <steam-machine> --pin 1234
 # Steam Machine
 echo 1234 > $XDG_RUNTIME_DIR/sdss/session/pin
 ```
@@ -46,7 +46,7 @@ echo 1234 > $XDG_RUNTIME_DIR/sdss/session/pin
 Afterwards the Deck lists the host's apps:
 
 ```
-$ moonlight list 10.10.10.161
+$ moonlight list <steam-machine>
 Second Screen
 ```
 

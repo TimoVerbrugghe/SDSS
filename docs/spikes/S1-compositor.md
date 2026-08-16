@@ -1,6 +1,6 @@
 # S1–S4 — nested compositor, host clients, capture
 
-Run: 2026-08-15, against the Steam Machine (10.10.10.161) in **Desktop Mode**
+Run: 2026-08-15, against the Steam Machine (<steam-machine>) in **Desktop Mode**
 (Plasma/X11 — the gamescope session was not running, see "Not yet verified").
 
 ## Verdict

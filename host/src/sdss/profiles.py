@@ -66,6 +66,12 @@ class Profile:
     # Cemu's AppImage GTK build cannot talk Wayland, so it needs the nested Xwayland.
     needs_x11: bool = False
     extra_env: dict[str, str] = field(default_factory=dict)
+    # Path EmuDeck's own launcher script execs. SDSS never edits that script — it swaps
+    # this file for a wrapper (see hooks.py) so `sdss run` still wraps a normal Steam launch.
+    launcher_path: str | None = None
+    # Command used when the launcher path is an export or other indirection rather than the
+    # emulator command itself.
+    launcher_command: tuple[str, ...] | None = None
 
 
 CEMU = Profile(
@@ -85,6 +91,7 @@ CEMU = Profile(
     second_size=(854, 480),
     verified=True,
     needs_x11=True,
+    launcher_path="~/Applications/Cemu.AppImage",
     notes="Separate GamePad view renders the Wii U GamePad screen at 854x480. The official "
     "AppImage has no working GTK Wayland backend (cemu-project/Cemu#1809), so it runs on "
     "the nested Xwayland.",
@@ -115,6 +122,7 @@ AZAHAR = Profile(
     ),
     second_size=(320, 240),
     verified=True,
+    launcher_path="~/Applications/azahar.AppImage",
     notes="Qt writes a `key\\default` marker next to every setting; it must be false or "
     "Azahar restores its own default on launch.",
 )
@@ -129,7 +137,9 @@ MELONDS = Profile(
             path="~/.var/app/net.kuribo64.melonDS/config/melonDS/melonDS.toml",
             format=TOML,
             edits=(
-                # screenSizing_BotOnly == 5, screenLayout_Natural == 0
+                # screenSizing: 4 = TopOnly, 5 = BotOnly
+                Edit(section="Instance0.Window0", key="ScreenSizing", value="4"),
+                Edit(section="Instance0.Window1", key="Enabled", value="true"),
                 Edit(section="Instance0.Window1", key="ScreenSizing", value="5"),
                 Edit(section="Instance0.Window1", key="ScreenLayout", value="0"),
                 Edit(section="Instance0.Window1", key="Width", value="256"),
@@ -137,11 +147,15 @@ MELONDS = Profile(
             ),
         ),
     ),
-    # UNVERIFIED (S4): whether melonDS re-creates Window1 from config alone.
+    # The second-window title matcher is not verified on hardware; matching the complete
+    # title suffix is safer than moving both indistinguishable melonDS windows to the Deck.
     second_window=WindowMatch(app_id=("melonDS",), title_regex="melonDS.*2"),
     second_size=(256, 192),
-    notes="melonDS 1.x migrates melonDS.ini to melonDS.toml on first save; the toml must "
-    "exist before SDSS can patch it.",
+    needs_x11=True,
+    launcher_path="~/.local/share/flatpak/exports/bin/net.kuribo64.melonDS",
+    launcher_command=("flatpak", "run", "net.kuribo64.melonDS"),
+    notes="melonDS 1.x migrates melonDS.ini to melonDS.toml on first save. Like Cemu it "
+    "only maps windows on Xwayland. The second-window title match remains unverified.",
 )
 
 PROFILES: tuple[Profile, ...] = (CEMU, AZAHAR, MELONDS)

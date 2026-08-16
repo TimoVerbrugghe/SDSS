@@ -1,6 +1,9 @@
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from sdss import patch
 from sdss.patch import INI, TOML, XML, Edit
@@ -139,6 +142,73 @@ class TestJournal(unittest.TestCase):
 
         journal.restore()
         self.assertEqual(config.read_text(), "[S]\nk=1\n")
+
+    def test_corrupt_manifest_never_discards_the_intact_backups(self):
+        # SteamOS SIGKILLs the whole session on logout (see docs/hardware-recon.md), which
+        # can hit `sdss` mid-write and truncate manifest.json. Treating that as "nothing
+        # recorded" is the dangerous reading: restore() would report success having
+        # restored nothing, then discard() would rmtree the backups that are still fine.
+        journal = patch.Journal(self.root / "journal", "session")
+        config = self.root / "b.ini"
+        config.write_text("[S]\nk=1\n")
+        journal.record(config)
+        backup = next(journal.files.iterdir())
+        journal.manifest.write_text("{not valid json")
+
+        with self.assertRaises(patch.PatchError):
+            journal._load()
+        with self.assertRaises(patch.PatchError):
+            journal.restore()
+        # The whole point: the backup bytes are still recoverable by hand.
+        self.assertTrue(backup.is_file())
+        self.assertEqual(backup.read_text(), "[S]\nk=1\n")
+
+    def test_backup_names_do_not_collide_across_entries(self):
+        # Backup filenames used to be derived from len(entries), so any renumbering made a
+        # later record() overwrite an earlier file's only copy.
+        journal = patch.Journal(self.root / "journal", "session")
+        first = self.root / "one.ini"
+        second = self.root / "two.ini"
+        first.write_text("[S]\nk=first\n")
+        second.write_text("[S]\nk=second\n")
+        journal.record(first)
+        journal.record(second)
+
+        self.assertEqual(len(list(journal.files.iterdir())), 2)
+        first.write_text("clobbered")
+        second.write_text("clobbered")
+        journal.restore()
+        self.assertEqual(first.read_text(), "[S]\nk=first\n")
+        self.assertEqual(second.read_text(), "[S]\nk=second\n")
+
+    def test_manifest_write_is_atomic(self):
+        journal = patch.Journal(self.root / "journal", "session")
+        config = self.root / "c.ini"
+        config.write_text("[S]\nk=1\n")
+        journal.record(config)
+
+        # No leftover temp file, and the manifest itself is valid JSON.
+        leftovers = list(journal.dir.glob(".manifest.json.sdss-tmp"))
+        self.assertEqual(leftovers, [])
+        self.assertTrue(journal.manifest.is_file())
+
+    def test_restore_refuses_a_corrupted_backup(self):
+        # The journal records a sha256 digest of each backup precisely so a truncated
+        # or corrupted backup file can't be restored silently — restore() must verify
+        # it instead of trusting the bytes on disk unconditionally.
+        config = self.root / "d.ini"
+        config.write_text("[S]\nk=1\n")
+        journal = patch.Journal(self.root / "journal", "session")
+        journal.record(config)
+        config.write_text("[S]\nk=2\n")
+
+        backup = journal.files / next(journal.files.iterdir()).name
+        backup.write_bytes(b"corrupted")
+
+        with self.assertRaises(patch.PatchError):
+            journal.restore()
+        # The live file must be left alone when the restore is refused.
+        self.assertEqual(config.read_text(), "[S]\nk=2\n")
 
 
 if __name__ == "__main__":

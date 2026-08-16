@@ -10,10 +10,11 @@ Wii U GamePad — and its touchscreen acts as the stylus.
 Steam Machine (SteamOS / gamescope session)
 └── sdss run -- <emulator>
     └── nested sway compositor
-        ├── output WL-1        → window inside gamescope → TV        (main screen)
-        └── output HEADLESS-1  → captured by Sunshine    → Moonlight (second screen)
-                                                          ↑ touch ↓
-                                              sdss-inputd (stylus injection)
+        ├── output X11-1       → per-game Xwayland     → TV        (main screen)
+        │   └── WL-1 fallback  → gamescope Wayland     → TV        (native/off-Steam)
+        └── output HEADLESS-1  → captured by Sunshine  → Moonlight (second screen)
+                                                           ↑ touch ↓
+                                               sdss-inputd (stylus injection)
 ```
 
 ## Why it works this way
@@ -52,10 +53,10 @@ Early development. See [docs/PLAN.md](docs/PLAN.md) for the phased plan and
 | P0 spikes | dual output, capture, Cemu/Azahar second windows, and an end-to-end stream to the Deck all proven; see [docs/spikes](docs/spikes) |
 | P1 `sdss run` | implemented; every piece verified individually |
 | P2 emulator profiles | Cemu and Azahar verified; melonDS open |
-| P3 touch bridge | not started (`/dev/uinput` access confirmed available) |
-| P4 Decky plugin | not started |
+| P3 touch bridge | `sdss-inputd` implemented; streams verified end to end |
+| P4 Decky plugin | implemented — toggles second screen mode and restores configs |
 | P5 Deck helper | `deck/install.sh` + `deck/sdss-connect.sh` |
-| P6 packaging | compositor image builds on device |
+| P6 packaging | `install.sh` covers both endpoints from one `.desktop` launcher |
 
 ## Repo layout
 
@@ -64,18 +65,110 @@ host/       Python package `sdss` — launch wrapper, compositor + Sunshine conf
 plugin/     Decky plugin (Steam Machine UI)
 deck/       Steam Deck side helper (Moonlight auto-connect)
 runtime/    Build recipes for the bundled sway/wlroots compositor
-packaging/  Install scripts and systemd user units
+packaging/  Host installer, uninstaller, udev rule, desktop launcher
 docs/       Plan, architecture, spike results
 ```
 
 ## Install
 
-Not packaged yet. For development:
+Copy this repository to the device (or clone it), then either double-click
+**Install SDSS** in the file manager or run:
 
 ```bash
-cd host && python3 -m pip install -e .
-sdss doctor
+./install.sh
 ```
+
+The installer detects whether it is on a Steam Machine (`Fremont`) or a Steam Deck
+(`Jupiter` / `Galileo`) and asks for confirmation, then remembers the answer. It copies
+itself to `~/.local/share/sdss/release` and adds an **Install or Update SDSS** launcher
+that re-runs the endpoint setup from there.
+
+| | Steam Machine (host) | Steam Deck (client) |
+| --- | --- | --- |
+| Flatpaks | Sunshine | Moonlight |
+| Binaries | `~/.local/bin/sdss` | `~/.local/bin/sdss-connect` |
+| System changes | one udev rule (asks for sudo once) | none |
+| Extras | compositor image, Decky plugin | Steam shortcut + controller template |
+
+Nothing is written outside `$HOME` except two files under `/etc` — the udev rule and its
+SteamOS atomic-update keep-list entry, which is what makes the rule survive OS updates.
+
+Non-interactive:
+
+```bash
+./install.sh --role steam-machine
+./install.sh --role steam-deck --host 10.0.0.5
+```
+
+### Updating
+
+The desktop launcher runs the *installed* copy, so on its own it only re-runs the endpoint
+setup — it has no newer code to copy. To pick up a new version, point it at a fresh
+checkout:
+
+```bash
+./install.sh                       # from the new checkout, or
+~/.local/share/sdss/release/install.sh --source /path/to/new/checkout
+```
+
+The release directory is swapped in atomically; if the swap fails the previous release is
+put back.
+
+### Uninstalling
+
+```bash
+~/.local/share/sdss/release/packaging/uninstall.sh
+```
+
+This restores every emulator config SDSS patched *before* removing anything, then deletes
+the release, the `sdss` shim, the launcher, the Decky plugin and the compositor image. On a
+Deck install it also removes `sdss-connect`, the SDSS Steam shortcut, and the SDSS
+controller template. The udev rule is left in place (it is inert without SDSS); the command
+to remove it is printed by `uninstall.sh --help`.
+
+Development on the host uses the same package directly:
+
+```bash
+PYTHONPATH=host/src python3 -m sdss.cli doctor
+cd host && python3 -m unittest discover -s tests
+```
+
+### Decky plugin
+
+The plugin toggles second screen mode (globally and per emulator) and can restore all
+patched emulator configs. It shells out to `sdss`, so config edits always go through the
+patch journal.
+
+SteamOS has no node, so `plugin/dist/index.js` is committed prebuilt. After changing the
+frontend:
+
+```bash
+cd plugin && npm install && npm run build
+```
+
+The bundle is only rebuilt by `plugin/install.sh` when `dist/index.js` is missing, so a
+committed bundle always wins on SteamOS. Force a rebuild on a machine with node:
+
+```bash
+SDSS_REBUILD_PLUGIN=1 plugin/install.sh
+```
+
+## Deck controller template (required for 1:1 touch)
+
+`deck/install.sh` installs a Steam Input template named **SDSS - Second Screen**. It is
+derived on-device from Steam's own `Gamepad with Joystick Trackpad` template plus one
+always-on `Touchscreen Native Support` command, so it never goes stale when Valve changes
+the controller schema.
+
+Select it in Game Mode: `Second Screen` -> Controller Settings -> current layout ->
+Templates -> `SDSS - Second Screen`.
+
+Without this, Steam Input can consume touchscreen events before Moonlight sees them.
+With it, touch maps 1:1 to the streamed second screen.
+
+For touch validation, prefer a ROM that needs frequent bottom-screen taps (for example,
+`The Legend of Zelda: A Link Between Worlds`) rather than one that can progress mostly
+without touch.
 
 ## Constraints
 

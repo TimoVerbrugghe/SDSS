@@ -6,7 +6,11 @@
 # socket that appears in the shared XDG_RUNTIME_DIR.
 FROM docker.io/library/archlinux:base
 
-RUN pacman -Sy --noconfirm --needed \
+# `-Sy` without `-u` is the classic Arch partial-upgrade trap: it refreshes the package
+# database but keeps the base image's older packages, so a freshly synced dependency can
+# be linked against a library version the image does not have. `-Syu` keeps the image
+# internally consistent.
+RUN pacman -Syu --noconfirm --needed \
         sway \
         xorg-xwayland \
         mesa \
@@ -17,12 +21,45 @@ RUN pacman -Sy --noconfirm --needed \
         grim \
         foot \
         wayland-utils \
+        python \
+        python-evdev \
+        python-pywayland \
+        wlr-protocols \
+        pkgconf \
+        # wlr_x11_backend has no working commit-time mode-set: sway's "output ... mode ..."
+        # (even with --custom) always fails with "Requested backend configuration failed"
+        # regardless of the value requested. It only reacts passively to a real X11
+        # ConfigureWindow on its own toplevel, exactly like any WM-managed client — xdotool
+        # is how session.py drives that resize itself right after sway starts (see
+        # write_artifacts()), instead of leaving the game's first frame racing gamescope's
+        # own (much slower, sometimes absent) async resize and rendering pillarboxed.
+        # xdotool alone cannot reliably *find* that window: wlroots sets only its EWMH
+        # _NET_WM_NAME, never the classic WM_NAME xdotool's own "search --name" matches —
+        # every real Steam launch either matched nothing or matched the root window
+        # instead. xorg-xwininfo's "-children" listing prints the same title from
+        # whichever property backs it and is parsed directly (see x11_fit_script()).
+        xdotool \
+        xorg-xwininfo \
     && pacman -Scc --noconfirm \
     # rootless podman refuses to exec a file with capabilities; sway only wants
     # cap_sys_nice for realtime scheduling, which a nested compositor does not need.
     && setcap -r /usr/bin/sway
 
+# zwlr_virtual_pointer_v1 bindings are not shipped with pywayland and have to be generated
+# into its protocol package; the core wayland.xml is needed to resolve wl_seat and wl_output.
+RUN python -m pywayland.scanner \
+        --input /usr/share/wayland/wayland.xml \
+                /usr/share/wlr-protocols/unstable/wlr-virtual-pointer-unstable-v1.xml \
+        --output-dir "$(python -c 'import os, pywayland.protocol as p; print(os.path.dirname(p.__file__))')"
+
+COPY inputd/sdss_inputd.py /usr/local/lib/sdss/sdss_inputd.py
+RUN printf '#!/bin/sh\nexec python /usr/local/lib/sdss/sdss_inputd.py "$@"\n' \
+        > /usr/local/bin/sdss-inputd \
+    && chmod 0755 /usr/local/bin/sdss-inputd
+
 # wlroots needs a writable runtime dir even when it only draws into the parent compositor.
+# WLR_BACKENDS here is only a fallback for running the image directly; `sdss run` always
+# overrides it via an explicit --env passthrough, chosen by runtime.parent_display().
 ENV XDG_RUNTIME_DIR=/run/user/1000 \
     WLR_BACKENDS=wayland,headless \
     WLR_NO_HARDWARE_CURSORS=1

@@ -5,6 +5,19 @@ build/
 dist/
 *.egg-info/
 node_modules/
-.env.local
+.env
+.env.*
 runtime/_build/
 runtime/dist/
+
+# The Decky bundle is committed: SteamOS has no node, so the installer needs it prebuilt.
+# Ignore the directory's contents and re-include only that one file, so a stray rollup
+# chunk or other build artifact can never be committed by accident.
+plugin/dist/*
+!plugin/dist/index.js
+
+# Deliberately not committed. It is generated behind whatever registry proxy the developer
+# happens to use and records those hosts in every `resolved` URL, which both leaks internal
+# infrastructure and is unresolvable anywhere else. Reproducibility comes from exact (not
+# caret) version pins in plugin/package.json instead.
+plugin/package-lock.json
