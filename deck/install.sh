@@ -60,6 +60,9 @@ python3 "$HERE/install-controller-template.py" || echo "controller template skip
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/sdss"
 mkdir -p "$CONFIG_DIR"
 printf '%s\n' "steam-deck" > "$CONFIG_DIR/installed-role"
+# The address is otherwise only recoverable by parsing it back out of shortcuts.vdf, which
+# Steam rewrites; the app shows it and reuses it when re-running this installer.
+printf '%s\n' "$HOST" > "$CONFIG_DIR/host"
 
 note_path "$BIN_DIR"
 
