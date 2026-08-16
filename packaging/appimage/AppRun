@@ -1,0 +1,25 @@
+#!/bin/sh
+# AppImage entry point. Runs the bundled Python against the bundled SDSS tree.
+#
+# Kept POSIX sh (not bash) and dependency-free: this is the one file that has to work
+# before anything the AppImage carries has been proven to work.
+set -eu
+
+HERE="$(dirname "$(readlink -f "$0")")"
+
+export APPDIR="$HERE"
+export PATH="$HERE/usr/bin:$PATH"
+export LD_LIBRARY_PATH="$HERE/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# The bundled interpreter must not pick up the user's site-packages or a PYTHONPATH from
+# the desktop session: a stray PySide6 there would be loaded instead of ours.
+export PYTHONNOUSERSITE=1
+unset PYTHONPATH PYTHONHOME 2>/dev/null || true
+
+# With no display at all there is nothing for Qt to attach to; `offscreen` lets the app
+# start anyway so it can fall back to its terminal mode instead of dying inside Qt with a
+# platform-plugin error that says nothing about SDSS.
+if [ -z "${WAYLAND_DISPLAY:-}" ] && [ -z "${DISPLAY:-}" ]; then
+    export QT_QPA_PLATFORM=offscreen
+fi
+
+exec "$HERE/usr/bin/python3" "$HERE/usr/share/sdss/app/sdss-app" "$@"

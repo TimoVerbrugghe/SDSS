@@ -20,6 +20,10 @@ Runner = Callable[..., Result]
 STEAM_MACHINE = "steam-machine"
 STEAM_DECK = "steam-deck"
 ROLES = (STEAM_MACHINE, STEAM_DECK)
+ROLE_LABELS = {
+    STEAM_MACHINE: "Steam Machine (host)",
+    STEAM_DECK: "Steam Deck (client)",
+}
 
 SUNSHINE_ID = "dev.lizardbyte.app.Sunshine"
 MOONLIGHT_ID = "com.moonlight_stream.Moonlight"
@@ -77,6 +81,10 @@ class Status:
         payload = asdict(self)
         payload["role"] = self.role
         return payload
+
+
+def role_label(role: str | None) -> str:
+    return ROLE_LABELS.get(role or "", "unknown")
 
 
 def detect_role(product_file: Path = DMI_PRODUCT) -> str | None:

@@ -587,11 +587,25 @@ class AppCliTest(_Sandbox):
         headless.assert_called_once()
         gui.assert_not_called()
 
-    def test_no_display_falls_back_to_the_terminal(self):
+    def test_no_display_and_no_flags_prints_a_summary_and_installs_nothing(self):
+        # Opening the app over SSH, or on a machine with no display, must never start
+        # rewriting the system just because it could not draw a window.
+        import io
+        from contextlib import redirect_stdout
+
+        buffer = io.StringIO()
+        with mock.patch.object(app_cli, "has_display", return_value=False), mock.patch.object(
+            app_cli.runner, "run"
+        ) as run, redirect_stdout(buffer):
+            self.assertEqual(app_cli.main([]), 0)
+        run.assert_not_called()
+        self.assertIn("--role", buffer.getvalue())
+
+    def test_no_gui_with_a_role_still_installs(self):
         with mock.patch.object(app_cli, "_headless", return_value=0) as headless, mock.patch.object(
-            app_cli, "has_display", return_value=False
+            app_cli, "has_display", return_value=True
         ):
-            app_cli.main([])
+            app_cli.main(["--no-gui", "--role", "steam-machine"])
         headless.assert_called_once()
 
     def test_a_display_opens_the_gui(self):

@@ -35,6 +35,14 @@ Do not break these without updating `docs/PLAN.md` first:
   `python-evdev` / `pywayland` are allowed **only** inside the touch bridge
   (`runtime/inputd/sdss_inputd.py`), which runs inside the container image where those
   packages are installed — never in the `sdss` package.
+  **PySide6** is allowed **only** inside `app/ui/` (the desktop app's Qt layer), which runs
+  from the AppImage where Qt and its own Python are bundled — never in `sdss`, and never in
+  `app/core/`. `app/core/` holds every decision the app makes and stays stdlib-only so it is
+  unit-testable on a CI runner with no display; `app/ui/` only renders state and forwards
+  button presses. `host/tests/test_appimage.py` asserts that boundary instead of trusting it.
+  The app must also never be the only way to do something: every window has a `sdss-app`
+  flag equivalent, and every action shells out to the existing `install.sh` /
+  `packaging/uninstall.sh` / `sdss` entry points rather than reimplementing them.
 - Tests use `unittest` (`python3 -m unittest discover -s host/tests`). No pytest.
 - Every shell entry point runs under `set -euo pipefail` (`packaging/common.sh` is the one
   exception — it is sourced, so it inherits its caller's). Two consequences bite

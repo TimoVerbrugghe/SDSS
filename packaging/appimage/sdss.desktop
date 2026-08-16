@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=SDSS
+GenericName=Steam Deck Second Screen
+Comment=Install, update and manage Steam Deck Second Screen
+Exec=sdss-app
+Icon=sdss
+Terminal=false
+Type=Application
+Categories=Game;Utility;
+StartupNotify=true

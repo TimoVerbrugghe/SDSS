@@ -1,0 +1,86 @@
+name: AppImage
+
+# The AppImage is how SDSS is actually delivered, so it is built on every push: a recipe
+# that only runs at release time is a recipe that is broken at release time. Building here
+# rather than on the target is deliberate — SteamOS has a read-only rootfs and no build
+# tooling, and the produced file must carry its own Python and Qt.
+on:
+  push:
+  pull_request:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # appimagetool needs these to package, and PySide6 needs them to be importable for
+      # the smoke test below. The runner is only the build host; nothing here has to exist
+      # on SteamOS, which is what the bundled runtime is for.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            desktop-file-utils zsync libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+
+      - name: Build the AppImage
+        run: packaging/appimage/build.sh
+
+      # A file that builds but cannot start is worse than a failed build, and all three of
+      # these are cheap. --version exercises the bundled interpreter and the payload
+      # layout; --status exercises app/core against a real filesystem; --self-test builds
+      # the whole window offscreen, which is the only thing that would catch a Qt bundle
+      # that packaged fine but cannot draw.
+      - name: Smoke test
+        run: |
+          chmod +x dist/SDSS-x86_64.AppImage
+          APPIMAGE_EXTRACT_AND_RUN=1 dist/SDSS-x86_64.AppImage --version
+          APPIMAGE_EXTRACT_AND_RUN=1 dist/SDSS-x86_64.AppImage --status > /tmp/status.json
+          python3 -c "import json; json.load(open('/tmp/status.json'))"
+          APPIMAGE_EXTRACT_AND_RUN=1 dist/SDSS-x86_64.AppImage --self-test
+
+      - name: Verify the published checksum
+        run: |
+          cd dist
+          # Captured, not piped into a checker: under `pipefail` a checker that exits on
+          # its first line SIGPIPEs the producer and reports 141 instead of a result.
+          expected="$(cut -d' ' -f1 SDSS-x86_64.AppImage.sha256)"
+          actual="$(sha256sum SDSS-x86_64.AppImage)"
+          actual="${actual%% *}"
+          [ "$expected" = "$actual" ] || { echo "checksum mismatch" >&2; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SDSS-AppImage
+          path: |
+            dist/SDSS-x86_64.AppImage
+            dist/SDSS-x86_64.AppImage.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: SDSS-AppImage
+          path: dist
+      # The app refuses to install an update it cannot verify, so the .sha256 asset is not
+      # optional — uploading the AppImage without it ships an update no one can apply.
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$TAG" \
+            dist/SDSS-x86_64.AppImage \
+            dist/SDSS-x86_64.AppImage.sha256 \
+            --repo "$GITHUB_REPOSITORY" --clobber

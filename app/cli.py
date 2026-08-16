@@ -34,6 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-gui", action="store_true", help="never open a window, even when a display exists"
     )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="build the window offscreen and exit; changes nothing on the system",
+    )
     return parser
 
 
@@ -65,6 +70,47 @@ def _print_status() -> int:
     import json
 
     print(json.dumps(probe.probe().to_json(), indent=2))
+    return 0
+
+
+def _self_test() -> int:
+    """Prove the bundled Qt loads and the window builds, without touching the system.
+
+    The AppImage is built on a machine that is not the target and carries its own Qt, so
+    "it packaged successfully" says nothing about whether it can draw. This is the cheapest
+    check that would actually fail on a broken bundle, and CI runs it on every build.
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from .ui.main import self_test
+
+    self_test()
+    print("self-test ok")
+    return 0
+
+
+def _summary() -> int:
+    """What a bare run with no display prints.
+
+    Never an install: an app opened by accident over SSH, or on a machine with no display,
+    must not start rewriting the system because it could not draw a window.
+    """
+    status = probe.probe()
+    print(f"SDSS app {status.app_version}")
+    if not status.installed:
+        role = status.detected_role
+        suggestion = role or "steam-machine|steam-deck"
+        print(f"SDSS is not installed ({status.install_path} is missing).")
+        print(f"Install it with:  sdss-app --role {suggestion}")
+        if role == probe.STEAM_DECK or role is None:
+            print("A Steam Deck install also needs --host <steam-machine-address>.")
+        return 0
+    print(f"installed:  {status.installed_version or 'unknown'}")
+    print(f"role:       {probe.role_label(status.role)}")
+    print(f"path:       {status.install_path}")
+    for check in status.checks:
+        print(f"  {'ok  ' if check.ok else 'FAIL'}  {check.label}: {check.detail}")
+    problems = len(status.problems)
+    print(f"\n{problems} problem(s). Repair with:  sdss-app --role {status.role}")
     return 0
 
 
@@ -101,9 +147,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.status:
         return _print_status()
-    explicit = args.uninstall or args.role or args.stage_only
-    if args.no_gui or not has_display() or explicit:
+    if args.self_test:
+        return _self_test()
+    explicit = bool(args.uninstall or args.role or args.stage_only)
+    if explicit:
         return _headless(args)
+    if args.no_gui or not has_display():
+        return _summary()
     return _gui(args)
 
 
