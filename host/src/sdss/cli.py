@@ -7,12 +7,10 @@ import contextlib
 import fcntl
 import json
 import logging
-import os
-import shutil
 import subprocess
 import sys
 
-from . import hooks, paths, patch, profiles, runtime, state, stream
+from . import doctor, hooks, paths, patch, profiles, release, state, stream
 from .session import Session, SessionError
 
 log = logging.getLogger("sdss")
@@ -36,41 +34,24 @@ def cmd_profiles(_: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_doctor(_: argparse.Namespace) -> int:
-    problems = 0
-    print("== tooling ==")
-    print(f"  compositor  {runtime.describe()}")
-    if not (runtime.native_sway() or runtime.image_present()):
-        problems += 1
-    sunshine = shutil.which("flatpak")
-    print(f"  flatpak     {sunshine or 'MISSING'}  (Sunshine runtime)")
-    problems += 0 if sunshine else 1
+def cmd_doctor(args: argparse.Namespace) -> int:
+    report = doctor.run()
+    if getattr(args, "json", False):
+        payload = report.to_json()
+        payload["release"] = release.installed()
+        print(json.dumps(payload, indent=2))
+        return 1 if report.problems else 0
 
-    print("== session ==")
-    for var in ("WAYLAND_DISPLAY", "GAMESCOPE_WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"):
-        value = os.environ.get(var, "")
-        print(f"  {var:<26} {value or '(unset)'}")
-    if not (os.environ.get("WAYLAND_DISPLAY") or os.environ.get("GAMESCOPE_WAYLAND_DISPLAY")):
-        print("  hint: source /run/user/1000/gamescope-environment when running over SSH")
-        problems += 1
-
-    print("== emulator configs ==")
-    for profile in profiles.PROFILES:
-        for target in profile.configs:
-            resolved = target.resolve()
-            status = "ok" if resolved.is_file() else "MISSING"
-            print(f"  {profile.id:<10} {status:<8} {resolved}")
-
-    print("== state ==")
-    current = state.load()
-    print(f"  second screen mode: {'enabled' if current.enabled else 'disabled'}")
-    journal = patch.Journal(paths.backup_dir(), "session")
-    if journal.exists:
-        print("  WARNING: stale config journal — run `sdss restore`")
-        problems += 1
-
-    print(f"\n{problems} problem(s)")
-    return 1 if problems else 0
+    section = None
+    for check in report.checks:
+        if check.section != section:
+            section = check.section
+            print(f"== {section} ==")
+        print(f"  {check.label:<26} {check.detail}")
+        if check.hint:
+            print(f"  hint: {check.hint}")
+    print(f"\n{report.problems} problem(s)")
+    return 1 if report.problems else 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -207,11 +188,29 @@ def _hooks_lock():
         handle.close()
 
 
+def _patched_configs() -> list:
+    """Config files the journal is currently holding backups for.
+
+    Best effort on purpose: this feeds a status display, and an unreadable manifest must
+    not take the whole payload down with it — `sdss restore` is where that error belongs.
+    """
+    journal = patch.Journal(paths.backup_dir(), "session")
+    if not journal.exists:
+        return []
+    try:
+        return journal.recorded_paths()
+    except patch.PatchError as exc:
+        log.warning("could not read the config journal: %s", exc)
+        return []
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     current = state.load()
     _reconcile_hooks(current)
     if getattr(args, "json", False):
         # Consumed by the Decky plugin, so profile ids never have to be hardcoded there.
+        # Keys are only ever *added* here: the plugin ships prebuilt and an older bundle
+        # keeps working only as long as the existing shape is untouched.
         print(
             json.dumps(
                 {
@@ -224,9 +223,12 @@ def cmd_status(args: argparse.Namespace) -> int:
                             "system": profile.system,
                             "verified": profile.verified,
                             "enabled": current.enabled_for(profile.id),
+                            "hooked": hooks.is_installed(profile),
                         }
                         for profile in profiles.PROFILES
                     ],
+                    "release": release.installed(),
+                    "patched_configs": [str(path) for path in _patched_configs()],
                 },
                 indent=2,
             )
@@ -244,7 +246,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("doctor", help="check the host setup").set_defaults(func=cmd_doctor)
+    doctor_cmd = sub.add_parser("doctor", help="check the host setup")
+    doctor_cmd.add_argument("--json", action="store_true", help="machine-readable output")
+    doctor_cmd.set_defaults(func=cmd_doctor)
     sub.add_parser("profiles", help="list emulator profiles").set_defaults(func=cmd_profiles)
     status = sub.add_parser("status", help="show toggle state")
     status.add_argument("--json", action="store_true", help="machine-readable output")

@@ -149,6 +149,10 @@ class Journal:
         entries.append(entry)
         self._save(entries)
 
+    def recorded_paths(self) -> list[Path]:
+        """Which config files this journal can restore, without restoring them."""
+        return [Path(entry["path"]) for entry in self._load()]
+
     def restore(self) -> list[Path]:
         restored: list[Path] = []
         for entry in self._load():

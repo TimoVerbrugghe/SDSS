@@ -1,8 +1,0 @@
-[Desktop Entry]
-Name=Install or Update SDSS
-Comment=Configure Steam Deck Second Screen on this SteamOS device
-Exec=sh -lc "exec \"${XDG_DATA_HOME:-$HOME/.local/share}/sdss/release/install.sh\""
-Terminal=true
-Type=Application
-Categories=Game;Utility;
-StartupNotify=true

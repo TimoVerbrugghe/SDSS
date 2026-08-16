@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=SDSS
+GenericName=Steam Deck Second Screen
+Comment=Install, update and manage Steam Deck Second Screen
+# Installed by install.sh, which can run from a plain checkout where no AppImage exists.
+# The app rewrites this entry (Terminal=false, a direct Exec) as soon as it has copied
+# itself to ~/Applications, so the terminal fallback below is only ever used by an
+# install that was driven from a shell.
+Exec=sh -c 'app="$HOME/Applications/SDSS.AppImage"; [ -x "$app" ] && exec "$app"; exec "${XDG_DATA_HOME:-$HOME/.local/share}/sdss/release/install.sh"'
+Icon=sdss
+Terminal=true
+Type=Application
+Categories=Game;Utility;
+StartupNotify=true

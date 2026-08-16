@@ -16,7 +16,8 @@ usage() {
 Usage: packaging/uninstall.sh [--keep-configs] [--yes]
 
 Restores every emulator config SDSS patched, then removes the installed release, the
-`sdss` shim, the desktop launcher, the Decky plugin and the container image.
+`sdss` shim, the desktop launcher, the Decky plugin and the container image. The SDSS
+AppImage is left in place; delete ~/Applications/SDSS.AppImage to remove it too.
 
   --keep-configs  leave emulator configs patched (they will point at a missing SDSS)
   --yes           do not ask for confirmation
@@ -94,7 +95,10 @@ if [[ "$ROLE" == "steam-deck" || -e "$BIN_DIR/sdss-connect" || -e "$DECK_TEMPLAT
     echo "removed the deck launcher, Steam shortcut and controller template"
 fi
 
-rm -f "$BIN_DIR/sdss" "$APPLICATIONS/sdss-installer.desktop"
+rm -f "$BIN_DIR/sdss" "$APPLICATIONS/sdss.desktop"
+# The pre-app entry name. Removed unconditionally so an upgrade-then-uninstall does not
+# strand a launcher pointing at a release that no longer exists.
+rm -f "$APPLICATIONS/sdss-installer.desktop"
 rm -rf "$INSTALL_ROOT" "$STATE_DIR" "$CONFIG_DIR"
 # Installers before the mktemp-container fix could leave a full copy of the release behind
 # on every successful update. They are invisible (dot-prefixed) and can be gigabytes.
@@ -113,4 +117,7 @@ SDSS is uninstalled.
 
 Sunshine and Moonlight were installed as flatpaks and are left alone; remove them with
 `flatpak uninstall --user dev.lizardbyte.app.Sunshine` if you no longer want them.
+
+The SDSS app itself (~/Applications/SDSS.AppImage) is left in place: it is a single file
+that can reinstall SDSS at any time. Delete it if you no longer want it.
 EOF
