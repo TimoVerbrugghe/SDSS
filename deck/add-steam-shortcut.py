@@ -18,6 +18,7 @@ import argparse
 import shutil
 import struct
 import sys
+import tempfile
 import time
 import zlib
 from pathlib import Path
@@ -34,6 +35,14 @@ TAG = "SDSS"
 # Backups kept per user config directory; older ones are pruned so they do not pile up in
 # a directory Steam Cloud syncs.
 KEEP_BACKUPS = 3
+DEFAULT_ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
+LIBRARY_ASSETS = (
+    ("", "steam-shortcut-grid.png"),
+    ("p", "steam-shortcut-gridp.png"),
+    ("_hero", "steam-shortcut-hero.png"),
+    ("_logo", "steam-shortcut-logo.png"),
+    ("_icon", "steam-shortcut-icon.png"),
+)
 
 
 class ShortcutsError(Exception):
@@ -188,6 +197,56 @@ def prune_backups(config: Path, keep: int = KEEP_BACKUPS) -> None:
         stale.unlink(missing_ok=True)
 
 
+def _appid_file_id(value: int) -> int:
+    """Steam stores appid as signed int32 in shortcuts.vdf but filenames use uint32."""
+    return value & 0xFFFFFFFF
+
+
+def _grid_art_paths(grid_dir: Path, appid: int) -> list[Path]:
+    file_id = _appid_file_id(appid)
+    return [grid_dir / f"{file_id}{suffix}.png" for suffix, _ in LIBRARY_ASSETS]
+
+
+def install_library_assets(config: Path, appid: int, assets_dir: Path) -> None:
+    grid_dir = config / "grid"
+    missing = [name for _, name in LIBRARY_ASSETS if not (assets_dir / name).is_file()]
+    if missing:
+        raise ShortcutsError(
+            f"missing Steam artwork in {assets_dir}: {', '.join(missing)}"
+        )
+    grid_dir.mkdir(parents=True, exist_ok=True)
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for path, (_, name) in zip(_grid_art_paths(grid_dir, appid), LIBRARY_ASSETS):
+            with tempfile.NamedTemporaryFile(
+                dir=grid_dir, prefix=f".{path.name}.", suffix=".tmp", delete=False
+            ) as handle:
+                temp = Path(handle.name)
+            staged.append((temp, path))
+            shutil.copyfile(assets_dir / name, temp)
+        for temp, final in staged:
+            temp.replace(final)
+    except OSError as error:
+        raise ShortcutsError(f"could not install Steam artwork: {error}") from error
+    finally:
+        for temp, _ in staged:
+            temp.unlink(missing_ok=True)
+
+
+def remove_library_assets(config: Path, appids: list[int]) -> None:
+    grid_dir = config / "grid"
+    if not grid_dir.is_dir():
+        return
+    seen: set[int] = set()
+    for appid in appids:
+        file_id = _appid_file_id(appid)
+        if file_id in seen:
+            continue
+        seen.add(file_id)
+        for path in (grid_dir / f"{file_id}{suffix}.png" for suffix, _ in LIBRARY_ASSETS):
+            path.unlink(missing_ok=True)
+
+
 def owned_by_sdss(entry: dict, quoted_exe: str) -> bool:
     """Is this entry one we previously wrote, and therefore safe to replace?
 
@@ -314,6 +373,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="edit shortcuts.vdf even while Steam is running (it will be overwritten)",
     )
+    parser.add_argument(
+        "--assets-dir",
+        default=str(DEFAULT_ASSETS_DIR),
+        help="directory containing Steam shortcut artwork files",
+    )
     args = parser.parse_args(argv)
 
     if args.remove:
@@ -354,6 +418,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.remove
         else build_entry(args.exe, args.name, args.host, str(Path(args.exe).parent))
     )
+    appid = None if entry is None else shortcut_appid(quoted(args.exe), args.name)
+    assets_dir = Path(args.assets_dir)
     for config in configs:
         path = config / "shortcuts.vdf"
         data = path.read_bytes() if path.is_file() else b""
@@ -373,7 +439,11 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         quoted_exe = quoted(args.exe)
-        remaining = [e for e in entries if not owned_by_sdss(e, quoted_exe)]
+        owned_entries: list[dict] = []
+        remaining: list[dict] = []
+        for entry_data in entries:
+            target = owned_entries if owned_by_sdss(entry_data, quoted_exe) else remaining
+            target.append(entry_data)
         if args.remove and len(remaining) == len(entries):
             continue  # nothing of ours here; leave the file (and its mtime) untouched
 
@@ -383,15 +453,26 @@ def main(argv: list[str] | None = None) -> int:
             prune_backups(config)
 
         if entry is not None:
+            if appid is not None:
+                try:
+                    install_library_assets(config, appid, assets_dir)
+                except ShortcutsError as error:
+                    print(f"{path}: {error}", file=sys.stderr)
+                    return 1
             remaining.append(entry)
         write_atomically(path, serialize(remaining))
+        if args.remove:
+            remove_library_assets(
+                config,
+                [value for e in owned_entries if isinstance((value := e.get("appid")), int)],
+            )
         verb = "removed from" if args.remove else "wrote"
         print(f"{verb} {path} ({len(remaining)} shortcut(s))")
 
     if args.remove:
         return 0
 
-    appid = shortcut_appid(quoted(args.exe), args.name)
+    assert appid is not None
     print(f"appid: {appid}")
     print(f"launch with: steam steam://rungameid/{rungameid(appid)}")
     print(
