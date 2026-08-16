@@ -237,8 +237,13 @@ def remove_library_assets(config: Path, appids: list[int]) -> None:
     grid_dir = config / "grid"
     if not grid_dir.is_dir():
         return
-    for appid in {_appid_file_id(value) for value in appids}:
-        for path in _grid_art_paths(grid_dir, appid):
+    seen: set[int] = set()
+    for appid in appids:
+        file_id = _appid_file_id(appid)
+        if file_id in seen:
+            continue
+        seen.add(file_id)
+        for path in (grid_dir / f"{file_id}{suffix}.png" for suffix, _ in LIBRARY_ASSETS):
             path.unlink(missing_ok=True)
 
 
