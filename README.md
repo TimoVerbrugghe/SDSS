@@ -93,7 +93,7 @@ that re-runs the endpoint setup from there.
 | Flatpaks | Sunshine | Moonlight |
 | Binaries | `~/.local/bin/sdss` | `~/.local/bin/sdss-connect` |
 | System changes | one udev rule (asks for sudo once) | none |
-| Extras | compositor image, Decky plugin | Steam shortcut + controller template |
+| Extras | compositor image, Decky plugin | Steam shortcut + library artwork + controller template |
 
 Nothing is written outside `$HOME` except two files under `/etc` — the udev rule and its
 SteamOS atomic-update keep-list entry, which is what makes the rule survive OS updates.
