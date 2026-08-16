@@ -9,6 +9,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import launch, paths
 from .compositor import HEADLESS_OUTPUT
 
 APP_NAME = "Second Screen"
@@ -24,6 +25,11 @@ class SunshineSpec:
     port: int = DEFAULT_PORT
     name: str = "SDSS Second Screen"
     output: str = HEADLESS_OUTPUT
+
+
+def default_spec() -> SunshineSpec:
+    """The one Sunshine config location every caller shares."""
+    return SunshineSpec(config_dir=paths.config_dir() / "sunshine")
 
 
 def render_conf(spec: SunshineSpec) -> str:
@@ -76,9 +82,7 @@ def launch_command(spec: SunshineSpec, wayland_display: str, runtime_dir: str) -
     return [
         "flatpak",
         "run",
-        "--socket=wayland",
-        f"--filesystem=xdg-run/{wayland_display}",
-        f"--env=WAYLAND_DISPLAY={wayland_display}",
+        *launch.flatpak_socket_args(wayland_display),
         f"--env=XDG_RUNTIME_DIR={runtime_dir}",
         f"--filesystem={spec.config_dir}",
         "--device=all",

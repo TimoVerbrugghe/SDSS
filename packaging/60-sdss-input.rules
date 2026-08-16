@@ -1,0 +1,35 @@
+# SDSS: give the logged-in user access to Sunshine's virtual input devices.
+#
+# Sunshine creates its passthrough devices with uinput. systemd-logind only tags
+# devices it recognises as a keyboard/mouse seat device with "uaccess", so on
+# SteamOS the touch, pen and absolute-pointer nodes end up mode 0660 root:input
+# with no ACL for the desktop user. sdss-inputd runs unprivileged and needs to
+# EVIOCGRAB them, so tag them explicitly.
+#
+# Install: sudo ./packaging/install-udev-rule.sh
+ACTION=="remove", GOTO="sdss_input_end"
+SUBSYSTEM!="input", GOTO="sdss_input_end"
+
+# Match only event nodes. The rule previously also fired for the parent input/inputN
+# devices, where TAG+="uaccess" does nothing useful, and for any future non-event child.
+# The names below are Sunshine's; they are matched exactly (== not a glob) so unrelated
+# devices are not handed to the desktop user.
+KERNEL!="event[0-9]*", GOTO="sdss_input_end"
+
+# Only ever tag uinput-created nodes. A real USB device that happened to report one of
+# the names below would otherwise be handed to the desktop user.
+#
+# Verified on the Steam Machine (see docs/spikes/S8-udev-uaccess.md): a uinput node lands
+# at /devices/virtual/input/inputN/eventN, and matching DEVPATH=="/devices/pci*" instead
+# denies it — so this genuinely discriminates. Note that DRIVERS=="uinput" does NOT work:
+# the parent input device reports DRIVERS=="" and the rule would never fire at all.
+DEVPATH!="/devices/virtual/*", GOTO="sdss_input_end"
+
+# Keep this list identical to TOUCH_DEVICES in runtime/inputd/sdss_inputd.py — every name
+# here hands that node's raw event stream to the desktop user, so granting one the daemon
+# never claims widens the input-snooping surface for nothing. A test asserts they match.
+ATTRS{name}=="Touch passthrough", TAG+="uaccess"
+ATTRS{name}=="Pen passthrough", TAG+="uaccess"
+ATTRS{name}=="Mouse passthrough (absolute)", TAG+="uaccess"
+
+LABEL="sdss_input_end"

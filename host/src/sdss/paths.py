@@ -37,6 +37,16 @@ def state_file() -> Path:
     return state_dir() / "state.json"
 
 
+def hooks_lock_file() -> Path:
+    """Serializes launcher-wrapper reconciliation across concurrent `sdss` invocations.
+
+    In the state dir rather than the runtime dir so it is the same file for an SSH shell
+    (no XDG_RUNTIME_DIR) and the gamescope session, which can otherwise reconcile the same
+    launcher paths at the same time.
+    """
+    return state_dir() / "hooks.lock"
+
+
 def ensure(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=Install SDSS
+Comment=Install Steam Deck Second Screen on this SteamOS device
+# %k is the path of this .desktop file and must be a standalone argument (the spec
+# forbids field codes inside a quoted argument). It may arrive as a percent-encoded
+# file:// URI, so it is decoded with python3 rather than by hand -- a plain ${1#file://}
+# left "%20" in the path and broke any install directory containing a space. Some
+# launchers pass nothing at all, hence the empty guard.
+Exec=sh -c '[ -n "$1" ] || { echo "cannot locate the SDSS installer; run install.sh from a terminal instead" >&2; exit 2; }; exec "$(python3 -c "import os,sys,urllib.parse,urllib.request; a=sys.argv[1]; p=urllib.request.url2pathname(urllib.parse.urlparse(a).path) if a.startswith(\"file:\") else a; print(os.path.join(os.path.dirname(os.path.abspath(p)),\"install.sh\"))" "$1")"' sh %k
+Terminal=true
+Type=Application
+Categories=Game;Utility;
+StartupNotify=true

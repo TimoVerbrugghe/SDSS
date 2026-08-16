@@ -1,6 +1,6 @@
 # S4 — emulator second windows, Xwayland, and Game Mode
 
-Run: 2026-08-15 on the Steam Machine (10.10.10.161). Follows
+Run: 2026-08-15 on the Steam Machine (<steam-machine>). Follows
 [S1-compositor.md](S1-compositor.md).
 
 ## Verdict

@@ -1,0 +1,34 @@
+name: Tests
+
+# Deliberately unfiltered by path: the suite guards cross-tree invariants, so a change
+# outside host/ can break it. test_inputd.py asserts packaging/60-sdss-input.rules and
+# TOUCH_DEVICES in runtime/inputd/ stay set-equal, and the patch/restore round-trip is the
+# verification contract docs/PLAN.md names for emulator config edits.
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the floor in host/pyproject.toml. The host tooling is stdlib-only, so
+          # there is nothing to install before running the suite.
+          python-version: "3.11"
+      - run: python3 -m unittest discover -s host/tests -v
+
+  shell-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The installers are the one part of SDSS with no unit tests, and a syntax error in
+      # them is only ever discovered on a real Deck mid-install.
+      - run: |
+          status=0
+          while IFS= read -r script; do
+            bash -n "$script" || status=1
+          done < <(git ls-files '*.sh')
+          exit $status

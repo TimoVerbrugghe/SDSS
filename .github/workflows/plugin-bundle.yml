@@ -1,0 +1,35 @@
+name: Verify plugin bundle
+
+on:
+  push:
+    paths:
+      - "plugin/**"
+      - ".github/workflows/plugin-bundle.yml"
+  pull_request:
+    paths:
+      - "plugin/**"
+      - ".github/workflows/plugin-bundle.yml"
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # `--no-package-lock`, and no lockfile committed: one is only ever generated behind a
+      # developer's registry proxy, which records those internal hosts in every `resolved`
+      # URL and cannot be resolved from a public runner. What makes the byte-comparison
+      # below meaningful is that plugin/package.json pins exact versions rather than caret
+      # ranges, so this install resolves the same direct dependencies every time. Keep it
+      # that way -- a caret range here would let an unrelated upstream release fail this
+      # check.
+      - run: npm install --no-package-lock --ignore-scripts --no-audit --no-fund
+      - run: npm run build
+      # Fails only when the committed bundle no longer matches plugin/src. SteamOS has no
+      # node, so the installer ships this prebuilt file and it must never go stale.
+      - run: git diff --exit-code -- dist/index.js

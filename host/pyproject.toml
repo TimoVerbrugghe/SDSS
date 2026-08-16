@@ -9,9 +9,6 @@ description = "Steam Deck Second Screen — second-screen streaming for DS/3DS/W
 requires-python = ">=3.11"
 dependencies = []
 
-[project.optional-dependencies]
-input = ["evdev>=1.6", "pywayland>=0.4.17"]
-
 [project.scripts]
 sdss = "sdss.cli:main"
 
