@@ -104,7 +104,7 @@ class Session:
         journal = self.journal
         if journal.exists:
             log.warning("stale journal found — restoring before starting")
-            journal.restore()
+            journal.restore_snapshots()
         changed: list[Path] = []
         for target in self.profile.configs:
             path = target.resolve()
@@ -255,7 +255,7 @@ class Session:
         journal = self.journal
         if journal.exists:
             try:
-                restored = journal.restore()
+                restored = journal.restore_snapshots()
             except patch.PatchError as exc:
                 # cleanup() runs from a `finally`; raising here would replace whatever
                 # actually ended the session. The backups are still on disk either way.

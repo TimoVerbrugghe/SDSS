@@ -136,8 +136,9 @@ rather than ratios, so a wrong extent that preserves the quotient still fails.
 | melonDS | Flatpak `net.kuribo64.melonDS` | `~/.var/app/net.kuribo64.melonDS/config/melonDS/melonDS.toml` | `Instance0.Window1.ScreenSizing` = bottom-only — unverified |
 | RetroArch DS | — | — | **Not viable** — one framebuffer, no second toplevel |
 
-All config edits go through a backup journal so the user's config is restored
-byte-identically when the session ends.
+All config edits go through a backup journal. Session teardown now reverts only SDSS-managed
+keys in place (so unrelated user changes made during a run are preserved), while the journal
+still keeps byte-exact snapshots for explicit full-restore recovery.
 
 ## Auto-launch from the Steam Library
 
@@ -241,7 +242,7 @@ the emulator on the host against the compositor's Wayland socket.
 ## Verification
 
 - One `docs/spikes/SN-*.md` per spike with the exact commands and pass/fail.
-- Unit tests: patch → restore round-trip is byte-identical; profile matching.
+- Unit tests: SDSS-managed keys revert correctly while unrelated settings persist; profile matching.
 - Manual E2E per emulator: TV shows the main screen, Moonlight shows only the second
   screen, Deck touch drives the stylus, quitting restores configs and stops sway/Sunshine.
 - Latency budget: the extra compositing hop must stay under roughly one frame on the TV path.

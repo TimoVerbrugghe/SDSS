@@ -25,8 +25,10 @@ Do not break these without updating `docs/PLAN.md` first:
    `zwlr_virtual_pointer_manager_v1` bound to `HEADLESS-1`.
 4. The SteamOS rootfs is **read-only and stays that way**. No `pacman`, no
    `steamos-readonly disable`. Everything lives under `$HOME`.
-5. Emulator config edits always go through the journal in `host/src/sdss/patch.py`, so a
-   restore is byte-identical. Never write a config without a backup.
+5. Emulator config edits always go through the journal in `host/src/sdss/patch.py`. Session
+   teardown reverts only SDSS-managed keys (preserving unrelated user changes made during a
+   run), while explicit full restore still uses byte-identical backups. Never write a config
+   without a backup.
 
 ## Conventions
 

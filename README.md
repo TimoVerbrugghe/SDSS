@@ -179,4 +179,5 @@ without touch.
 
 - The SteamOS root filesystem stays **read-only**. Everything installs under `$HOME`
   (Flatpaks + a bundled compositor runtime).
-- Emulator configs are patched with a backup journal and restored byte-identically on exit.
+- Emulator configs are patched with a backup journal; on exit SDSS reverts only SDSS-managed
+  keys in place so unrelated settings changed during a run are preserved.

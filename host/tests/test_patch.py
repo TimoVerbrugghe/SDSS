@@ -48,6 +48,10 @@ class TestXmlEdits(unittest.TestCase):
         with self.assertRaises(patch.PatchError):
             patch.apply_edits(CEMU_XML, XML, (Edit(key="nope", value="1"),))
 
+    def test_missing_optional_tag_is_ignored(self):
+        out = patch.apply_edits(CEMU_XML, XML, (Edit(key="nope", value="1", required=False),))
+        self.assertEqual(out, CEMU_XML)
+
 
 class TestIniEdits(unittest.TestCase):
     def test_replaces_existing_key_in_section(self):
@@ -209,6 +213,39 @@ class TestJournal(unittest.TestCase):
             journal.restore()
         # The live file must be left alone when the restore is refused.
         self.assertEqual(config.read_text(), "[S]\nk=2\n")
+
+    def test_restore_snapshots_preserves_unrelated_user_changes(self):
+        config = self.root / "qt-config.ini"
+        config.write_text(AZAHAR_INI)
+        journal = patch.Journal(self.root / "journal", "session")
+        patch.patch_file(
+            config,
+            INI,
+            (
+                Edit(section="Layout", key="layout_option", value="4"),
+                Edit(section="Layout", key="secondary_display_layout", value="2"),
+            ),
+            journal,
+        )
+        current = config.read_text()
+        config.write_text(current.replace("theme=default", "theme=dark"))
+
+        journal.restore_snapshots()
+        restored = config.read_text()
+        self.assertIn("layout_option=5", restored)
+        self.assertNotIn("layout_option=4", restored)
+        self.assertNotIn("secondary_display_layout=2", restored)
+        self.assertIn("theme=dark", restored)
+
+    def test_restore_snapshots_falls_back_to_full_restore_without_snapshots(self):
+        config = self.root / "legacy.ini"
+        config.write_text("[S]\nk=1\n")
+        journal = patch.Journal(self.root / "journal", "session")
+        journal.record(config)
+        config.write_text("[S]\nk=2\n")
+
+        journal.restore_snapshots()
+        self.assertEqual(config.read_text(), "[S]\nk=1\n")
 
 
 if __name__ == "__main__":

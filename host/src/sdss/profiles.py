@@ -14,6 +14,16 @@ from pathlib import Path
 from .patch import INI, TOML, XML, Edit
 
 
+def _cemu_edits() -> tuple[Edit, ...]:
+    edits: list[Edit] = [Edit(key="open_pad", value="true")]
+    gamepad_profile = os.environ.get("SDSS_CEMU_GAMEPAD_PROFILE", "").strip()
+    if gamepad_profile:
+        # Cemu profile keys differ across versions/builds; try both without failing if absent.
+        edits.append(Edit(key="controllerProfile", value=gamepad_profile, required=False))
+        edits.append(Edit(key="controller_profile", value=gamepad_profile, required=False))
+    return tuple(edits)
+
+
 @dataclass(frozen=True)
 class ConfigTarget:
     path: str
@@ -83,7 +93,7 @@ CEMU = Profile(
         ConfigTarget(
             path="~/.config/Cemu/settings.xml",
             format=XML,
-            edits=(Edit(key="open_pad", value="true"),),
+            edits=_cemu_edits(),
         ),
     ),
     # Verified on hardware: "GamePad View - FPS: 60.10", class Cemu.
