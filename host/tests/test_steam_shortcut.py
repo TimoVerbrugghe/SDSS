@@ -264,5 +264,68 @@ class TestRemoval(unittest.TestCase):
         self.assertEqual(list(path.parent.glob("*.bak")), [])
 
 
+class TestLibraryArtwork(unittest.TestCase):
+    def _steam_root(self, entries):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        config = root / "userdata" / "12345" / "config"
+        config.mkdir(parents=True)
+        (config / "shortcuts.vdf").write_bytes(shortcut.serialize(entries))
+        return root, config
+
+    def _assets_dir(self):
+        assets = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, assets, True)
+        for _, name in shortcut.LIBRARY_ASSETS:
+            (assets / name).write_bytes(name.encode("utf-8"))
+        return assets
+
+    def _grid_files(self, appid):
+        file_id = appid & 0xFFFFFFFF
+        return [f"{file_id}{suffix}.png" for suffix, _ in shortcut.LIBRARY_ASSETS]
+
+    def test_add_writes_grid_assets_for_the_shortcut(self):
+        root, config = self._steam_root([])
+        assets = self._assets_dir()
+        launcher = root / "sdss-connect"
+        launcher.write_text("#!/bin/sh\n")
+        appid = shortcut.shortcut_appid(shortcut.quoted(str(launcher)), "Second Screen")
+
+        code = shortcut.main(
+            [
+                "--force",
+                "--steam-root",
+                str(root),
+                "--exe",
+                str(launcher),
+                "--assets-dir",
+                str(assets),
+                "10.0.0.5",
+            ]
+        )
+
+        self.assertEqual(code, 0)
+        for name in self._grid_files(appid):
+            self.assertTrue((config / "grid" / name).is_file(), name)
+
+    def test_remove_deletes_grid_assets_for_removed_entries(self):
+        exe = "/home/deck/.local/bin/sdss-connect"
+        mine = shortcut.build_entry(exe, "Second Screen", "10.0.0.5", "/home/deck")
+        root, config = self._steam_root([mine])
+        appid = mine["appid"]
+        grid = config / "grid"
+        grid.mkdir(parents=True)
+        for name in self._grid_files(appid):
+            (grid / name).write_bytes(b"x")
+
+        code = shortcut.main(
+            ["--remove", "--force", "--steam-root", str(root), "--exe", exe]
+        )
+
+        self.assertEqual(code, 0)
+        for name in self._grid_files(appid):
+            self.assertFalse((grid / name).exists(), name)
+
+
 if __name__ == "__main__":
     unittest.main()
