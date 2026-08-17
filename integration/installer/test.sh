@@ -6,13 +6,15 @@ ARTIFACTS="${SDSS_TEST_ARTIFACTS:-/artifacts}"
 ROOT="/work"
 RUNTIME="/run/user/1000"
 HOME="/home/deck"
+SWAY_ENV="/tmp/sdss-installer-test.env"
 export APPIMAGE_EXTRACT_AND_RUN=1
-export HOME XDG_RUNTIME_DIR="$RUNTIME" WAYLAND_DISPLAY=sdss-installer-test
+export HOME XDG_RUNTIME_DIR="$RUNTIME" SDSS_TEST_ENV="$SWAY_ENV"
 export XDG_DATA_HOME="$HOME/.local/share"
 export XDG_CONFIG_HOME="$HOME/.config"
 export XDG_STATE_HOME="$HOME/.local/state"
 
 mkdir -p "$ARTIFACTS" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
+rm -f "$SWAY_ENV"
 
 WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=2 sway -c /etc/sdss-installer-test-sway.conf \
     >"$ARTIFACTS/sway.log" 2>&1 &
@@ -26,16 +28,26 @@ cleanup() {
 trap cleanup EXIT
 
 for _ in $(seq 1 100); do
+    [[ -s "$SWAY_ENV" ]] && break
+    sleep 0.1
+done
+[[ -s "$SWAY_ENV" ]] || { echo "sway never reported its sockets" >&2; exit 1; }
+WAYLAND_DISPLAY="$(sed -n 's/^WAYLAND_DISPLAY=//p' "$SWAY_ENV")"
+SWAYSOCK="$(sed -n 's/^SWAYSOCK=//p' "$SWAY_ENV")"
+export WAYLAND_DISPLAY SWAYSOCK
+
+for _ in $(seq 1 100); do
     swaymsg -t get_outputs >/dev/null 2>&1 && break
     sleep 0.1
 done
-swaymsg -t get_outputs | python3 -c '
+outputs="$(swaymsg -t get_outputs)"
+python3 -c '
 import json
 import sys
 
 names = {output["name"] for output in json.load(sys.stdin)}
 assert {"HEADLESS-1", "HEADLESS-2"} <= names, names
-'
+' <<<"$outputs"
 
 "$APPIMAGE" --version
 "$APPIMAGE" --status >"$ARTIFACTS/status.json"
