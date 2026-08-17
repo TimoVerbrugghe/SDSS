@@ -15,14 +15,64 @@ from pathlib import Path
 from .patch import INI, TOML, XML, Edit
 
 
+# Cemu profile names become a `controllerProfiles/<name>.txt` filename, so anything that
+# would escape that directory (separators, `..`) or collide with reserved names is rejected
+# rather than silently written somewhere unexpected.
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9 _.-]+$")
+
+
+def _cemu_gamepad_profile_name() -> str:
+    name = os.environ.get("SDSS_CEMU_GAMEPAD_PROFILE", "").strip()
+    if name and (not _PROFILE_NAME_RE.fullmatch(name) or name in (".", "..")):
+        raise ValueError(
+            f"SDSS_CEMU_GAMEPAD_PROFILE={name!r} is not a safe controller profile filename"
+        )
+    return name
+
+
 def _cemu_edits() -> tuple[Edit, ...]:
     edits: list[Edit] = [Edit(key="open_pad", value="true")]
-    gamepad_profile = os.environ.get("SDSS_CEMU_GAMEPAD_PROFILE", "").strip()
+    gamepad_profile = _cemu_gamepad_profile_name()
     if gamepad_profile:
         # Cemu profile keys differ across versions/builds; try both without failing if absent.
         edits.append(Edit(key="controllerProfile", value=gamepad_profile, required=False))
         edits.append(Edit(key="controller_profile", value=gamepad_profile, required=False))
     return tuple(edits)
+
+
+# Cemu's own schema for a controller profile: which physical device (`api`/`controller`) and
+# deadzones it emulates the Wii U GamePad with. Deliberately stops short of per-button
+# bindings (button_N / axis_N indices) — those are device- and API-specific, and every
+# reference profile found for this (see docs/hardware-recon.md) was for a different input
+# API than SteamOS exposes. Shipping a guessed 1:1 mapping risks a profile that *looks*
+# configured but silently binds nothing, which is worse than requiring the one-time mapping
+# Cemu's own input UI already does. This still saves recreating the profile file/entry by
+# hand and gets it auto-selected via `SDSS_CEMU_GAMEPAD_PROFILE`.
+_CEMU_GAMEPAD_PROFILE_TEMPLATE = """[General]
+emulate = Wii U GamePad
+api = SDL
+controller = 0
+
+[Controller]
+rumble = 0
+leftRange = 1
+rightRange = 1
+leftDeadzone = 0.15
+rightDeadzone = 0.15
+buttonThreshold = 0.5
+"""
+
+
+def _cemu_files() -> tuple[FileTarget, ...]:
+    gamepad_profile = _cemu_gamepad_profile_name()
+    if not gamepad_profile:
+        return ()
+    return (
+        FileTarget(
+            path=f"~/.config/Cemu/controllerProfiles/{gamepad_profile}.txt",
+            content=_CEMU_GAMEPAD_PROFILE_TEMPLATE,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -36,6 +86,22 @@ class ConfigTarget:
 
     def resolved_edits(self) -> tuple[Edit, ...]:
         return self.edits() if callable(self.edits) else self.edits
+
+
+@dataclass(frozen=True)
+class FileTarget:
+    """A whole file SDSS can create as a default — never patched, never overwritten.
+
+    Used for artifacts like a Cemu controller profile that may not exist yet: unlike
+    `ConfigTarget`, there is no existing file to surgically edit, so `patch.
+    write_file_if_absent` only ever fills a gap and leaves anything already there alone.
+    """
+
+    path: str
+    content: str
+
+    def resolve(self) -> Path:
+        return Path(os.path.expanduser(self.path))
 
 
 @dataclass(frozen=True)
@@ -74,6 +140,9 @@ class Profile:
     detect: tuple[str, ...]
     second_window: WindowMatch
     configs: tuple[ConfigTarget, ...] = ()
+    # Files SDSS can create as defaults if missing (e.g. a Cemu controller profile). Never
+    # overwrites an existing file — see `FileTarget`.
+    files: tuple[FileTarget, ...] | Callable[[], tuple[FileTarget, ...]] = ()
     second_size: tuple[int, int] = (1280, 800)
     notes: str = ""
     verified: bool = False
@@ -86,6 +155,9 @@ class Profile:
     # Command used when the launcher path is an export or other indirection rather than the
     # emulator command itself.
     launcher_command: tuple[str, ...] | None = None
+
+    def resolved_files(self) -> tuple[FileTarget, ...]:
+        return self.files() if callable(self.files) else self.files
 
 
 CEMU = Profile(
@@ -100,6 +172,7 @@ CEMU = Profile(
             edits=_cemu_edits,
         ),
     ),
+    files=_cemu_files,
     # Verified on hardware: "GamePad View - FPS: 60.10", class Cemu.
     second_window=WindowMatch(app_id=("Cemu",), title_regex="^GamePad View"),
     second_size=(854, 480),

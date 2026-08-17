@@ -106,6 +106,12 @@ class Session:
             log.warning("stale journal found — restoring before starting")
             journal.restore_snapshots()
         changed: list[Path] = []
+        # Files first: a profile's edits (e.g. Cemu's `controllerProfile` key) may reference
+        # a file this step just created, but never the other way around.
+        for file_target in self.profile.resolved_files():
+            path = file_target.resolve()
+            if patch.write_file_if_absent(path, file_target.content, journal):
+                changed.append(path)
         for target in self.profile.configs:
             path = target.resolve()
             if patch.patch_file(path, target.format, target.resolved_edits(), journal):

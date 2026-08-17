@@ -349,6 +349,23 @@ class Journal:
             shutil.rmtree(self.dir)
 
 
+def write_file_if_absent(path: Path, content: str, journal: Journal) -> bool:
+    """Create `path` with `content` unless it already exists. Returns True when written.
+
+    Unlike `patch_file`, this never touches an existing file — it exists for artifacts SDSS
+    can offer as a preconfigured default (e.g. a Cemu controller profile) without ever
+    clobbering something the user already made. The journal still records it so a session
+    that creates the file gets it removed again on teardown, same as any other SDSS-managed
+    config write.
+    """
+    journal.record(path)
+    if path.is_file():
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_atomic(path, content.encode())
+    return True
+
+
 def patch_file(path: Path, fmt: str, edits: tuple[Edit, ...], journal: Journal) -> bool:
     """Apply `edits` to `path`, backing it up first. Returns True when bytes changed."""
     if not path.is_file():

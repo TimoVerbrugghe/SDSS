@@ -138,7 +138,10 @@ rather than ratios, so a wrong extent that preserves the quotient still fails.
 
 All config edits go through a backup journal. Session teardown now reverts only SDSS-managed
 keys in place (so unrelated user changes made during a run are preserved), while the journal
-still keeps byte-exact snapshots for explicit full-restore recovery.
+still keeps byte-exact snapshots for explicit full-restore recovery. When
+`SDSS_CEMU_GAMEPAD_PROFILE` names a Cemu controller profile that doesn't exist yet, the same
+journal is used to create a minimal default under `controllerProfiles/` (never overwriting a
+user's own file of that name) — see docs/hardware-recon.md.
 
 ## Auto-launch from the Steam Library
 

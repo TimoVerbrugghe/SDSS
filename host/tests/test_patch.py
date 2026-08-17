@@ -99,6 +99,52 @@ class TestTomlEdits(unittest.TestCase):
         self.assertIn("ScreenSizing = 3", window0)
 
 
+class TestWriteFileIfAbsent(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_creates_missing_file_and_its_parent_dir(self):
+        path = self.root / "controllerProfiles" / "DeckGamePad.txt"
+        journal = patch.Journal(self.root / "journal", "session")
+
+        written = patch.write_file_if_absent(path, "[General]\nemulate = Wii U GamePad\n", journal)
+
+        self.assertTrue(written)
+        self.assertEqual(path.read_text(), "[General]\nemulate = Wii U GamePad\n")
+
+    def test_never_overwrites_an_existing_file(self):
+        path = self.root / "DeckGamePad.txt"
+        path.write_text("user's own mapping")
+        journal = patch.Journal(self.root / "journal", "session")
+
+        written = patch.write_file_if_absent(path, "template content", journal)
+
+        self.assertFalse(written)
+        self.assertEqual(path.read_text(), "user's own mapping")
+
+    def test_teardown_removes_a_file_it_created(self):
+        path = self.root / "DeckGamePad.txt"
+        journal = patch.Journal(self.root / "journal", "session")
+
+        patch.write_file_if_absent(path, "template content", journal)
+        self.assertTrue(path.is_file())
+
+        journal.restore_snapshots()
+        self.assertFalse(path.exists())
+
+    def test_teardown_leaves_a_preexisting_file_untouched(self):
+        path = self.root / "DeckGamePad.txt"
+        path.write_text("user's own mapping")
+        journal = patch.Journal(self.root / "journal", "session")
+
+        patch.write_file_if_absent(path, "template content", journal)
+        journal.restore_snapshots()
+
+        self.assertEqual(path.read_text(), "user's own mapping")
+
+
 class TestJournal(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -64,6 +65,45 @@ class TestConfigTargets(unittest.TestCase):
         self.assertIn(("open_pad", "true"), values)
         self.assertIn(("controllerProfile", "DeckGamePad"), values)
         self.assertIn(("controller_profile", "DeckGamePad"), values)
+
+    def test_no_gamepad_profile_env_means_no_edits_and_no_files(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            edits = profiles.CEMU.configs[0].resolved_edits()
+            files = profiles.CEMU.resolved_files()
+        values = {(edit.key, edit.value) for edit in edits}
+        self.assertIn(("open_pad", "true"), values)
+        self.assertNotIn("controllerProfile", {key for key, _ in values})
+        self.assertEqual(files, ())
+
+
+class TestCemuGamepadProfileFile(unittest.TestCase):
+    def test_creates_a_default_profile_file_target_named_after_the_env_var(self):
+        with unittest.mock.patch.dict(os.environ, {"SDSS_CEMU_GAMEPAD_PROFILE": "DeckGamePad"}):
+            files = profiles.CEMU.resolved_files()
+        self.assertEqual(len(files), 1)
+        target = files[0]
+        self.assertEqual(
+            target.resolve(),
+            Path(os.path.expanduser("~/.config/Cemu/controllerProfiles/DeckGamePad.txt")),
+        )
+        self.assertIn("emulate = Wii U GamePad", target.content)
+        self.assertIn("[General]", target.content)
+
+    def test_no_env_var_means_no_file_target(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(profiles.CEMU.resolved_files(), ())
+
+    def test_path_separators_are_rejected(self):
+        with unittest.mock.patch.dict(os.environ, {"SDSS_CEMU_GAMEPAD_PROFILE": "../../etc/x"}):
+            with self.assertRaises(ValueError):
+                profiles.CEMU.resolved_files()
+            with self.assertRaises(ValueError):
+                profiles.CEMU.configs[0].resolved_edits()
+
+    def test_plain_names_are_accepted(self):
+        with unittest.mock.patch.dict(os.environ, {"SDSS_CEMU_GAMEPAD_PROFILE": "Deck Gamepad-1"}):
+            files = profiles.CEMU.resolved_files()
+        self.assertEqual(len(files), 1)
 
 
 class TestSwayConfig(unittest.TestCase):

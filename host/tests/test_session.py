@@ -128,6 +128,67 @@ class WriteArtifactsTests(unittest.TestCase):
         self.assertNotIn("xdotool", script)
 
 
+class PatchConfigsTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        env = {
+            "HOME": str(self.root),
+            "XDG_RUNTIME_DIR": str(self.root / "runtime"),
+            "XDG_CONFIG_HOME": str(self.root / "config"),
+            "XDG_STATE_HOME": str(self.root / "state"),
+            "XDG_DATA_HOME": str(self.root / "data"),
+        }
+        patcher = mock.patch.dict("os.environ", env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_creates_the_cemu_gamepad_profile_before_pointing_settings_xml_at_it(self):
+        from sdss.profiles import CEMU
+
+        cemu_config = self.root / ".config" / "Cemu"
+        cemu_config.mkdir(parents=True)
+        (cemu_config / "settings.xml").write_text(
+            "<content><open_pad>false</open_pad><controllerProfile></controllerProfile>"
+            "</content>"
+        )
+
+        with mock.patch.dict(os.environ, {"SDSS_CEMU_GAMEPAD_PROFILE": "DeckGamePad"}):
+            session = Session(profile=CEMU, command=["cemu"])
+            changed = session.patch_configs()
+
+        profile_file = cemu_config / "controllerProfiles" / "DeckGamePad.txt"
+        self.assertIn(profile_file, changed)
+        self.assertIn("emulate = Wii U GamePad", profile_file.read_text())
+        settings = (cemu_config / "settings.xml").read_text()
+        self.assertIn("DeckGamePad", settings)
+
+        session.journal.restore_snapshots()
+        self.assertFalse(profile_file.exists())
+
+    def test_does_not_overwrite_an_existing_gamepad_profile(self):
+        from sdss.profiles import CEMU
+
+        cemu_config = self.root / ".config" / "Cemu"
+        (cemu_config / "controllerProfiles").mkdir(parents=True)
+        (cemu_config / "settings.xml").write_text(
+            "<content><open_pad>false</open_pad></content>"
+        )
+        profile_file = cemu_config / "controllerProfiles" / "DeckGamePad.txt"
+        profile_file.write_text("user's own mapping")
+
+        with mock.patch.dict(os.environ, {"SDSS_CEMU_GAMEPAD_PROFILE": "DeckGamePad"}):
+            session = Session(profile=CEMU, command=["cemu"])
+            changed = session.patch_configs()
+
+        self.assertNotIn(profile_file, changed)
+        self.assertEqual(profile_file.read_text(), "user's own mapping")
+
+        session.journal.restore_snapshots()
+        self.assertEqual(profile_file.read_text(), "user's own mapping")
+
+
 class SunshinePinFifoTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

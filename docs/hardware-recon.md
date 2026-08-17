@@ -57,6 +57,48 @@ Other Flatpaks include RetroArch 1.22.2, Dolphin, PPSSPP.
 
 `open_pad` is the "Separate GamePad view" toggle.
 
+### Cemu — creating a default controller profile
+
+`SDSS_CEMU_GAMEPAD_PROFILE=<name>` makes `sdss` point `settings.xml`'s
+`controllerProfile`/`controller_profile` keys at `<name>`, so Cemu's input page opens with
+that profile selected. If `~/.config/Cemu/controllerProfiles/<name>.txt` doesn't already
+exist, `sdss` now creates it (never overwriting one that does) so the profile is there to
+select in the first place, instead of Cemu falling back to no assigned profile.
+
+Cemu controller profiles are plain INI-style text, not XML — one file per profile, found by
+name under `controllerProfiles/`. A real example (`api = DirectInput`, targeting a vJoy
+device) confirms the `[General]`/`[Controller]` shape:
+
+```
+[General]
+emulate = Wii U GamePad
+api = DirectInput
+controller = 0
+
+[Controller]
+rumble = 0
+leftRange = 1
+rightRange = 1
+leftDeadzone = 0
+rightDeadzone = 0
+buttonThreshold = 0.5
+1 = button_1
+2 = button_2
+...
+```
+
+The numbered keys below `[Controller]` (Cemu's fixed Wii U GamePad button legend) are
+bound to values (`button_<mask>`, `axis_<n>`, …) that are specific to the physical
+device *and* input API — the DirectInput/vJoy example above encodes each button as a hex
+bitmask that has no equivalent for SDL. **Unverified on real hardware**: what SDL reports
+`controller = 0` as once SteamOS's Deck touch/gamepad devices are behind it, so SDSS's
+generated default (`sdss/profiles.py:_CEMU_GAMEPAD_PROFILE_TEMPLATE`) stops at `[General]`
++ deadzones and deliberately omits per-button bindings rather than guess ones that could
+silently bind nothing. The one-time mapping still has to happen in Cemu's own input UI;
+this only saves creating the profile file/dropdown entry by hand. Needs a spike once a Deck
+is paired to a Steam Machine to record what Cemu's SDL controller list actually shows and
+fill in a verified per-button mapping.
+
 ### Azahar — separate windows
 
 `~/.config/azahar-emu/qt-config.ini`, section `[Layout]`. From
