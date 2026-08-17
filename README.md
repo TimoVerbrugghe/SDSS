@@ -60,7 +60,7 @@ Early development. See [docs/PLAN.md](docs/PLAN.md) for the phased plan and
 | P3 touch bridge | `sdss-inputd` implemented; streams verified end to end |
 | P4 Decky plugin | implemented — toggles second screen mode and restores configs |
 | P5 Deck helper | `deck/install.sh` + `deck/sdss-connect.sh` |
-| P6 packaging | `install.sh` covers both endpoints from one `.desktop` launcher |
+| P6 packaging | one AppImage: installer on first run, management app afterwards |
 
 ## Repo layout
 
@@ -69,24 +69,34 @@ host/       Python package `sdss` — launch wrapper, compositor + Sunshine conf
 plugin/     Decky plugin (Steam Machine UI)
 deck/       Steam Deck side helper (Moonlight auto-connect)
 runtime/    Build recipes for the bundled sway/wlroots compositor
-packaging/  Host installer, uninstaller, udev rule, desktop launcher
+packaging/  Host installer, uninstaller, udev rule, desktop entry, AppImage recipe
+app/        The SDSS desktop app (install, status dashboard, update, uninstall)
 docs/       Plan, architecture, spike results
 assets/     Logo and other artwork
 ```
 
 ## Install
 
-Copy this repository to the device (or clone it), then either double-click
-**Install SDSS** in the file manager or run:
+Download **`SDSS.AppImage`** from the [latest release](../../releases/latest), make it
+executable, and run it — on the Steam Machine, on the Deck, or both:
 
 ```bash
-./install.sh
+chmod +x SDSS.AppImage
+./SDSS.AppImage
 ```
 
-The installer detects whether it is on a Steam Machine (`Fremont`) or a Steam Deck
-(`Jupiter` / `Galileo`) and asks for confirmation, then remembers the answer. It copies
-itself to `~/.local/share/sdss/release` and adds an **Install or Update SDSS** launcher
-that re-runs the endpoint setup from there.
+A download or a copy from a USB stick usually loses the executable bit. In Dolphin:
+right-click → **Properties** → **Permissions** → tick **Is executable**. If the AppImage
+refuses to start because FUSE is missing, run it as
+`./SDSS.AppImage --appimage-extract-and-run`.
+
+The app detects whether it is on a Steam Machine (`Fremont`) or a Steam Deck
+(`Jupiter` / `Galileo`) and preselects it; a Deck install also asks for the Steam Machine's
+address. Everything the installer does is streamed into a log pane — nothing is hidden.
+
+The AppImage carries the whole SDSS tree, so it is the installer *and* the payload: there is
+no clone and no unzip step. On success it copies itself to `~/Applications/SDSS.AppImage`
+and adds a single **SDSS** entry to the application menu.
 
 | | Steam Machine (host) | Steam Deck (client) |
 | --- | --- | --- |
@@ -96,20 +106,56 @@ that re-runs the endpoint setup from there.
 | Extras | compositor image, Decky plugin | Steam shortcut + library artwork + controller template |
 
 Nothing is written outside `$HOME` except two files under `/etc` — the udev rule and its
-SteamOS atomic-update keep-list entry, which is what makes the rule survive OS updates.
+SteamOS atomic-update keep-list entry, which is what makes the rule survive OS updates. The
+SteamOS rootfs is never modified: no `pacman`, no `steamos-readonly disable`.
 
-Non-interactive:
+If the password prompt fails, the install still completes everything else and the udev row
+in the dashboard goes red with a **Fix** button. A Deck fresh out of the box often has no
+password set at all; the app says so and points at `passwd`.
+
+### The app after installing
+
+Reopening the AppImage shows a status dashboard instead of the installer:
+
+- installed version, endpoint role and install path;
+- a health row per component (Sunshine/Moonlight, the `sdss` shim, the udev rule, the
+  compositor image, the Decky plugin, `PATH`), each with a **Fix** button that runs exactly
+  the same script the installer would;
+- second screen state — the global toggle and each emulator profile, including whether its
+  launcher wrapper is currently in place (an EmuDeck emulator update can silently overwrite
+  it; opening the app re-wraps it);
+- which emulator configs are currently patched, with **Restore all**;
+- **Check for updates**, **Repair**, **Uninstall** and **Open log**.
+
+### Command line
+
+The GUI is never the only way to do anything. The AppImage takes the same flags, which is
+what SSH and CI use:
+
+```bash
+./SDSS.AppImage --role steam-machine
+./SDSS.AppImage --role steam-deck --host 10.0.0.5
+./SDSS.AppImage --status          # the dashboard's data as JSON
+./SDSS.AppImage --uninstall
+```
+
+From a checkout, the underlying scripts work exactly as before and remain the supported
+advanced path:
 
 ```bash
 ./install.sh --role steam-machine
-./install.sh --role steam-deck --host 10.0.0.5
+~/.local/share/sdss/release/packaging/uninstall.sh
 ```
 
 ### Updating
 
-The desktop launcher runs the *installed* copy, so on its own it only re-runs the endpoint
-setup — it has no newer code to copy. To pick up a new version, point it at a fresh
-checkout:
+**Check for updates** in the app compares the installed version against the latest GitHub
+release, downloads the new AppImage, verifies its published checksum, replaces
+`~/Applications/SDSS.AppImage` atomically and re-runs the install from the new payload. An
+update with no published checksum is refused. Being offline is not an error — the check
+just reports that it could not run.
+
+Developers can point the same flow at a locally built file, or install from a checkout:
 
 ```bash
 ./install.sh                       # from the new checkout, or
@@ -121,15 +167,19 @@ put back.
 
 ### Uninstalling
 
+**Uninstall** in the app, or:
+
 ```bash
 ~/.local/share/sdss/release/packaging/uninstall.sh
 ```
 
-This restores every emulator config SDSS patched *before* removing anything, then deletes
-the release, the `sdss` shim, the launcher, the Decky plugin and the compositor image. On a
-Deck install it also removes `sdss-connect`, the SDSS Steam shortcut, and the SDSS
-controller template. The udev rule is left in place (it is inert without SDSS); the command
-to remove it is printed by `uninstall.sh --help`.
+Either way the same script runs. It restores every emulator config SDSS patched *before*
+removing anything, then deletes the release, the `sdss` shim, the desktop entry, the Decky
+plugin and the compositor image. On a Deck install it also removes `sdss-connect`, the SDSS
+Steam shortcut, and the SDSS controller template. Tick **keep emulator configs patched** to
+skip the restore. The two `/etc` files are left in place (they are inert without SDSS); the
+app offers to remove them, and `uninstall.sh --help` prints the command. The AppImage itself
+is removed last, since it is the running process.
 
 Development on the host uses the same package directly:
 
@@ -137,6 +187,16 @@ Development on the host uses the same package directly:
 PYTHONPATH=host/src python3 -m sdss.cli doctor
 cd host && python3 -m unittest discover -s tests
 ```
+
+### Building the AppImage
+
+```bash
+packaging/appimage/build.sh          # writes dist/SDSS-x86_64.AppImage + .sha256
+```
+
+It downloads a pinned standalone CPython and PySide6 and packs them with the tracked tree,
+so the result depends on nothing in the SteamOS rootfs. Never build on the target — CI does
+it on `ubuntu-latest`.
 
 ### Decky plugin
 

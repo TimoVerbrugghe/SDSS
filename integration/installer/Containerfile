@@ -1,0 +1,15 @@
+ARG BASE_IMAGE=localhost/sdss-compositor:latest
+FROM ${BASE_IMAGE}
+
+RUN pacman -S --noconfirm --needed fuse2 \
+    && pacman -Scc --noconfirm \
+    && useradd --create-home --uid 1000 deck \
+    && install -d --owner deck --group deck --mode 0700 /run/user/1000 \
+    && printf 'NAME="SteamOS"\nID=steamos\nID_LIKE=arch\n' > /etc/os-release
+
+COPY integration/installer/sway.conf /etc/sdss-installer-test-sway.conf
+COPY integration/installer/drive.py /opt/sdss-installer-test/drive.py
+COPY integration/installer/test.sh /opt/sdss-installer-test/test.sh
+RUN chmod 0755 /opt/sdss-installer-test/test.sh /opt/sdss-installer-test/drive.py
+
+USER deck

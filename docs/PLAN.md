@@ -168,9 +168,56 @@ host/       Python package `sdss`
 plugin/     Decky plugin (TS frontend + Python backend shelling out to `sdss`)
 deck/       Deck-side Moonlight auto-connect helper
 runtime/    Build recipe for the bundled sway/wlroots compositor
-packaging/  host installer, uninstaller, udev rule, desktop launcher
+packaging/  host installer, uninstaller, udev rule, desktop entry, AppImage recipe
+app/        the SDSS desktop app: `core/` decisions (stdlib), `ui/` Qt front end
 docs/       this plan, recon notes, spike results
 ```
+
+## Delivery: one AppImage, installer and management app
+
+SDSS ships as a single `SDSS.AppImage` that is both the first-run installer and the
+permanent management app, the way EmuDeck's app behaves. Deliberately **not** a local web
+server and browser page: that is not an application, it needs a browser, and it is awkward
+in Desktop Mode. Flatpak was rejected too — the installer has to write `~/.local/bin` and
+`~/homebrew`, run `podman`, `flatpak install --user` and `sudo`, and a sandbox fights all of
+it. The AppImage carries its own Python and Qt, so it depends on nothing in the read-only
+rootfs and survives a SteamOS update that changes what is installed there.
+
+Load-bearing properties:
+
+- **The AppImage embeds the whole tracked tree.** Installing is `install.sh --source
+  <mountpoint>`; there is no clone and no unzip step. A newer AppImage therefore *is* newer
+  code, which is what the old "the launcher runs the installed copy and has no newer code to
+  copy" wart could not do. `install.sh` remains the only code that moves files, and keeps
+  its atomic swap, rollback and `--source` marker validation.
+- **The GUI never re-implements install logic.** Every button shells out to the same
+  `install.sh` / `packaging/uninstall.sh` / `sdss` entry point a shell user would run, and
+  streams its output verbatim into a log pane. Nothing the app does may be impossible from a
+  terminal, and `sdss-app` accepts `--role/--host/--stage-only/--uninstall` for SSH and CI.
+- **Decisions live in `app/core/`, rendering in `app/ui/`.** `app/core` is stdlib-only and
+  unit-tested against fake subprocess results on a CI runner with no display; `app/ui` only
+  renders state and forwards button presses. Same discipline as `sdss-inputd`, and the
+  reason the tests mean anything for a component that is otherwise unobservable off-hardware.
+- **Third-party dependency boundary.** `host/src/sdss/**` stays standard-library-only,
+  forever. PySide6 is allowed **only** in `app/ui/` and only inside the AppImage build; no
+  `sdss` module and no `app/core` module may import it. `host/tests/test_appimage.py`
+  asserts this rather than trusting it.
+- **Machine-readable interfaces, never screen-scraping.** The dashboard is built from
+  `sdss doctor --json` and `sdss status --json`, and from `.sdss-release.json`, a version
+  marker `install.sh` writes into the release directory so the app reports what is actually
+  installed rather than what the app itself is.
+- **Elevation has no tty.** `install-udev-rule.sh` needs root: prefer `pkexec` when a polkit
+  agent is running, else feed a dialog password to `sudo -S` (never echoed, logged or
+  persisted), and detect the "deck user has no password" case explicitly instead of looping
+  on failed auth. If elevation is refused the install still completes everything else and
+  the udev row goes red with a Fix button — it must not abort halfway.
+- **Updates are verified.** The app checks GitHub Releases, refuses an update with no
+  published checksum, and replaces `~/Applications/SDSS.AppImage` atomically before
+  re-execing. A failed check is a normal state ("could not check"), not an error dialog.
+
+Built on `ubuntu-latest` in CI, never on the target — nothing new is ever installed on
+SteamOS. `plugin/dist/index.js` stays prebuilt and committed; the AppImage packs it and
+never runs npm.
 
 ## Phases
 
@@ -182,7 +229,7 @@ docs/       this plan, recon notes, spike results
 | P3 | Touch input bridge (`sdss-inputd`) |
 | P4 | Decky plugin |
 | P5 | Deck-side auto-connect helper |
-| P6 | Packaging, install/update, docs |
+| P6 | Packaging, install/update, docs — delivered as a single AppImage (below) |
 
 ## Spikes
 

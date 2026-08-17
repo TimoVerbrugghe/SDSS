@@ -247,3 +247,25 @@ real templates directory (78 files after install):
   `ts_n` binding, not two.
 - Installing twice leaves no `.tmp`/`.new` debris — the atomic write cleans up after
   itself — and all 78 templates still parse afterwards.
+
+## AppImage app — pending hardware checks (not yet run)
+
+The desktop app (`app/`, shipped as `SDSS.AppImage`) is built and tested on CI, which shares
+nothing important with the target: no SteamOS, no Plasma session, no Deck screen. These five
+questions decide whether the design holds, and none of them is answerable from a runner.
+Record the output here as each is answered, and mark it verified.
+
+| # | Question | Command | State |
+| --- | --- | --- | --- |
+| 1 | Does a CI-built python+Qt AppImage start on SteamOS Desktop, and is FUSE present? | `./SDSS.AppImage --self-test` then, if it fails, `./SDSS.AppImage --appimage-extract-and-run --self-test`; `lsmod \| grep fuse`, `ls -l /dev/fuse` | pending |
+| 2 | Is a polkit agent running in the Plasma session, and does `pkexec` prompt there? | `ls /proc/*/comm \| xargs grep -l polkit 2>/dev/null`; `pkexec true` from a Konsole inside the session | pending |
+| 3 | Does the `deck` user have a password on each box? | `passwd -S deck`; `sudo -n true; echo $?` | pending |
+| 4 | Does a file copied from a USB stick / downloaded keep its executable bit? | `ls -l ~/Downloads/SDSS.AppImage` after each transfer path | pending |
+| 5 | Is the window usable at the Deck's 1280×800 with the default scaling, trackpad only? | run it in Deck Desktop Mode; note whether any control is off-screen or needs a scroll | pending |
+
+Why each matters: (1) decides whether the README must lead with
+`--appimage-extract-and-run`; (2) and (3) decide which elevation branch users actually hit
+(`app/core/elevate.py` plans root → passwordless sudo → pkexec → `sudo -S` → unavailable, and
+the "no password set" case has to be reported as `passwd` instructions, not a failed-auth
+loop); (4) is the single most likely first-run failure, since a browser download drops `+x`;
+(5) is the only one that can force a UI change rather than a doc change.

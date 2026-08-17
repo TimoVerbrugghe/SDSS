@@ -199,8 +199,29 @@ install_release() {
 install_desktop_launcher() {
     local applications="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
     mkdir -p "$applications"
-    install -m 0644 "$INSTALL_ROOT/packaging/sdss-installer.desktop" \
-        "$applications/sdss-installer.desktop"
+    install -m 0644 "$INSTALL_ROOT/packaging/sdss.desktop" \
+        "$applications/sdss.desktop"
+    # Superseded by sdss.desktop; an install that predates the app would otherwise leave a
+    # second, now-wrong entry ("Install or Update SDSS") in the menu forever.
+    rm -f "$applications/sdss-installer.desktop"
+}
+
+write_release_marker() {
+    # Lets the desktop app report what is *installed* rather than what it is itself; the
+    # two differ as soon as a newer AppImage is opened without installing. Written after
+    # the swap so it always describes the tree that is actually in place.
+    local version="unknown" stamp
+    if [[ -r "$INSTALL_ROOT/VERSION" ]]; then
+        version="$(<"$INSTALL_ROOT/VERSION")"
+    fi
+    # Whitespace and anything that would need JSON escaping is dropped rather than
+    # escaped: the value is ours to begin with, and a broken marker would make every
+    # status read fail to parse.
+    version="${version//[^A-Za-z0-9.+_-]/}"
+    [[ -n "$version" ]] || version="unknown"
+    stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '{\n  "version": "%s",\n  "installed_at": "%s"\n}\n' "$version" "$stamp" \
+        > "$INSTALL_ROOT/.sdss-release.json"
 }
 
 choose_role
@@ -212,6 +233,7 @@ esac
 require_steamos
 install_release
 install_desktop_launcher
+write_release_marker
 mkdir -p "$CONFIG_DIR"
 printf '%s\n' "$ROLE" > "$CONFIG_DIR/installed-role"
 
