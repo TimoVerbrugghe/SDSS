@@ -293,13 +293,33 @@ class Journal:
         for entry in self._load():
             path = Path(entry["path"])
             snapshots = entry.get("snapshots")
-            if isinstance(snapshots, list) and path.is_file():
-                current = path.read_text()
-                updated = current
-                for snapshot in snapshots:
-                    updated = _restore_snapshot(updated, snapshot)
-                if updated != current:
-                    _write_atomic(path, updated.encode())
+            if isinstance(snapshots, list):
+                if path.is_file():
+                    current = path.read_text()
+                    updated = current
+                    for snapshot in snapshots:
+                        updated = _restore_snapshot(updated, snapshot)
+                    if updated != current:
+                        _write_atomic(path, updated.encode())
+                    restored.append(path)
+                    continue
+
+                # Snapshot-aware rollback needs a live file. If it disappeared while SDSS was
+                # active, restoring the recorded backup is the safest recovery path.
+                if entry["existed"]:
+                    backup = self.files / entry["backup"]
+                    try:
+                        data = backup.read_bytes()
+                    except FileNotFoundError as exc:
+                        raise PatchError(
+                            f"backup for {path} is missing (expected at {backup}) — refusing to restore"
+                        ) from exc
+                    expected = entry.get("sha256")
+                    if expected is not None and _digest(data) != expected:
+                        raise PatchError(
+                            f"backup for {path} is corrupted (sha256 mismatch) — refusing to restore"
+                        )
+                    _write_atomic(path, data)
                 restored.append(path)
                 continue
 

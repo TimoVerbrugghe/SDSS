@@ -1,3 +1,4 @@
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -52,6 +53,17 @@ class TestX11Requirement(unittest.TestCase):
         self.assertTrue(profiles.CEMU.needs_x11)
         self.assertTrue(profiles.MELONDS.needs_x11)
         self.assertFalse(profiles.AZAHAR.needs_x11)
+
+
+class TestConfigTargets(unittest.TestCase):
+    def test_cemu_edits_read_env_at_resolution_time(self):
+        target = profiles.CEMU.configs[0]
+        with unittest.mock.patch.dict(os.environ, {"SDSS_CEMU_GAMEPAD_PROFILE": "DeckGamePad"}):
+            edits = target.resolved_edits()
+        values = {(edit.key, edit.value) for edit in edits}
+        self.assertIn(("open_pad", "true"), values)
+        self.assertIn(("controllerProfile", "DeckGamePad"), values)
+        self.assertIn(("controller_profile", "DeckGamePad"), values)
 
 
 class TestSwayConfig(unittest.TestCase):

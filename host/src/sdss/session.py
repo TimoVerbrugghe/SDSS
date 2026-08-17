@@ -108,7 +108,7 @@ class Session:
         changed: list[Path] = []
         for target in self.profile.configs:
             path = target.resolve()
-            if patch.patch_file(path, target.format, target.edits, journal):
+            if patch.patch_file(path, target.format, target.resolved_edits(), journal):
                 changed.append(path)
         return changed
 

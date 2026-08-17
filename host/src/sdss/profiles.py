@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,10 +29,13 @@ def _cemu_edits() -> tuple[Edit, ...]:
 class ConfigTarget:
     path: str
     format: str
-    edits: tuple[Edit, ...]
+    edits: tuple[Edit, ...] | Callable[[], tuple[Edit, ...]]
 
     def resolve(self) -> Path:
         return Path(os.path.expanduser(self.path))
+
+    def resolved_edits(self) -> tuple[Edit, ...]:
+        return self.edits() if callable(self.edits) else self.edits
 
 
 @dataclass(frozen=True)
@@ -93,7 +97,7 @@ CEMU = Profile(
         ConfigTarget(
             path="~/.config/Cemu/settings.xml",
             format=XML,
-            edits=_cemu_edits(),
+            edits=_cemu_edits,
         ),
     ),
     # Verified on hardware: "GamePad View - FPS: 60.10", class Cemu.
