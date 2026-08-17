@@ -149,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
         return _print_status()
     if args.self_test:
         return _self_test()
-    explicit = bool(args.uninstall or args.role or args.stage_only)
+    explicit = bool(args.uninstall or args.role)
     if explicit:
         return _headless(args)
     if args.no_gui or not has_display():

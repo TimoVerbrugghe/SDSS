@@ -615,6 +615,15 @@ class AppCliTest(_Sandbox):
             app_cli.main([])
         gui.assert_called_once()
 
+    def test_stage_only_uses_the_gui_when_a_display_is_available(self):
+        with mock.patch.object(app_cli, "_headless", return_value=0) as headless, mock.patch.object(
+            app_cli, "_gui", return_value=0
+        ) as gui, mock.patch.object(app_cli, "has_display", return_value=True):
+            app_cli.main(["--stage-only"])
+        headless.assert_not_called()
+        gui.assert_called_once()
+        self.assertTrue(gui.call_args.args[0].stage_only)
+
     def test_headless_install_forwards_the_role_and_host(self):
         recorded = {}
 

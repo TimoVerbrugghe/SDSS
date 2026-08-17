@@ -233,8 +233,9 @@ class UpdateDialog(QDialog):
 
 
 class MainWindow(QWidget):
-    def __init__(self) -> None:
+    def __init__(self, *, stage_only: bool = False) -> None:
         super().__init__()
+        self.stage_only = stage_only
         self.setWindowTitle("SDSS — Steam Deck Second Screen")
         # Fits the Deck's 1280x800 panel with room for SteamOS's default scaling.
         self.resize(980, 720)
@@ -304,7 +305,7 @@ class MainWindow(QWidget):
     # -- actions -------------------------------------------------------------
 
     def install(self, role: str, host: str | None) -> None:
-        command = actions.install_command(role, host)
+        command = actions.install_command(role, host, stage_only=self.stage_only)
 
         def task(emit):
             emit("$ " + " ".join(command))
@@ -495,7 +496,7 @@ class MainWindow(QWidget):
 def run_gui(args: argparse.Namespace) -> int:
     application = QApplication(sys.argv[:1])
     application.setApplicationName("SDSS")
-    window = MainWindow()
+    window = MainWindow(stage_only=args.stage_only)
     window.show()
     return application.exec()
 
