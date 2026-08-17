@@ -10,6 +10,6 @@ RUN pacman -S --noconfirm --needed fuse2 \
 COPY integration/installer/sway.conf /etc/sdss-installer-test-sway.conf
 COPY integration/installer/drive.py /opt/sdss-installer-test/drive.py
 COPY integration/installer/test.sh /opt/sdss-installer-test/test.sh
-RUN chmod 0755 /opt/sdss-installer-test/test.sh
+RUN chmod 0755 /opt/sdss-installer-test/test.sh /opt/sdss-installer-test/drive.py
 
 USER deck
