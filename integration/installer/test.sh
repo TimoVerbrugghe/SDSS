@@ -29,7 +29,13 @@ for _ in $(seq 1 100); do
     swaymsg -t get_outputs >/dev/null 2>&1 && break
     sleep 0.1
 done
-swaymsg -t get_outputs >/dev/null
+swaymsg -t get_outputs | python3 -c '
+import json
+import sys
+
+names = {output["name"] for output in json.load(sys.stdin)}
+assert {"HEADLESS-1", "HEADLESS-2"} <= names, names
+'
 
 "$APPIMAGE" --version
 "$APPIMAGE" --status >"$ARTIFACTS/status.json"
