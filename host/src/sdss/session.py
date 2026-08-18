@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import compositor, launch, paths, patch, runtime, stream
-from .compositor import CompositorSpec, OutputMode, environment, render_config
+from .compositor import DECK_PANEL_RESOLUTION, CompositorSpec, OutputMode, environment, render_config
 from .profiles import Profile
 
 log = logging.getLogger("sdss.session")
@@ -86,7 +86,7 @@ class Session:
             profile=self.profile,
             env_dump=str(dump),
             tv=tv,
-            second=OutputMode(*self.profile.second_size),
+            second=OutputMode(*DECK_PANEL_RESOLUTION),
             main_output=main_output,
         )
         config = runtime_dir / "sway.conf"

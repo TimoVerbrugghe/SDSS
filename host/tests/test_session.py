@@ -48,10 +48,14 @@ class WriteArtifactsTests(unittest.TestCase):
         config = artifacts["sway_config"].read_text()
         self.assertIn("output WL-1 mode 1280x800@60Hz position 0 0", config)
 
-    def test_headless_output_uses_the_profiles_native_second_size(self):
-        # Regression test: write_artifacts() used to hardcode a 1280x800 HEADLESS-1
-        # output for every profile, silently ignoring each Profile's own
-        # `second_size` (e.g. Azahar's 320x240 native second-screen resolution).
+    def test_headless_output_is_always_the_decks_panel_resolution(self):
+        # Regression test (inverted from the original): HEADLESS-1 must always be
+        # 1280x800 (the Deck's own panel resolution — see
+        # compositor.DECK_PANEL_RESOLUTION) regardless of the profile, even though
+        # Azahar's second screen natively renders at 320x240. Sizing HEADLESS-1 to a
+        # profile's native size used to make Moonlight rescale the stream on top of
+        # Azahar's own internal 4:3 letterboxing, producing a squashed picture on the
+        # Deck.
         with mock.patch.object(
             runtime, "outer_gamescope_resolution", return_value=(1280, 800)
         ), mock.patch.object(runtime, "parent_display", return_value=("wayland", "gamescope-0")):
@@ -59,8 +63,7 @@ class WriteArtifactsTests(unittest.TestCase):
             artifacts = session.write_artifacts()
 
         config = artifacts["sway_config"].read_text()
-        width, height = AZAHAR.second_size
-        self.assertIn(f"output HEADLESS-1 mode {width}x{height}@60Hz", config)
+        self.assertIn("output HEADLESS-1 mode 1280x800@60Hz", config)
 
     def test_falls_back_to_1920x1080_when_no_outer_gamescope_found(self):
         with mock.patch.object(
