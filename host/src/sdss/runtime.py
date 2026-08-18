@@ -114,6 +114,50 @@ def own_cgroup() -> str | None:
     return None
 
 
+X11_SOCKET_DIR = Path("/tmp/.X11-unix")
+
+
+def prepare_x11_socket_dir(runtime_dir: Path, source: Path | None = None) -> Path:
+    """Return a directory to bind onto /tmp/.X11-unix that Xwayland will accept.
+
+    The host's /tmp/.X11-unix is root:root 1777. Under rootless podman with
+    --userns=keep-id, only our own uid is mapped, so host root shows up inside the
+    container as `nobody` (65534). wlroots refuses to start Xwayland unless the
+    socket directory is owned by root *or* the current user (xwayland/sockets.c:83
+    "not owned by root or us") and has the sticky bit (sockets.c:90), so mounting
+    the host directory straight through breaks every needs_x11 profile (melonDS,
+    Cemu) with "Failed to start Xwayland".
+
+    Mirroring the host's sockets into a directory we own satisfies the ownership
+    check while keeping the parent display reachable: the existing X0/X1 entries
+    are hardlinked (copied if that fails across filesystems) so the nested sway's
+    wlr_x11_backend can still connect out, and sway's own Xwayland creates its new
+    socket here. Host-side emulators reach that new socket because the abstract
+    socket namespace is shared via --network=host, which is what they actually
+    connect over — the filesystem entry only has to exist somewhere writable.
+    """
+    target = runtime_dir / "sdss-x11"
+    source = source if source is not None else X11_SOCKET_DIR
+    target.mkdir(parents=True, exist_ok=True)
+    try:
+        for entry in source.iterdir():
+            mirror = target / entry.name
+            if mirror.exists():
+                continue
+            try:
+                os.link(entry, mirror)
+            except OSError:
+                # Cross-device or a socket we may not link — the abstract namespace
+                # still carries the connection, so a missing mirror is not fatal.
+                pass
+    except OSError:
+        pass
+    # Sticky bit last: mkdir honours the process umask, and wlroots checks for it
+    # separately from ownership.
+    os.chmod(target, 0o1777)
+    return target
+
+
 def compositor_command(config: Path, runtime_dir: Path, home: Path | None = None) -> list[str]:
     sway = native_sway()
     if sway:
@@ -123,6 +167,7 @@ def compositor_command(config: Path, runtime_dir: Path, home: Path | None = None
 
     home = home or Path.home()
     parent = own_cgroup()
+    x11_dir = prepare_x11_socket_dir(runtime_dir)
     return [
         "podman",
         # podman's default systemd cgroup manager refuses a --cgroup-parent that is a
@@ -153,7 +198,11 @@ def compositor_command(config: Path, runtime_dir: Path, home: Path | None = None
         # new socket file here for needs_x11 profiles (Cemu, melonDS) — the host-side
         # emulator process connects to that new socket, which a ro mount would prevent
         # the container from creating in the first place.
-        "--volume=/tmp/.X11-unix:/tmp/.X11-unix",
+        #
+        # Sourced from prepare_x11_socket_dir() rather than /tmp/.X11-unix directly: the
+        # host directory is root-owned, which --userns=keep-id maps to `nobody` inside
+        # the container, and wlroots then refuses to start Xwayland at all.
+        f"--volume={x11_dir}:/tmp/.X11-unix",
         # The touch bridge reads and grabs Sunshine's virtual input devices.
         "--volume=/dev/input:/dev/input",
         "--device=/dev/input",

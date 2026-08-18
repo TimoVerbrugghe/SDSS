@@ -1,4 +1,6 @@
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,11 +20,12 @@ class CompositorCommandTests(unittest.TestCase):
         with mock.patch.object(runtime, "native_sway", return_value=None), mock.patch.object(
             runtime, "podman_available", return_value=True
         ), mock.patch.object(runtime, "own_cgroup", return_value=None):
-            command = runtime.compositor_command(
-                Path("/run/user/1000/sdss/session/sway.conf"),
-                Path("/run/user/1000"),
-                home=Path("/home/deck"),
-            )
+            with tempfile.TemporaryDirectory() as tmp:
+                command = runtime.compositor_command(
+                    Path("/run/user/1000/sdss/session/sway.conf"),
+                    Path(tmp),
+                    home=Path("/home/deck"),
+                )
         self.assertIn("--pid=host", command)
         self.assertIn("--cgroupns=host", command)
 
@@ -40,11 +43,12 @@ class CompositorCommandTests(unittest.TestCase):
             return_value="user.slice/user-1000.slice/user@1000.service/app.slice/"
             "app-steam-app3216885850-80042.scope",
         ):
-            command = runtime.compositor_command(
-                Path("/run/user/1000/sdss/session/sway.conf"),
-                Path("/run/user/1000"),
-                home=Path("/home/deck"),
-            )
+            with tempfile.TemporaryDirectory() as tmp:
+                command = runtime.compositor_command(
+                    Path("/run/user/1000/sdss/session/sway.conf"),
+                    Path(tmp),
+                    home=Path("/home/deck"),
+                )
         self.assertIn(
             "--cgroup-parent=/user.slice/user-1000.slice/user@1000.service/app.slice/"
             "app-steam-app3216885850-80042.scope",
@@ -120,3 +124,55 @@ class ParentDisplayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class X11SocketDirTests(unittest.TestCase):
+    # Regression: with --userns=keep-id, the host's root-owned /tmp/.X11-unix maps to
+    # `nobody` inside the container. wlroots then logs "not owned by root or us" and
+    # refuses to start Xwayland, so every needs_x11 profile (melonDS, Cemu) aborts with
+    # "needs Xwayland but the compositor reported no DISPLAY". Verified on hardware:
+    # mounting a dir we own instead yields a working nested Xwayland (DISPLAY=:2).
+
+    def test_prepared_dir_is_owned_by_us_with_sticky_bit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "host-x11"
+            source.mkdir()
+            target = runtime.prepare_x11_socket_dir(Path(tmp) / "run", source=source)
+            info = os.stat(target)
+            self.assertEqual(info.st_uid, os.getuid())
+            # wlroots checks the sticky bit separately from ownership (sockets.c:90);
+            # mkdir alone leaves it off because of the umask.
+            self.assertTrue(info.st_mode & 0o1000, "sticky bit must be set")
+
+    def test_existing_host_sockets_are_mirrored(self):
+        # The nested sway's wlr_x11_backend connects *out* to the parent display's
+        # socket, so the host's existing entries have to remain visible.
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "host-x11"
+            source.mkdir()
+            (source / "X0").write_text("")
+            target = runtime.prepare_x11_socket_dir(Path(tmp) / "run", source=source)
+            self.assertTrue((target / "X0").exists())
+
+    def test_missing_host_dir_is_not_fatal(self):
+        # A host with no X11 sockets at all (pure Wayland session) must still get a
+        # usable directory rather than crashing the whole run.
+        with tempfile.TemporaryDirectory() as tmp:
+            target = runtime.prepare_x11_socket_dir(
+                Path(tmp) / "run", source=Path(tmp) / "does-not-exist"
+            )
+            self.assertTrue(target.is_dir())
+
+    def test_container_mounts_prepared_dir_not_host_root_owned_one(self):
+        with mock.patch.object(runtime, "native_sway", return_value=None), mock.patch.object(
+            runtime, "podman_available", return_value=True
+        ), mock.patch.object(runtime, "own_cgroup", return_value=None):
+            with tempfile.TemporaryDirectory() as tmp:
+                command = runtime.compositor_command(
+                    Path("/run/user/1000/sdss/session/sway.conf"),
+                    Path(tmp),
+                    home=Path("/home/deck"),
+                )
+                expected = f"--volume={Path(tmp) / 'sdss-x11'}:/tmp/.X11-unix"
+        self.assertIn(expected, command)
+        self.assertNotIn("--volume=/tmp/.X11-unix:/tmp/.X11-unix", command)
