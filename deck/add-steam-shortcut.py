@@ -263,7 +263,14 @@ def owned_by_sdss(entry: dict, quoted_exe: str) -> bool:
 
 
 def rungameid(appid: int) -> int:
-    return (appid << 32) | 0x02000000
+    """The 64-bit id `steam://rungameid/` needs; the 32-bit appid alone does nothing.
+
+    `build_entry` stores the appid *signed* (that is the VDF's int32 field), so an id read
+    back out of shortcuts.vdf is routinely negative. Shifting a negative left by 32 in
+    Python yields a negative gameid, which Steam silently ignores — mask back to unsigned
+    first. Already-unsigned input is unaffected.
+    """
+    return ((appid & 0xFFFFFFFF) << 32) | 0x02000000
 
 
 def build_entry(exe: str, name: str, launch_options: str, start_dir: str) -> dict:

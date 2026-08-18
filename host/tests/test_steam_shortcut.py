@@ -3,6 +3,7 @@
 import importlib.util
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import unittest
@@ -63,6 +64,20 @@ class RoundTripTest(unittest.TestCase):
     def test_rungameid_shape(self):
         appid = shortcut.shortcut_appid('"/bin/true"', "X")
         self.assertEqual(shortcut.rungameid(appid), (appid << 32) | 0x02000000)
+
+    def test_rungameid_masks_the_signed_appid_stored_in_the_vdf(self):
+        """A gameid must not go negative just because the VDF holds appids signed.
+
+        build_entry writes the signed form, so anything read back out of shortcuts.vdf is
+        routinely negative; shifting that left by 32 produces a gameid Steam ignores
+        without error. Hard-coded value observed working on hardware.
+        """
+        unsigned = shortcut.shortcut_appid('"/bin/true"', "X")
+        signed = struct.unpack("<i", struct.pack("<I", unsigned))[0]
+        self.assertLess(signed, 0, "fixture must exercise the negative case")
+        self.assertEqual(shortcut.rungameid(signed), shortcut.rungameid(unsigned))
+        self.assertGreater(shortcut.rungameid(signed), 0)
+        self.assertEqual(shortcut.rungameid(-1257812039), 13044482501723029504)
 
 
 class TestByteFidelity(unittest.TestCase):
