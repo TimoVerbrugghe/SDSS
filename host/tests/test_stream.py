@@ -30,7 +30,17 @@ class TestSunshineConfig(unittest.TestCase):
 
     def test_single_app_is_exposed(self):
         apps = json.loads(stream.render_apps())
-        self.assertEqual([app["name"] for app in apps["apps"]], [stream.APP_NAME])
+        self.assertEqual(len(apps["apps"]), 1)
+
+    def test_app_name_is_plain_second_screen(self):
+        # HEADLESS-1's size never varies (always DECK_PANEL_RESOLUTION), so there's
+        # nothing to smuggle into the name — deck/sdss-connect.sh hardcodes the same
+        # constant instead of parsing it out of the app list.
+        apps = json.loads(stream.render_apps())
+        self.assertEqual(apps["apps"][0]["name"], "Second Screen")
+
+    def test_app_name_helper_matches_render_apps(self):
+        self.assertEqual(stream.app_name(), "Second Screen")
 
 
 class TestLaunchCommand(unittest.TestCase):

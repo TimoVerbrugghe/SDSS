@@ -49,12 +49,25 @@ def render_conf(spec: SunshineSpec) -> str:
     return "".join(f"{key} = {value}\n" for key, value in settings.items())
 
 
+def app_name() -> str:
+    """Sunshine app name shown in `moonlight list`.
+
+    `HEADLESS-1` is always sized to `compositor.DECK_PANEL_RESOLUTION` regardless of
+    profile (emulators like Azahar render their second screen at a fixed native aspect
+    ratio and letterbox internally to fit any larger output, so matching the Deck's own
+    panel size avoids an extra, squashing rescale on top of that). Since that size never
+    varies today, `deck/sdss-connect.sh` just hardcodes the same constant rather than
+    parsing it out of the app name, so this stays a plain, stable name.
+    """
+    return APP_NAME
+
+
 def render_apps() -> str:
     apps = {
         "env": {},
         "apps": [
             {
-                "name": APP_NAME,
+                "name": app_name(),
                 "auto-detach": "true",
                 "exclude-global-prep-cmd": "false",
                 "prep-cmd": [],

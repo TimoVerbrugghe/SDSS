@@ -19,6 +19,20 @@ HEADLESS_OUTPUT = "HEADLESS-1"
 MAIN_WORKSPACE = "main"
 SECOND_WORKSPACE = "second"
 
+# HEADLESS-1 always targets the Deck's own panel resolution, never a per-profile
+# native size. Emulators like Azahar render their second screen at a fixed native
+# aspect ratio (e.g. exactly 320x240 for the 3DS bottom screen) and letterbox
+# internally to fit whatever window/output size they're given — confirmed on
+# hardware by resizing Azahar's Secondary Window to 1280x800 and finding the
+# rendered content still exactly 960x720 (320x240 * 3), centered with black bars.
+# Sizing HEADLESS-1 to each profile's tiny native size (e.g. 320x240) instead
+# produced a squashed/stretched picture on the Deck, because Moonlight's client
+# always requests its own fixed resolution and scales the incoming stream to
+# fill it — there's no way to tell it "use the source's native size, no scaling".
+# Matching the Deck's panel exactly sidesteps that scaling step entirely; the
+# only remaining letterboxing is Azahar's own, which is proportionally correct.
+DECK_PANEL_RESOLUTION = (1280, 800)
+
 
 @dataclass(frozen=True)
 class OutputMode:

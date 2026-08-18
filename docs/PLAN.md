@@ -38,9 +38,29 @@ against the shared `gamescope-0` Wayland socket for native/off-Steam testing:
   on the shared `gamescope-0` Wayland socket renders correctly but is invisible to that
   check, so Steam's loading spinner never clears. `X11-1` must be preferred whenever
   Steam hands the process a `DISPLAY`.
-- `HEADLESS-1` — 1280x800@60, holds the emulator's **second** window. Captured by a
-  dedicated Sunshine instance (`capture = wlr`, `output_name = HEADLESS-1`,
-  `stream_audio = disabled`).
+- `HEADLESS-1` — always sized to the Deck's own panel resolution (1280x800, see
+  `compositor.DECK_PANEL_RESOLUTION`), holds the emulator's **second** window. Captured
+  by a dedicated Sunshine instance (`capture = wlr`, `output_name = HEADLESS-1`,
+  `stream_audio = disabled`). Sunshine does no resize/negotiation of its own — it just
+  encodes whatever `HEADLESS-1`'s current mode is — and Moonlight's protocol has the
+  *client* dictate the requested stream resolution (only fixed presets or an explicit
+  `--resolution WxH`, no "native size" mode). Since `HEADLESS-1`'s size never varies
+  (always `DECK_PANEL_RESOLUTION`), `deck/sdss-connect.sh` just hardcodes the matching
+  `--resolution 1280x800` rather than needing to learn it from the host — the Sunshine
+  app name stays a plain `"Second Screen"` (see `stream.app_name()`).
+  Rejected alternative: size `HEADLESS-1` to each emulator profile's own native
+  second-screen resolution instead (320x240 for Azahar's 3DS bottom screen, 854x480 for
+  Cemu's Wii U GamePad, 256x192 for melonDS's DS bottom screen). This produced a visibly
+  squashed picture on hardware: emulators like Azahar render their second screen at a
+  fixed native 4:3 aspect ratio and letterbox internally to fit whatever size their
+  window actually is — confirmed by resizing Azahar's Secondary Window to 1280x800 and
+  finding the rendered content still exactly 960x720 (320x240 * 3), centered in black
+  bars. So sizing `HEADLESS-1` to the profile's native size just moved the problem:
+  Moonlight would then stretch that already-letterboxed 320x240 frame up to whatever
+  resolution the Deck requested, squashing Azahar's own pillarboxes into thin bars along
+  with everything else. Targeting the Deck's panel directly instead means Moonlight's
+  stream and its display are the same size, so there's exactly one scaling step
+  (Azahar's own internal letterbox) rather than two compounding ones.
 
 sway is chosen over a custom wlroots compositor because it already provides Xwayland,
 window rules by `app_id`/class/title, multi-seat, and the `swaymsg` IPC.
