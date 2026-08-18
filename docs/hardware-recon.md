@@ -247,3 +247,105 @@ real templates directory (78 files after install):
   `ts_n` binding, not two.
 - Installing twice leaves no `.tmp`/`.new` debris — the atomic write cleans up after
   itself — and all 78 templates still parse afterwards.
+
+## Launching shortcuts, pairing and capture (verified 2026-08-18, both devices)
+
+Full end-to-end run: an emulator launched from its Steam shortcut on the Steam Machine,
+streamed to the Deck's `Second Screen` shortcut, both confirmed live.
+
+### Launching a non-Steam shortcut must go through Steam, not SSH
+
+Anything launched over plain SSH never inherits a per-game Xwayland `DISPLAY`, so
+`runtime.parent_display()` picks a different branch than it does in the real session.
+**Test evidence gathered by SSH-launching the emulator is void** — this invalidated a
+day's worth of it. Hand the URL to the already-running Steam client instead, so gamescope
+is the parent:
+
+```sh
+export XDG_RUNTIME_DIR=/run/user/1000
+set -a; source /run/user/1000/gamescope-environment; set +a   # yields DISPLAY=:0
+/home/deck/.local/share/Steam/steam.sh "steam://rungameid/<64-bit-gameid>"
+```
+
+Bare `steam <url>` without the sourced environment does nothing. A related artifact: Qt
+apps aborting over SSH with **exit 134 (SIGABRT) on "could not connect to display"** do
+not reproduce under a Steam launch.
+
+### `rungameid` needs the 64-bit id, built from the *unsigned* appid
+
+`((appid & 0xFFFFFFFF) << 32) | 0x02000000`. Passing the 32-bit appid, or a negative one,
+is **silently ignored** — no error, nothing launches. `shortcuts.vdf` stores appids signed
+(int32), so an id read back out is routinely negative and must be masked. Reading the
+shortcuts requires the **binary** parser in `deck/add-steam-shortcut.py` (`parse()` /
+`serialize()`); `deck/vdf.py` is for **text** VDF (controller templates) and cannot read
+this file. There is no `sdss.deck` package, so load it by path:
+
+```python
+spec = importlib.util.spec_from_file_location("ass", "deck/add-steam-shortcut.py")
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+entries = m.parse(path.read_bytes())
+```
+
+Steam rewrites `shortcuts.vdf` from memory on exit — restart Steam after editing it.
+
+### Pairing is keyed to the host IP, and is two-sided
+
+Moving the host to a new DHCP address invalidates the existing pairing. `moonlight list`
+then returns empty, and `sdss-connect.sh` treats that as fatal — which presents as
+**"spinner, then the shortcut closes"**. The script is behaving correctly; the host is
+simply unpaired. Re-pair with both halves overlapping in time: the Deck runs
+`moonlight pair <host> --pin <pin>` while the host writes the same PIN into the FIFO
+`/run/user/1000/sdss/session/pin` (a real FIFO, `prw-------`, so the write blocks until
+read). A ~12 s delay before writing worked.
+
+`moonlight list` over SSH needs `QT_QPA_PLATFORM=offscreen` and
+`XDG_RUNTIME_DIR=/run/user/1000`; it is slow, so wrap it in `timeout 60`.
+
+### Verified process chains
+
+Host, from the Steam shortcut:
+
+```
+reaper SteamLaunch AppId=… -> azahar.sh <rom>
+  -> python3 -m sdss.cli run --profile azahar -- …azahar.AppImage.sdss-real <rom>
+    -> podman run … --volume=/run/user/1000/sdss-x11:/tmp/.X11-unix …   (nested sway)
+    -> bwrap -- sunshine …/sdss/sunshine/sunshine.conf -0
+```
+
+Deck, from its shortcut:
+
+```
+reaper SteamLaunch AppId=… -> sdss-connect <host>
+  -> bwrap -- moonlight stream <host> Second Screen --resolution 1280x800 --fps 60 \
+       --display-mode fullscreen --no-vsync --no-touchscreen-trackpad
+```
+
+### `wlgrab`'s log ordering is misleading
+
+Sunshine enumerates every output, printing `Name:` / `Offset` / `Logical size` for each,
+then prints `Selected monitor [...]` immediately after the **last one enumerated** — which
+is not necessarily the one selected. A `Logical size: 2560x1440` line can therefore sit
+directly above the selection line while the captured output really is 1280x800. Always
+grep with context and match `Logical size` back to its own preceding `Name:`. Correct
+capture reads `Name: HEADLESS-1` / `Offset: 8192x0` / `Logical size: 1280x800`.
+
+### `/tmp/.X11-unix` cannot be bind-mounted from the host
+
+It is `root:root`, and under `--userns=keep-id` host root maps to `nobody` inside, so
+wlroots refuses it ("not owned by root or us") and Xwayland fails to start. SDSS mirrors
+the sockets into a user-owned `$XDG_RUNTIME_DIR/sdss-x11` (sticky bit applied *after*
+`mkdir`, since `mkdir` honours the umask) and mounts that instead.
+
+### Debugging notes
+
+- A diagnostic `podman run` needs `--entrypoint=/bin/sh`; the image's ENTRYPOINT is `sway`.
+- Query the nested sway:
+  `podman exec $(podman ps -q | head -1) sh -c "SWAYSOCK=/run/user/1000/sway-ipc.1000.<pid>.sock swaymsg -t get_outputs"`
+  (glob for the socket with `ls /run/user/1000/sway-ipc.*`).
+- **Emulator stderr is not captured** into the SDSS log. This has cost real time twice.
+- Stale `sdss_inputd` / `sunshine` processes leak across failed runs and hold port 48010.
+  Kill them and `podman rm -af` between test runs.
+- SDSS wraps the *emulator binary*, not the EmuDeck launcher. AppImage emulators get an
+  in-place wrapper plus a `.sdss-real` shadow and are honoured; melonDS is **bypassed**
+  because EmuDeck's `melonds.sh` hardcodes `/usr/bin/flatpak run`.
+- SSH's first connection attempt sometimes fails with "Permission denied"; retry after ~3 s.
