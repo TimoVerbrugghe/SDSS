@@ -165,17 +165,45 @@ def image_present() -> bool:
     return result.returncode == 0
 
 
+GRACEFUL_STOP_TIMEOUT = 3.0
+
+
 def remove_container(name: str = CONTAINER_NAME) -> bool:
-    """Kill and force-remove the compositor container.
+    """Gracefully stop, then force-kill and remove, the compositor container.
 
     Terminating the `podman run` process is not enough: conmon supervises the container in
     its own process and, together with fuse-overlayfs and the nested Xwayland, keeps running
     inside the Steam per-game cgroup scope SDSS deliberately nests under. Steam treats a
     non-empty scope as the game still running, so the next launch is refused with "Game
     already running" until those are reaped. Verified on hardware.
+
+    A plain SIGKILL (the only signal this sent before) never gives sway a chance to close its
+    X11 connection to gamescope's per-game Xwayland — the kernel just drops the socket. That
+    connection is exactly what Steam's own client watches this compositor generation through
+    (see docs/architecture.md), so an abrupt severing rather than a clean protocol disconnect
+    is a plausible contributor to the Steam-side corruption documented there. `--signal TERM`
+    is tried first and bounded by a short `podman wait`; verified on hardware that this exits
+    within about a second and does not hang or leave conmon behind (the concern the original
+    force-first approach was written to avoid). The unconditional SIGKILL below is kept
+    exactly as before as a backstop — if the graceful attempt didn't finish in time, or the
+    container was already gone, it and the following `rm --force` are harmless no-ops.
     """
     if not podman_available():
         return False
+    subprocess.run(
+        ["podman", "kill", "--signal", "TERM", name],
+        capture_output=True,
+        check=False,
+    )
+    try:
+        subprocess.run(
+            ["podman", "wait", "--ignore", "--condition", "stopped", name],
+            capture_output=True,
+            check=False,
+            timeout=GRACEFUL_STOP_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        pass
     # The compositor uses --pid=host, so sway is not necessarily in podman's client process
     # group. Kill the container first; otherwise `rm --force` can hang or leave conmon behind.
     subprocess.run(
@@ -454,7 +482,6 @@ def compositor_command(config: Path, runtime_dir: Path, home: Path | None = None
         # host networking shares the abstract socket namespace, which is how host X11
         # clients reach the nested Xwayland.
         "--network=host",
-        "--ipc=host",
         # Gamescope decides a launched Steam game is "ready" (and dismisses its loading
         # spinner) by walking the process tree/cgroup it launched. A default podman run
         # puts sway in its own pid/cgroup namespace, orphaned from that tree, so gamescope

@@ -9,6 +9,16 @@ architecture, not in any single line of code. This document draws the shape, con
 with a vanilla (non-SDSS) launch, and lays out the hardware evidence for what triggers the
 abort. [docs/redesign-plan.md](redesign-plan.md) proposes what to do about it.
 
+> **Status update, 2026-08-19**: the "Phase 0" hardening from
+> [docs/redesign-plan.md](redesign-plan.md#phase-0--immediate-low-risk-hardening-do-this-regardless-of-phase-12-outcome)
+> (graceful compositor teardown, dropping the unexplained `--ipc=host`) has been implemented
+> and validated on hardware — a 5-cycle alternating Cemu/Azahar test covering the exact
+> transitions documented in §3.3 below as reliably fatal completed with zero crashes and flat
+> Steam memory. The evidence and hypothesis below describe the mechanism that was fixed and
+> remain accurate as a historical/diagnostic record; they no longer describe the live
+> behavior of the current codebase. See the redesign plan's status update for what's still
+> outstanding (goal 3's process-count gap, not a crash risk).
+
 Read this alongside [docs/PLAN.md](PLAN.md) (the original design rationale) and
 [docs/hardware-recon.md](hardware-recon.md) (verified hardware facts). Nothing here
 contradicts either — it assembles what they already established into one picture, plus

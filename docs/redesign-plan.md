@@ -3,6 +3,14 @@
 Companion to [docs/architecture.md](architecture.md), which lays out the current shape and
 the hardware evidence for why it destabilizes Steam. This document proposes what to change.
 
+> **Status update, 2026-08-19**: Phase 0 is implemented and validated on hardware — see
+> [Phase 0's result](#phase-0--immediate-low-risk-hardening-do-this-regardless-of-phase-12-outcome)
+> below. A 5-cycle alternating Cemu/Azahar acceptance test, covering the exact adjacent-pair
+> transitions that reliably crashed Steam before, completed with zero crashes and flat memory.
+> Phase 1/2 (the persistent compositor) are downgraded from "likely required to stop the
+> crash" to "a separate, lower-priority improvement toward goal 3" — see
+> [Reassessing Phase 1/2 after Phase 0's result](#reassessing-phase-12-after-phase-0s-result).
+
 ## The goal, verbatim
 
 Three requirements, stated by the project owner, are the fixed target for this redesign —
@@ -115,32 +123,76 @@ regardless of which way this resolves.
 
 ### Phase 0 — immediate, low-risk hardening (do this regardless of Phase 1/2 outcome)
 
-Targets the same evidence without waiting on the open question above:
+**Status: implemented and validated on hardware, 2026-08-19.**
 
-1. **Graceful teardown before force.** [`_terminate_process`](/Users/timo/Projects/SDSS/host/src/sdss/session.py:168)
-   already does SIGTERM-then-SIGKILL, but sway's shutdown on SIGTERM has never been verified
-   to cleanly close its X11 connection to gamescope's per-game Xwayland before exiting.
-   Verify this specifically (does wlroots flush/close the X11 backend connection on SIGTERM,
-   or does the process just die mid-connection?); if it doesn't, send sway a mechanism that
-   does (e.g. an IPC command to close outputs before signaling the process).
-2. **Explicit settle/drain window between sessions.** Add a brief, verified-not-just-slept
-   wait after teardown completes and before the next session's compositor starts — poll for
-   the old X11 connection actually being gone (e.g. `xdotool`/`xwininfo` against gamescope's
-   per-game Xwayland showing no stale client) rather than assuming process-exit timing is
-   sufficient.
-3. **Drop `--ipc=host`.** No comment in [runtime.py](/Users/timo/Projects/SDSS/host/src/sdss/runtime.py:457)
-   justifies it, unlike every other namespace-sharing flag on that `podman run` line. Test
-   removing it; if nothing breaks (compositor start, Sunshine capture, audio still routing to
-   the TV via Pipewire, which passes file descriptors over its own protocol rather than
-   relying on shared IPC namespaces), it comes out. If something *does* depend on it, that
-   dependency gets its own comment explaining what and why, matching every other flag on that
-   line.
-4. **Re-run the exact alternating-cycle test** from
-   [hardware-test-report.md](hardware-test-report.md:538) — Cemu, Cemu, Azahar, Cemu,
-   Azahar, at least 5 cycles — after 1–3, and record whether the "first launch clean, second
-   fatal" correlation from [docs/architecture.md §3.3](architecture.md#33-fresh-reproduction-2026-08-19-it-is-not-about-which-emulator-or-whether-its-overlay-is-even-enabled)
-   still reproduces. This is the acceptance gate for Phase 0 — if it's gone, Phase 1/2 may
-   not be needed at all; document that outcome either way rather than assuming.
+1. **Graceful teardown before force — done.** [`remove_container()`](/Users/timo/Projects/SDSS/host/src/sdss/runtime.py:168)
+   now sends `podman kill --signal TERM` to the container and waits on `podman wait
+   --condition stopped` (bounded to `GRACEFUL_STOP_TIMEOUT = 3.0` seconds) before falling
+   through to the original unconditional `--signal KILL` + `rm --force` backstop, which is
+   unchanged and still guarantees teardown even if the graceful attempt times out. Verified
+   directly on hardware first, in isolation, before writing any code: `podman kill --signal
+   TERM sdss-compositor` against a live session let sway and conmon exit cleanly within 1–3
+   seconds with no hang and nothing left behind — disproving the assumption (never actually
+   tested before) that only an immediate SIGKILL was reliable here. Across the 5-cycle
+   acceptance test below, every teardown completed in ~2 seconds.
+2. **Explicit settle/drain window — done, subsumed by #1.** A separate artificial delay
+   turned out to be unnecessary: `podman wait --condition stopped` only returns once the
+   container's process has actually exited, which is a genuine settle signal (not a guessed
+   timer) already. No additional polling was added.
+3. **Drop `--ipc=host` — done.** Removed from
+   [`compositor_command()`](/Users/timo/Projects/SDSS/host/src/sdss/runtime.py:459), with a
+   regression test (`test_container_does_not_share_the_host_ipc_namespace`) locking in its
+   absence. Verified on hardware across 5 diverse sessions (Cemu on two different ROMs,
+   Azahar on two different ROMs) — Cemu and Azahar both rendered normally, the second screen
+   streamed, and nothing regressed. No replacement flag was needed.
+4. **Re-run the exact alternating-cycle test — done, passed cleanly.** Ran 5 real
+   Steam-launched sessions in sequence: Cemu (Wind Waker HD) → Azahar (A Link Between Worlds)
+   → Cemu (Twilight Princess HD) → Azahar (Animal Crossing New Leaf) → Cemu (Wind Waker HD
+   again) — covering the Cemu→Azahar and Azahar→Cemu adjacent-pair transitions twice each,
+   the exact pattern documented in
+   [docs/architecture.md §3.3](architecture.md#33-fresh-reproduction-2026-08-19-it-is-not-about-which-emulator-or-whether-its-overlay-is-even-enabled)
+   as reliably fatal before. Each session was observed live for 60–90+ seconds, exceeding
+   every historically-recorded crash window (45–90 seconds). Result: Steam's PID
+   (`102424`) never changed across all 5 cycles, its RSS stayed flat (~238–241 MB, no linear
+   growth) throughout, and every teardown left zero podman containers, zero orphaned
+   processes, and zero stale `app-steam-app*.scope` units. The "first launch clean, second
+   fatal" correlation did **not** reproduce.
+
+   One separate, non-blocking finding from this run: Azahar does not exit on `SIGTERM` (it
+   was sent twice, 3 seconds apart, and ignored both times; `SIGKILL` was required to
+   unblock the session). Real usage is unaffected — Azahar is exited via its own in-emulator
+   Select+Start hotkey, not an external signal — but it does mean
+   [`_terminate_process`](/Users/timo/Projects/SDSS/host/src/sdss/session.py:168)'s
+   SIGTERM-then-5s-wait-then-SIGKILL sequence always falls through to the SIGKILL branch for
+   Azahar specifically, adding a predictable ~5 second delay to its teardown. Not addressed
+   here; noted for a future look if Azahar's teardown latency becomes a user-visible problem.
+
+### Reassessing Phase 1/2 after Phase 0's result
+
+Phase 0 was written as a no-regrets hardening step to do "regardless of Phase 1/2 outcome" —
+it was not expected to be sufficient on its own, given how many prior targeted fixes had each
+worked around one proximate cause without stopping the recurring abort. It turned out to
+resolve the reproduction directly: the graceful-teardown change gives sway's X11 connection to
+gamescope's per-game Xwayland an actual chance to close cleanly (a real protocol disconnect
+Steam's side can observe) instead of being severed by SIGKILL every time, which is exactly the
+mechanism [§3.4's hypothesis](architecture.md#34-leading-hypothesis-evidence-backed-not-proven)
+pointed at.
+
+This changes the priority of Phases 1–3, but does not delete them:
+
+- The persistent-compositor redesign (Phases 1–2) is no longer believed necessary *to stop
+  the crash*. It remains a real improvement toward **goal 3** on its own merits — the
+  per-launch process count in
+  [docs/architecture.md §2.1](architecture.md#21-what-sdss-adds-enumerated) is still eleven
+  entries recreated every launch, which is still far from "identical outside the second
+  screen" even with the crash gone. Treat Phases 1–3 as a goal-3-driven architectural
+  improvement to pursue when there's room for it, not as an urgent fix.
+- Given Phase 0 alone closed every reproduction attempted so far, do not treat this as
+  absolute proof the mechanism can never recur under a condition not yet tested (a longer
+  play session, a different emulator combination, a slower/loaded machine). Keep the
+  hardware evidence-gathering discipline from this document (live monitor, real Steam
+  launches, exact reproduction steps) as the standing method for any future report, rather
+  than assuming Phase 0 makes this section purely historical.
 
 ### Phase 1 — feasibility spike for the persistent compositor
 
@@ -217,19 +269,19 @@ goal 3:
 
 ## Acceptance criteria, tied back to the three goals
 
-1. **Seamless toggle**: `sdss enable`/`disable` from Decky starts/stops the persistent
-   service with no user-visible delay beyond what starting Sunshine/sway already takes
-   today; toggling off leaves zero SDSS processes running, same as today's `sdss restore`.
-2. **Second screen on any ROM launch**: unchanged behavior from the user's perspective —
-   launch any profiled emulator, second screen appears with touch + gamepad. This is the
-   regression risk of the whole plan; the alternating-cycle test from Phase 0.4 is the gate,
-   re-run after Phase 2 lands.
-3. **Identical outside the second screen**: measured directly against
-   [docs/architecture.md §2.1](architecture.md#21-what-sdss-adds-enumerated)'s table — after
-   Phase 2/3, the per-launch process count should drop from eleven entries to essentially
-   two (the wrapper hop, the emulator itself), with the compositor/Sunshine/input-bridge
-   trio no longer appearing in that table's "started by" column as "every launch."
+1. **Seamless toggle**: already true today for the config/wrapper layer (`sdss
+   enable`/`disable` reconciles both under one lock); would extend to starting/stopping the
+   persistent service too if Phase 2 is built. Not blocked on anything in this plan.
+2. **Second screen on any ROM launch, and Steam stays stable doing it**: validated on
+   hardware for the current (Phase-0-hardened) architecture — the 5-cycle alternating test
+   above reproduced no crash and no leak. This criterion is met today, without Phase 1/2.
+3. **Identical outside the second screen**: **not yet met** — this is the remaining gap.
+   Measured against [docs/architecture.md §2.1](architecture.md#21-what-sdss-adds-enumerated)'s
+   table, the per-launch process count is still eleven entries recreated every launch; Phase
+   0 fixed *how* they're torn down, not *how often*. Phases 1–3 are what would close this
+   specific gap, and remain worth pursuing on that basis — just no longer as crash fixes.
 
-Both architecture.md's evidence and this plan's phasing should be revisited once Phase 0's
-re-run (or Phase 1's spike) produces a result — this is a living pair of documents, not a
+Both architecture.md's evidence and this plan's phasing should be revisited whenever new
+hardware evidence appears (a crash reproduction under conditions not yet tested, a Phase 1
+spike result, or further goal-3 work) — this is a living pair of documents, not a
 one-time write-up.

@@ -551,3 +551,65 @@ Every app scope was empty after each exit. Managed config values and their
 per-profile journals remained active across game exits. A master disable then
 restored Cemu `open_pad=false` and Azahar `graphics_api=2`, removed the
 journals, and a re-enable reapplied `open_pad=true` and `graphics_api=1`.
+
+### Graceful compositor teardown and `--ipc=host` removal (2026-08-19)
+
+The crash reproduced again after the above: Azahar (`steam_overlay=False`, no
+Steam overlay at all) ran cleanly for 22 and then 51 minutes across two Steam
+boots, but the very next launch — Cemu, overlay on as always — leaked Steam's
+32-bit client at roughly 65 MiB/s and aborted within under a minute both
+times, with the identical `OUT OF MEMORY! attempted allocation size: 65` /
+`cannot allocate memory for thread-local data: ABORT` signature recorded
+throughout this project. This is written up in full, with the exact
+timestamps and journal excerpts, in
+[docs/architecture.md](architecture.md#3-the-crash-hard-evidence).
+
+Since the previous game's own overlay use was not the variable this time, the
+investigation shifted to what SDSS's session teardown does regardless of
+profile. `runtime.remove_container()` unconditionally sent `podman kill
+--signal KILL` — sway/Xwayland never got a chance to close their X11
+connection to gamescope's per-game Xwayland cleanly; the kernel just dropped
+the socket. Tested directly on a live session before writing any code:
+`podman kill --signal TERM sdss-compositor` (not just the client process) let
+sway and conmon exit within 1–3 seconds with no hang and nothing left behind —
+disproving the assumption that only an immediate SIGKILL was reliable, which
+the existing code comment had stated without a recorded test behind it.
+Separately, `--ipc=host` on the same `podman run` was the one namespace flag
+with no comment tying it to a verified bug, unlike every other flag on that
+line.
+
+**Fix:** `remove_container()` now tries `--signal TERM` first, waits on
+`podman wait --condition stopped` bounded to 3 seconds, and only then falls
+through to the original unconditional `--signal KILL` + `rm --force`
+backstop (unchanged, still guaranteed). `--ipc=host` was removed outright.
+287 host tests pass, including two new regression tests for the graceful
+path and one for the dropped flag; each was confirmed to fail against the
+prior code (mutation check) before being trusted.
+
+**Hardware acceptance test:** five real Steam-launched sessions in sequence —
+Cemu (Wind Waker HD) → Azahar (A Link Between Worlds) → Cemu (Twilight
+Princess HD) → Azahar (Animal Crossing New Leaf) → Cemu (Wind Waker HD again)
+— covering the Cemu→Azahar and Azahar→Cemu adjacent-pair transitions twice
+each, the exact pattern just described as reliably fatal. Each session was
+observed live for 60–90+ seconds, past every previously recorded crash
+window. Steam's PID (`102424`) never changed across all five cycles, its RSS
+stayed flat (~238–241 MB, no linear growth), and every teardown left zero
+podman containers, zero orphaned processes, and zero stale
+`app-steam-app*.scope` units afterward. The "first launch clean, second
+fatal" correlation did not reproduce.
+
+One separate, non-blocking finding: Azahar does not exit on `SIGTERM` (sent
+twice, 3 seconds apart, both ignored; `SIGKILL` was needed to unblock the
+session during this scripted test). Real usage exits Azahar through its own
+in-emulator Select+Start hotkey rather than an external signal, so this does
+not affect normal play — it just means `Session._terminate_process`'s
+SIGTERM-then-5s-wait-then-SIGKILL sequence always falls through to the
+SIGKILL branch for Azahar specifically, adding a predictable delay to its
+teardown that was not investigated further here.
+
+See [docs/architecture.md](architecture.md) and
+[docs/redesign-plan.md](redesign-plan.md) for the full evidence trail, the
+mechanism this is believed to fix, and what remains open (the persistent
+compositor is downgraded from "likely required to stop the crash" to "a
+separate improvement toward `docs/redesign-plan.md`'s goal 3," since Phase 0
+alone closed every reproduction attempted so far).
