@@ -196,6 +196,19 @@ def remove_container(name: str = CONTAINER_NAME) -> bool:
     abrupt way SIGKILL would have — so the graceful attempt was buying, at best, an
     occasional clean disconnect at the cost of an occasional hard crash, not a reliable
     improvement over SIGKILL. Going straight to SIGKILL removes that crash mode entirely.
+
+    Going straight to SIGKILL was *also* not the whole story: the exact same triple coredump
+    reproduced a third time with this function unchanged from the above fix. The remaining
+    cause was ordering, not signal choice — `podman rm --force` (or Podman's own `--rm`
+    auto-cleanup once the killed container's main process exits) tears down the fuse-overlayfs
+    rootfs that sway, Xwayland and sdss_inputd all still demand-page their own code and shared
+    libraries from, and this function used to call `reap_orphaned_helpers()` (which is what
+    actually kills those two client processes, since `--pid=host` keeps them out of Podman's
+    own view of "the container") *after* `rm --force` rather than before. Whichever of the two
+    groups `os.listdir("/proc")` happened to reach last in that unordered pass decided whether
+    the race was won or lost. `reap_orphaned_helpers()` now kills and *waits for* sway,
+    Xwayland and sdss_inputd before it touches conmon or fuse-overlayfs at all, so calling it
+    here before `rm --force` (rather than after) removes the race instead of shuffling it.
     """
     if not podman_available():
         return False
@@ -206,12 +219,14 @@ def remove_container(name: str = CONTAINER_NAME) -> bool:
         capture_output=True,
         check=False,
     )
+    # Must run before `rm --force`: it kills sway/Xwayland/sdss_inputd and confirms they are
+    # actually gone before anything removes the rootfs their code is still demand-paged from.
+    reap_orphaned_helpers(name)
     result = subprocess.run(
         ["podman", "rm", "--force", "--ignore", name],
         capture_output=True,
         check=False,
     )
-    reap_orphaned_helpers(name)
     return result.returncode == 0
 
 
@@ -224,6 +239,20 @@ def reap_orphaned_helpers(name: str = CONTAINER_NAME) -> None:
     requires both Podman's own pause PID file and a parent in this launch's ancestry, so
     unrelated rootless Podman sessions are not touched even when systemd chooses a different
     cgroup layout for the helper.
+
+    sway, Xwayland and sdss_inputd keep demand-paging their own code and shared libraries
+    (e.g. Mesa's libgallium) from the container's fuse-overlayfs-backed rootfs for as long as
+    they run. conmon and fuse-overlayfs are that rootfs's supervisor and storage backend.
+    Killing the two groups in a single unordered pass -- exactly what this function used to
+    do, in whatever order ``os.listdir("/proc")`` happened to return -- let fuse-overlayfs or
+    conmon die while sway/Xwayland/sdss_inputd were still executing. The next time one of them
+    faulted in a not-yet-resident code page, the kernel found the backing rootfs gone and
+    raised SIGBUS instead: reproduced on hardware as a triple coredump (sway itself, inside
+    libgallium, plus Xwayland and sdss_inputd), and consistent with the failure being
+    probabilistic rather than reliable -- it depended on enumeration order and scheduling
+    timing. Killing the rootfs-dependent processes first and confirming they are actually
+    gone -- not just signaled -- before touching conmon/fuse-overlayfs/the pause process
+    removes the race instead of narrowing it.
     """
     reap_orphaned_appimage_mounts()
     launch_ancestors = set(_ancestor_pids(os.getpid()))
@@ -232,16 +261,22 @@ def reap_orphaned_helpers(name: str = CONTAINER_NAME) -> None:
         entries = os.listdir("/proc")
     except OSError:
         return
+    rootfs_clients: list[int] = []
+    supervisors: list[int] = []
     for entry in entries:
         if not entry.isdigit() or int(entry) == os.getpid():
             continue
+        pid = int(entry)
         try:
             command = Path(f"/proc/{entry}/cmdline").read_bytes().replace(b"\0", b" ")
         except OSError:
             continue
         is_named_container = f"-n {name}".encode() in command
         is_input_bridge = INPUTD_NAME.encode() in command
-        is_launch_scoped = _belongs_to_cgroup(int(entry), launch_cgroup)
+        is_launch_scoped = _belongs_to_cgroup(pid, launch_cgroup)
+        is_nested_sway = is_launch_scoped and (
+            b"/sway " in command and b"/sdss/session/sway.conf" in command
+        )
         is_rootless_xwayland = is_launch_scoped and (
             b"Xwayland" in command and b"-rootless" in command and b"-wm" in command
         )
@@ -249,20 +284,41 @@ def reap_orphaned_helpers(name: str = CONTAINER_NAME) -> None:
             b"fuse-overlayfs" in command
             and b"/.local/share/containers/storage/overlay/" in command
         )
-        is_launch_pause = _is_launch_owned_podman_pause(
-            int(entry), command, launch_ancestors
-        )
-        if (
-            is_named_container
-            or is_input_bridge
-            or is_rootless_xwayland
-            or is_sdss_overlay
-            or is_launch_pause
-        ):
-            try:
-                os.kill(int(entry), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                continue
+        is_launch_pause = _is_launch_owned_podman_pause(pid, command, launch_ancestors)
+
+        if is_nested_sway or is_input_bridge or is_rootless_xwayland:
+            rootfs_clients.append(pid)
+        elif is_named_container or is_sdss_overlay or is_launch_pause:
+            supervisors.append(pid)
+
+    for pid in rootfs_clients:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            continue
+    _await_process_exit(rootfs_clients, timeout=2.0)
+
+    for pid in supervisors:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            continue
+
+
+def _await_process_exit(pids: list[int], timeout: float) -> None:
+    """Poll until none of ``pids`` are still alive, or ``timeout`` elapses.
+
+    A SIGKILL does not mean the target has already stopped running -- the kernel needs a
+    scheduling opportunity to deliver it. See reap_orphaned_helpers for why the caller must
+    not proceed to remove the container's storage until these PIDs are actually confirmed
+    gone, not merely signaled.
+    """
+    deadline = time.monotonic() + timeout
+    remaining = set(pids)
+    while remaining and time.monotonic() < deadline:
+        remaining = {pid for pid in remaining if Path(f"/proc/{pid}").exists()}
+        if remaining:
+            time.sleep(0.02)
 
 
 def _belongs_to_cgroup(pid: int, parent: str | None) -> bool:

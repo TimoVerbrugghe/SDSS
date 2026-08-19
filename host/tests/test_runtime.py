@@ -291,6 +291,25 @@ class ContainerTeardownTests(unittest.TestCase):
             runtime.remove_container()
         reap.assert_called_once_with(runtime.CONTAINER_NAME)
 
+    def test_remove_container_reaps_before_removing_storage(self):
+        # A fresh, real crash reproduced with reap_orphaned_helpers() called *after*
+        # `podman rm --force`: whichever of sway/Xwayland/sdss_inputd (killed by
+        # reap_orphaned_helpers) or conmon/fuse-overlayfs (torn down by `rm --force`) actually
+        # finished last decided whether the race was won or lost. reap_orphaned_helpers()
+        # itself now kills-and-waits-for the rootfs-dependent processes before touching
+        # conmon/fuse-overlayfs, but that only helps if it also runs before `rm --force`
+        # removes the storage those processes depend on, not after.
+        calls: list[str] = []
+        with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime.subprocess, "run", side_effect=lambda *a, **k: calls.append("subprocess.run")
+            or mock.Mock(returncode=0),
+        ), mock.patch.object(
+            runtime, "reap_orphaned_helpers", side_effect=lambda *a, **k: calls.append("reap")
+        ):
+            runtime.remove_container()
+        # ["podman kill", reap_orphaned_helpers, "podman rm --force"]
+        self.assertEqual(calls, ["subprocess.run", "reap", "subprocess.run"])
+
     def test_reap_orphaned_helpers_kills_named_processes(self):
         with mock.patch.object(runtime.os, "listdir", return_value=["123", "456"]), mock.patch.object(
             runtime.os, "getpid", return_value=999
@@ -298,12 +317,105 @@ class ContainerTeardownTests(unittest.TestCase):
             runtime.Path,
             "read_bytes",
             side_effect=[b"/usr/bin/conmon\0-n\0sdss-compositor\0", b"python\0sdss_inputd.py\0"],
-        ), mock.patch.object(runtime.os, "kill") as kill:
+        ), mock.patch.object(runtime, "_await_process_exit") as await_exit, mock.patch.object(
+            runtime.os, "kill"
+        ) as kill:
             runtime.reap_orphaned_helpers()
+        # sdss_inputd (456) is a rootfs client: killed and waited for before conmon (123),
+        # its supervisor -- conmon's own exit-command can tear down the storage sdss_inputd
+        # is still demand-paging code from.
         self.assertEqual(
             kill.call_args_list,
-            [mock.call(123, runtime.signal.SIGKILL), mock.call(456, runtime.signal.SIGKILL)],
+            [mock.call(456, runtime.signal.SIGKILL), mock.call(123, runtime.signal.SIGKILL)],
         )
+        await_exit.assert_called_once_with([456], timeout=2.0)
+
+    def test_reap_orphaned_helpers_kills_nested_sway(self):
+        # sway itself is only ever addressed by container name via `podman kill` today, which
+        # depends on conmon still being alive to relay the signal. reap_orphaned_helpers()
+        # finds it directly too, by its session-specific sway.conf path, so it is killed (and
+        # waited for) as a rootfs client exactly like Xwayland and sdss_inputd.
+        with mock.patch.object(runtime.os, "listdir", return_value=["123"]), mock.patch.object(
+            runtime.os, "getpid", return_value=999
+        ), mock.patch.object(
+            runtime.Path,
+            "read_bytes",
+            return_value=b"/usr/bin/sway\0-c\0/run/user/1000/sdss/session/sway.conf\0",
+        ), mock.patch.object(
+            runtime, "own_cgroup", return_value="user.slice/app-steam.scope"
+        ), mock.patch.object(
+            runtime, "_belongs_to_cgroup", return_value=True
+        ), mock.patch.object(runtime, "_await_process_exit") as await_exit, mock.patch.object(
+            runtime.os, "kill"
+        ) as kill:
+            runtime.reap_orphaned_helpers()
+        kill.assert_called_once_with(123, runtime.signal.SIGKILL)
+        await_exit.assert_called_once_with([123], timeout=2.0)
+
+    def test_reap_orphaned_helpers_ignores_sway_outside_launch_scope(self):
+        with mock.patch.object(runtime.os, "listdir", return_value=["123"]), mock.patch.object(
+            runtime.os, "getpid", return_value=999
+        ), mock.patch.object(
+            runtime.Path,
+            "read_bytes",
+            return_value=b"/usr/bin/sway\0-c\0/run/user/1000/sdss/session/sway.conf\0",
+        ), mock.patch.object(
+            runtime, "own_cgroup", return_value="user.slice/app-steam.scope"
+        ), mock.patch.object(
+            runtime, "_belongs_to_cgroup", return_value=False
+        ), mock.patch.object(runtime.os, "kill") as kill:
+            runtime.reap_orphaned_helpers()
+        kill.assert_not_called()
+
+    def test_reap_orphaned_helpers_kills_rootfs_clients_before_supervisors(self):
+        # The actual bug: killing conmon/fuse-overlayfs while sway/Xwayland/sdss_inputd are
+        # still executing code demand-paged from the rootfs those two back raises SIGBUS in
+        # the still-running client instead of letting it exit cleanly. Assert the ordering
+        # directly, across both os.kill and the wait, rather than just the final call list.
+        calls: list[tuple] = []
+        commands = [
+            b"/usr/bin/conmon\0-n\0sdss-compositor\0",  # supervisor
+            b"python\0sdss_inputd.py\0",  # rootfs client
+        ]
+        with mock.patch.object(runtime.os, "listdir", return_value=["123", "456"]), mock.patch.object(
+            runtime.os, "getpid", return_value=999
+        ), mock.patch.object(
+            runtime.Path, "read_bytes", side_effect=commands
+        ), mock.patch.object(
+            runtime,
+            "_await_process_exit",
+            side_effect=lambda pids, timeout: calls.append(("wait", tuple(pids))),
+        ), mock.patch.object(
+            runtime.os, "kill", side_effect=lambda pid, sig: calls.append(("kill", pid))
+        ):
+            runtime.reap_orphaned_helpers()
+        self.assertEqual(calls, [("kill", 456), ("wait", (456,)), ("kill", 123)])
+
+    def test_await_process_exit_returns_once_pids_are_gone(self):
+        # First poll still finds both alive (one sleep), second poll finds both gone: the
+        # `while remaining and ...` loop must exit right there without polling the clock
+        # again, since `remaining` alone is already false.
+        with mock.patch.object(
+            runtime.Path, "exists", side_effect=[True, True, False, False]
+        ), mock.patch.object(runtime.time, "sleep") as sleep, mock.patch.object(
+            runtime.time, "monotonic", side_effect=[0.0, 0.1, 0.2]
+        ):
+            runtime._await_process_exit([123, 456], timeout=2.0)
+        self.assertEqual(sleep.call_count, 1)
+
+    def test_await_process_exit_gives_up_after_timeout(self):
+        with mock.patch.object(runtime.Path, "exists", return_value=True), mock.patch.object(
+            runtime.time, "sleep"
+        ), mock.patch.object(
+            runtime.time, "monotonic", side_effect=[0.0, 0.1, 0.2, 5.0]
+        ):
+            # Must return instead of looping forever when a PID refuses to die.
+            runtime._await_process_exit([123], timeout=2.0)
+
+    def test_await_process_exit_is_a_noop_for_no_pids(self):
+        with mock.patch.object(runtime.time, "sleep") as sleep:
+            runtime._await_process_exit([], timeout=2.0)
+        sleep.assert_not_called()
 
     def test_reap_orphaned_helpers_kills_stale_nested_graphics_helpers(self):
         commands = [
@@ -321,13 +433,18 @@ class ContainerTeardownTests(unittest.TestCase):
             "_belongs_to_cgroup",
             side_effect=lambda pid, _parent: pid in (123, 456),
         ), mock.patch.object(
+            runtime, "_await_process_exit"
+        ) as await_exit, mock.patch.object(
             runtime.os, "kill"
         ) as kill:
             runtime.reap_orphaned_helpers()
+        # Xwayland (123, a rootfs client) is killed and waited for before fuse-overlayfs
+        # (456, its storage backend).
         self.assertEqual(
             kill.call_args_list,
             [mock.call(123, runtime.signal.SIGKILL), mock.call(456, runtime.signal.SIGKILL)],
         )
+        await_exit.assert_called_once_with([123], timeout=2.0)
 
     def test_reap_orphaned_helpers_preserves_graphics_helpers_from_other_scope(self):
         commands = [
