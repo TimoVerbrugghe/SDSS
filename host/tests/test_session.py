@@ -242,8 +242,49 @@ class CleanupContainerTests(unittest.TestCase):
             "sdss.session.runtime.native_sway", return_value="/usr/bin/sway"
         ):
             session.cleanup()
-        killpg.assert_called_once_with(1234, mock.ANY)
+        killpg.assert_called_once_with(1234, signal.SIGTERM)
         process.wait.assert_called_once_with(timeout=5)
+
+    def test_cleanup_sends_sigkill_immediately_to_the_emulator(self):
+        """Azahar does not shut down reliably on SIGTERM.
+
+        Verified on hardware: it usually just ignores SIGTERM for the full 5s timeout
+        (harmless), but on the occasions it reacted within milliseconds instead, sway,
+        Xwayland and sdss_inputd crashed with SIGBUS moments later — a triple coredump,
+        immediately followed by the classic Steam allocator abort in the next session. A
+        repeated hardware test that let SIGTERM go fully unanswered (5s timeout, then the
+        SIGKILL escalation) produced a clean teardown every time. The emulator must never
+        get a chance to react to SIGTERM at all; SIGKILL is the only path confirmed safe.
+        """
+        session = Session(profile=AZAHAR, command=["azahar"])
+        emulator = mock.Mock()
+        emulator.poll.return_value = None
+        emulator.pid = 4321
+        session._processes.append(emulator)
+        session._emulator_proc = emulator
+        with mock.patch("sdss.session.os.killpg") as killpg, mock.patch(
+            "sdss.session.runtime.native_sway", return_value="/usr/bin/sway"
+        ):
+            session.cleanup()
+        killpg.assert_called_once_with(4321, signal.SIGKILL)
+
+    def test_cleanup_still_sends_sigterm_first_to_the_compositor(self):
+        """Only the emulator skips straight to SIGKILL; sway keeps its graceful exit."""
+        session = Session(profile=AZAHAR, command=["azahar"])
+        sway_proc = mock.Mock()
+        sway_proc.poll.return_value = None
+        sway_proc.pid = 1111
+        emulator = mock.Mock()
+        emulator.poll.return_value = None
+        emulator.pid = 2222
+        session._processes.extend([sway_proc, emulator])
+        session._emulator_proc = emulator
+        with mock.patch("sdss.session.os.killpg") as killpg, mock.patch(
+            "sdss.session.runtime.native_sway", return_value="/usr/bin/sway"
+        ):
+            session.cleanup()
+        killpg.assert_any_call(1111, signal.SIGTERM)
+        killpg.assert_any_call(2222, signal.SIGKILL)
 
     def test_terminate_process_kills_descendants_outside_process_group(self):
         process = mock.Mock()
@@ -255,6 +296,22 @@ class CleanupContainerTests(unittest.TestCase):
             Session._terminate_process(process)
         kill.assert_any_call(5678, signal.SIGTERM)
         kill.assert_any_call(5678, signal.SIGKILL)
+
+    def test_terminate_process_graceful_false_never_sends_sigterm(self):
+        """graceful=False must not give the target any chance to react to SIGTERM."""
+        process = mock.Mock()
+        process.pid = 1234
+        process.wait.return_value = None
+        with mock.patch.object(Session, "_descendant_pids", return_value=[5678]), mock.patch(
+            "sdss.session.os.kill"
+        ) as kill, mock.patch("sdss.session.os.killpg") as killpg:
+            Session._terminate_process(process, graceful=False)
+        kill.assert_any_call(5678, signal.SIGKILL)
+        killpg.assert_called_once_with(1234, signal.SIGKILL)
+        for call in kill.call_args_list:
+            self.assertNotEqual(call.args[1], signal.SIGTERM)
+        for call in killpg.call_args_list:
+            self.assertNotEqual(call.args[1], signal.SIGTERM)
 
     def test_start_sway_force_removes_a_stale_container_first(self):
         """`--replace` alone is not enough when the previous conmon died unclean.

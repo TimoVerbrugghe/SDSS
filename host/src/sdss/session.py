@@ -36,6 +36,7 @@ class Session:
     tv: OutputMode | None = None
     dry_run: bool = False
     _processes: list[subprocess.Popen] = field(default_factory=list, repr=False)
+    _emulator_proc: subprocess.Popen | None = field(default=None, repr=False)
     _pin_keepalive_fd: int | None = field(default=None, repr=False)
     _signal_handlers: dict[int, object] = field(default_factory=dict, repr=False)
     _stopping: bool = field(default=False, repr=False)
@@ -165,16 +166,31 @@ class Session:
         self._signal_handlers.clear()
 
     @staticmethod
-    def _terminate_process(proc: subprocess.Popen) -> None:
-        """Stop a launched process and the wrappers it may have spawned."""
+    def _terminate_process(proc: subprocess.Popen, *, graceful: bool = True) -> None:
+        """Stop a launched process and the wrappers it may have spawned.
+
+        ``graceful=False`` skips SIGTERM and sends SIGKILL immediately. The emulator
+        needs this: Azahar does not shut down reliably on SIGTERM. Usually it just
+        ignores it for the full 5s timeout below (harmless — the SIGKILL escalation
+        handles that), but verified on hardware that it occasionally reacts within
+        milliseconds instead, and that fast reaction is what correlates with sway,
+        Xwayland and sdss_inputd then crashing with SIGBUS moments later — a triple
+        coredump within ~300ms of the fast exit, immediately followed by the classic
+        Steam allocator abort in the *next* session. A repeated hardware test that let
+        the same signal sequence run its full 5s course (i.e. the emulator never
+        reacted to SIGTERM at all) produced a clean teardown every time. A plain SIGKILL
+        never gives the emulator's own signal handling a chance to run, which is the
+        one path confirmed clean.
+        """
+        first_signal = signal.SIGTERM if graceful else signal.SIGKILL
         descendants = Session._descendant_pids(proc.pid)
         for pid in descendants:
             try:
-                os.kill(pid, signal.SIGTERM)
+                os.kill(pid, first_signal)
             except (ProcessLookupError, PermissionError):
                 continue
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            os.killpg(proc.pid, first_signal)
         except ProcessLookupError:
             return
         except PermissionError as exc:
@@ -267,6 +283,7 @@ class Session:
         except OSError as exc:
             raise SessionError(f"could not launch emulator {command[0]!r}: {exc}") from exc
         self._processes.append(proc)
+        self._emulator_proc = proc
         return proc
 
     def _start_sway(self, config: Path) -> subprocess.Popen:
@@ -369,8 +386,9 @@ class Session:
     def cleanup(self) -> None:
         for proc in reversed(self._processes):
             if proc.poll() is None:
-                self._terminate_process(proc)
+                self._terminate_process(proc, graceful=proc is not self._emulator_proc)
         self._processes.clear()
+        self._emulator_proc = None
         runtime.reap_orphaned_helpers()
         # `podman run` is a child, but conmon, fuse-overlayfs and the nested Xwayland are not.
         # Asking podman to remove the container reaps those remaining container processes.
