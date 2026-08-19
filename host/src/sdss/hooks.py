@@ -38,6 +38,10 @@ def _shadow(path: Path) -> Path:
     return path.with_name(path.name + ".sdss-real")
 
 
+def _previous_shadow(path: Path) -> Path:
+    return path.with_name(f".{path.name}.sdss-previous")
+
+
 def _head(path: Path) -> str:
     """First bytes of `path`, decoded loosely.
 
@@ -78,6 +82,8 @@ def _wrapper_script(profile: Profile, shadow: Path) -> str:
     return (
         f"#!/bin/bash\n"
         f"{_marker_line(profile.id)}\n"
+        'export SDSS_EMULATOR_LD_PRELOAD="${LD_PRELOAD-}"\n'
+        "unset LD_PRELOAD\n"
         f'exec {shlex.quote(sdss_bin)} run --profile {profile.id} -- {command_text} "$@"\n'
     )
 
@@ -117,6 +123,7 @@ def install(profile: Profile) -> bool:
     if path is None:
         return False
     shadow = _shadow(path)
+    previous = _previous_shadow(path)
 
     if not path.exists():
         # A previous run was killed between shadowing and writing the wrapper, so the
@@ -124,10 +131,12 @@ def install(profile: Profile) -> bool:
         # creates that state, and leaving it means the Steam entry never launches again.
         if shadow.exists() or shadow.is_symlink():
             _write_wrapper(path, profile, shadow)
+            previous.unlink(missing_ok=True)
             return True
         return False
 
     if _is_wrapper(path, profile.id):
+        previous.unlink(missing_ok=True)
         return False
 
     if _is_sdss_wrapper(path):
@@ -137,13 +146,27 @@ def install(profile: Profile) -> bool:
         if not (shadow.exists() or shadow.is_symlink()):
             return False
         _write_wrapper(path, profile, shadow)
+        previous.unlink(missing_ok=True)
         return True
 
-    # A genuine binary with an existing shadow is ambiguous: replacing the shadow would
-    # discard the only known copy of the previously installed real binary. Refuse rather
-    # than choosing which user's executable to destroy.
     if shadow.exists() or shadow.is_symlink():
-        raise OSError(f"refusing to replace existing SDSS shadow {shadow}")
+        previous.unlink(missing_ok=True)
+        os.replace(shadow, previous)
+        try:
+            os.replace(path, shadow)
+            try:
+                _write_wrapper(path, profile, shadow)
+            except OSError:
+                os.replace(shadow, path)
+                os.replace(previous, shadow)
+                raise
+        except OSError:
+            if previous.exists() and not shadow.exists():
+                os.replace(previous, shadow)
+            raise
+        previous.unlink(missing_ok=True)
+        return True
+
     os.replace(path, shadow)
     try:
         _write_wrapper(path, profile, shadow)
@@ -159,7 +182,9 @@ def remove(profile: Profile) -> bool:
     if path is None:
         return False
     shadow = _shadow(path)
+    previous = _previous_shadow(path)
     if not (shadow.exists() or shadow.is_symlink()):
+        previous.unlink(missing_ok=True)
         # Wrapper present but its shadow vanished — nothing safe to restore.
         return False
     if not (path.exists() or path.is_symlink()):
@@ -172,6 +197,7 @@ def remove(profile: Profile) -> bool:
     # rename() atomically replaces `path`; no separate unlink, so there is no window
     # where the launcher path is missing if this gets killed mid-operation.
     shadow.rename(path)
+    previous.unlink(missing_ok=True)
     return True
 
 

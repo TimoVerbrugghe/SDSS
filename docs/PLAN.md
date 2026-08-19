@@ -132,12 +132,15 @@ rather than ratios, so a wrong extent that preserves the quotient still fails.
 | Emulator | Install | Config | Second-screen edit |
 | --- | --- | --- | --- |
 | Cemu | `~/Applications/Cemu.AppImage` | `~/.config/Cemu/settings.xml` | `<open_pad>true</open_pad>` — **verified**, window `GamePad View` (X11 only) |
-| Azahar | `~/Applications/azahar.AppImage` | `~/.config/azahar-emu/qt-config.ini` | `[Layout] layout_option=4` (SeparateWindows), `secondary_display_layout=2` (BottomScreenOnly) — **verified**, window `… | Secondary Window` |
+| Azahar | `~/Applications/azahar.AppImage` | `~/.config/azahar-emu/qt-config.ini` | `[Layout] layout_option=4` (SeparateWindows), `secondary_display_layout=2` (BottomScreenOnly), `[Renderer] graphics_api=1` (OpenGL while SDSS runs) — **verified**, window `… | Secondary Window`; Steam launches use nested Xwayland because native Wayland produced fatal protocol errors, while Vulkan under nested Xwayland triggers an unbounded Steam overlay memory leak |
 | melonDS | Flatpak `net.kuribo64.melonDS` | `~/.var/app/net.kuribo64.melonDS/config/melonDS/melonDS.toml` | `Instance0.Window1.ScreenSizing` = bottom-only — unverified |
 | RetroArch DS | — | — | **Not viable** — one framebuffer, no second toplevel |
 
-All config edits go through a backup journal so the user's config is restored
-byte-identically when the session ends.
+The enabled state owns emulator configuration. `sdss enable` snapshots and applies only the
+keys declared by each profile; per-profile and master disables selectively restore those keys
+in the live file, preserving unrelated changes made while SDSS was enabled. Full-file,
+checksum-verified backups remain available for missing/corrupt-file recovery. A game session
+owns only processes and never restores configuration from Steam's fragile Exit Game path.
 
 ## Auto-launch from the Steam Library
 
@@ -178,7 +181,7 @@ docs/       this plan, recon notes, spike results
 | --- | --- |
 | P0 | Recon and spikes (blocking) |
 | P1 | `sdss run` MVP: sway dual output + Sunshine + manual launch options |
-| P2 | Emulator profiles + config patch/restore |
+| P2 | Emulator profiles + toggle-owned selective config patch/restore |
 | P3 | Touch input bridge (`sdss-inputd`) |
 | P4 | Decky plugin |
 | P5 | Deck-side auto-connect helper |
@@ -241,9 +244,11 @@ the emulator on the host against the compositor's Wayland socket.
 ## Verification
 
 - One `docs/spikes/SN-*.md` per spike with the exact commands and pass/fail.
-- Unit tests: patch → restore round-trip is byte-identical; profile matching.
+- Unit tests: managed keys restore while unrelated settings survive; full-backup recovery;
+  profile matching.
 - Manual E2E per emulator: TV shows the main screen, Moonlight shows only the second
-  screen, Deck touch drives the stylus, quitting restores configs and stops sway/Sunshine.
+  screen, Deck touch drives the stylus, quitting stops sway/Sunshine, and disabling SDSS
+  restores managed config keys.
 - Latency budget: the extra compositing hop must stay under roughly one frame on the TV path.
 
 ## Out of scope for v1

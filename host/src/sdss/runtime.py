@@ -6,12 +6,134 @@ container image. A native `sway` on PATH is preferred when present (development 
 
 from __future__ import annotations
 
+import ctypes
+import logging
 import os
+import re
+import signal
 import shutil
 import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 
 IMAGE = os.environ.get("SDSS_COMPOSITOR_IMAGE", "localhost/sdss-compositor:latest")
+
+# Fixed name so teardown can reach the container even though `podman run`'s own child
+# process is not what keeps it alive (conmon, fuse-overlayfs and the nested Xwayland are
+# siblings that outlive it — see Session.cleanup).
+CONTAINER_NAME = "sdss-compositor"
+PR_SET_PDEATHSIG = 1
+INPUTD_NAME = "sdss_inputd.py"
+_parent_watch_stop: threading.Event | None = None
+log = logging.getLogger("sdss.runtime")
+
+
+def arm_parent_death_signal() -> None:
+    """Make the session receive SIGTERM when its Steam launcher disappears.
+
+    Steam stops the launcher process, not necessarily every descendant it spawned. Linux
+    otherwise reparents SDSS to systemd, leaving the emulator and compositor alive.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+
+    original_parent = os.getppid()
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0)
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+    # The parent can exit between getppid() and prctl(). Deliver the same signal ourselves
+    # rather than allowing a race to leave an orphaned session.
+    if os.getppid() != original_parent:
+        os.kill(os.getpid(), signal.SIGTERM)
+    _arm_parent_lineage_watch(original_parent)
+
+
+def _arm_parent_lineage_watch(parent_pid: int) -> None:
+    """Notice either Steam or its reaper disappearing while wrappers survive."""
+    global _parent_watch_stop
+    watched_pids = _watched_parent_pids(parent_pid)
+    if not watched_pids:
+        return
+    stop_event = threading.Event()
+    _parent_watch_stop = stop_event
+
+    def watch() -> None:
+        # Bound to the local `stop_event`, not the module-global `_parent_watch_stop`: the
+        # global is reassigned to a new Event (or None) by disarm_parent_death_watch() from
+        # the main thread, and re-reading it here raced with that reassignment. Verified on
+        # hardware: this thread crashed with "AttributeError: 'NoneType' object has no
+        # attribute 'is_set'" when disarm ran between an iteration's wait() and its next
+        # while-check. Harmless to the running session (the thread was already being told to
+        # stop), but a real bug — an unhandled exception in a background thread — worth
+        # closing regardless of whether it caused any particular observed crash.
+        while not stop_event.is_set():
+            for pid in watched_pids:
+                if not Path(f"/proc/{pid}").exists():
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return
+            stop_event.wait(0.5)
+
+    threading.Thread(target=watch, name="sdss-parent-watch", daemon=True).start()
+
+
+def _watched_parent_pids(parent_pid: int) -> tuple[int, ...]:
+    """Return the reaper and, when present, Steam itself from the launch ancestry."""
+    ancestors = _ancestor_pids(parent_pid)
+    if not ancestors:
+        return ()
+    watched = [ancestors[0]]
+    steam = next((pid for pid in ancestors if _process_name(pid) == "steam"), None)
+    if steam is not None and steam not in watched:
+        watched.append(steam)
+    return tuple(watched)
+
+
+def _ancestor_pids(pid: int) -> tuple[int, ...]:
+    """Return a process's live parent chain, nearest first."""
+    ancestors: list[int] = []
+    seen = {pid}
+    current = pid
+    while True:
+        parent = _parent_pid(current)
+        if parent is None or parent <= 1 or parent in seen:
+            break
+        ancestors.append(parent)
+        seen.add(parent)
+        current = parent
+    return tuple(ancestors)
+
+
+def _parent_pid(pid: int) -> int | None:
+    try:
+        status = Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return None
+    for line in status.splitlines():
+        if line.startswith("PPid:\t"):
+            try:
+                return int(line.split("\t", 1)[1])
+            except ValueError:
+                return None
+    return None
+
+
+def _process_name(pid: int) -> str | None:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return None
+
+
+def disarm_parent_death_watch() -> None:
+    global _parent_watch_stop
+    if _parent_watch_stop is not None:
+        _parent_watch_stop.set()
+        _parent_watch_stop = None
 
 
 def parent_display() -> tuple[str, str]:
@@ -50,6 +172,221 @@ def image_present() -> bool:
         ["podman", "image", "exists", IMAGE], capture_output=True, check=False
     )
     return result.returncode == 0
+
+
+def remove_container(name: str = CONTAINER_NAME) -> bool:
+    """Force-kill and remove the compositor container.
+
+    Terminating the `podman run` process is not enough: conmon supervises the container in
+    its own process and, together with fuse-overlayfs and the nested Xwayland, keeps running
+    inside the Steam per-game cgroup scope SDSS deliberately nests under. Steam treats a
+    non-empty scope as the game still running, so the next launch is refused with "Game
+    already running" until those are reaped. Verified on hardware.
+
+    This used to try `--signal TERM` first, bounded by a short `podman wait`, on the theory
+    that a plain SIGKILL never gives sway a chance to close its X11 connection to gamescope's
+    per-game Xwayland cleanly, and that the abrupt severing was a plausible contributor to the
+    Steam-side corruption documented in docs/architecture.md. That theory was never proven,
+    and hardware testing found something worse than an unproven theory: sending the container
+    `--signal TERM` occasionally (not reliably) makes sway itself crash with SIGBUS within a
+    few hundred milliseconds, taking Xwayland and sdss_inputd down with it (a triple coredump,
+    reproduced twice — once with the emulator's own SIGTERM handling also implicated, once
+    with the emulator already reaped by SIGKILL beforehand, ruling that out as the cause). A
+    crash is not a clean protocol disconnect either — the kernel closes the socket the same
+    abrupt way SIGKILL would have — so the graceful attempt was buying, at best, an
+    occasional clean disconnect at the cost of an occasional hard crash, not a reliable
+    improvement over SIGKILL. Going straight to SIGKILL removes that crash mode entirely.
+    """
+    if not podman_available():
+        return False
+    # The compositor uses --pid=host, so sway is not necessarily in podman's client process
+    # group. Kill the container first; otherwise `rm --force` can hang or leave conmon behind.
+    subprocess.run(
+        ["podman", "kill", "--signal", "KILL", name],
+        capture_output=True,
+        check=False,
+    )
+    result = subprocess.run(
+        ["podman", "rm", "--force", "--ignore", name],
+        capture_output=True,
+        check=False,
+    )
+    reap_orphaned_helpers(name)
+    return result.returncode == 0
+
+
+def reap_orphaned_helpers(name: str = CONTAINER_NAME) -> None:
+    """Kill SDSS helper processes left behind after Podman loses its container record.
+
+    Rootless Podman can reparent overlay mounts and nested Xwayland to the user manager when
+    conmon or the session dies first. It can also create a persistent ``catatonit -P`` pause
+    process and reparent it to Steam's reaper, making "Exit Game" wait forever. Pause cleanup
+    requires both Podman's own pause PID file and a parent in this launch's ancestry, so
+    unrelated rootless Podman sessions are not touched even when systemd chooses a different
+    cgroup layout for the helper.
+    """
+    reap_orphaned_appimage_mounts()
+    launch_ancestors = set(_ancestor_pids(os.getpid()))
+    launch_cgroup = own_cgroup()
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            command = Path(f"/proc/{entry}/cmdline").read_bytes().replace(b"\0", b" ")
+        except OSError:
+            continue
+        is_named_container = f"-n {name}".encode() in command
+        is_input_bridge = INPUTD_NAME.encode() in command
+        is_launch_scoped = _belongs_to_cgroup(int(entry), launch_cgroup)
+        is_rootless_xwayland = is_launch_scoped and (
+            b"Xwayland" in command and b"-rootless" in command and b"-wm" in command
+        )
+        is_sdss_overlay = is_launch_scoped and (
+            b"fuse-overlayfs" in command
+            and b"/.local/share/containers/storage/overlay/" in command
+        )
+        is_launch_pause = _is_launch_owned_podman_pause(
+            int(entry), command, launch_ancestors
+        )
+        if (
+            is_named_container
+            or is_input_bridge
+            or is_rootless_xwayland
+            or is_sdss_overlay
+            or is_launch_pause
+        ):
+            try:
+                os.kill(int(entry), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                continue
+
+
+def _belongs_to_cgroup(pid: int, parent: str | None) -> bool:
+    if not parent:
+        return False
+    try:
+        contents = Path(f"/proc/{pid}/cgroup").read_text()
+    except OSError:
+        return False
+    for line in contents.splitlines():
+        if not line.startswith("0::"):
+            continue
+        current = line[3:].lstrip("/")
+        return current == parent or current.startswith(f"{parent}/")
+    return False
+
+
+def _is_launch_owned_podman_pause(
+    pid: int, command: bytes, launch_ancestors: set[int]
+) -> bool:
+    args = command.split()
+    if len(args) != 2 or Path(os.fsdecode(args[0])).name != "catatonit" or args[1] != b"-P":
+        return False
+    parent = _parent_pid(pid)
+    if parent not in launch_ancestors:
+        return False
+    return _podman_pause_pid() == pid
+
+
+def _podman_pause_pid() -> int | None:
+    runtime_dir = Path(
+        os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    )
+    try:
+        return int((runtime_dir / "libpod/tmp/pause.pid").read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def reap_orphaned_appimage_mounts() -> None:
+    """Unmount detached FUSE mounts left by an interrupted SDSS AppImage launch.
+
+    AppImage mounts are not processes, so killing the emulator and compositor cannot remove
+    them. Restrict this to mounts under AppImage's temporary directory whose source is one of
+    SDSS's shadowed launcher files.
+    """
+    try:
+        mountinfo = Path("/proc/self/mountinfo").read_text()
+    except OSError:
+        return
+    fusermount = shutil.which("fusermount3") or shutil.which("fusermount")
+    if not fusermount:
+        return
+    for line in mountinfo.splitlines():
+        fields = line.split(" - ", 1)
+        if len(fields) != 2:
+            continue
+        mount_fields, filesystem_fields = fields
+        mount_parts = mount_fields.split()
+        filesystem_parts = filesystem_fields.split()
+        if len(mount_parts) < 5 or len(filesystem_parts) < 2:
+            continue
+        mountpoint = re.sub(
+            r"\\([0-7]{3})",
+            lambda match: chr(int(match.group(1), 8)),
+            mount_parts[4],
+        )
+        source = re.sub(
+            r"\\([0-7]{3})",
+            lambda match: chr(int(match.group(1), 8)),
+            filesystem_parts[1],
+        )
+        if not mountpoint.startswith("/tmp/.mount_") or not source.endswith(
+            ".AppImage.sdss-real"
+        ):
+            continue
+        result = subprocess.run(
+            [fusermount, "-u", "-z", mountpoint],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            log.warning("could not unmount stale AppImage mount %s", mountpoint)
+
+
+HOST_X11_DIR = Path("/tmp/.X11-unix")
+# Where the host's X sockets are re-exposed inside the container, so the bridge dir mounted
+# over /tmp/.X11-unix can symlink back out to them.
+CONTAINER_HOST_X11_DIR = Path("/run/host-x11")
+
+
+def x11_bridge_dir(runtime_dir: Path) -> Path:
+    return runtime_dir / "sdss" / "x11"
+
+
+def prepare_x11_bridge(runtime_dir: Path) -> Path:
+    """Build a user-owned /tmp/.X11-unix replacement and return it.
+
+    Mounting the host's /tmp/.X11-unix straight through fails: it is root-owned (0:0), and
+    under --userns=keep-id host uid 0 maps to nobody, so wlroots refuses it outright --
+    "/tmp/.X11-unix not owned by root or us" -- and then "No display available in the first
+    33". Xwayland never starts, sway reports an empty DISPLAY, and every needs_x11 profile
+    (Cemu, melonDS) dies with a black second screen.
+
+    A directory we own satisfies that check. The host's existing sockets are symlinked back
+    in via a second, separate mount of the real directory, so the nested compositor can still
+    reach the host's per-game Xwayland (WLR_BACKENDS=x11) while its own Xwayland creates a
+    new socket here. Host-side clients reach that new display over the abstract socket
+    namespace, which --network=host already shares (verified: xdpyinfo on :2 from the host).
+    """
+    bridge = x11_bridge_dir(runtime_dir)
+    bridge.mkdir(parents=True, exist_ok=True)
+    for existing in bridge.iterdir():
+        if existing.is_symlink():
+            existing.unlink()
+    try:
+        sockets = sorted(HOST_X11_DIR.iterdir())
+    except OSError:
+        return bridge
+    for socket_path in sockets:
+        if not socket_path.name.startswith("X"):
+            continue
+        (bridge / socket_path.name).symlink_to(CONTAINER_HOST_X11_DIR / socket_path.name)
+    return bridge
 
 
 def outer_gamescope_resolution() -> tuple[int, int] | None:
@@ -132,11 +469,14 @@ def compositor_command(config: Path, runtime_dir: Path, home: Path | None = None
         *(["--cgroup-manager=cgroupfs"] if parent else []),
         "run",
         "--rm",
+        f"--name={CONTAINER_NAME}",
+        # A crashed session can leave the old container behind and podman refuses to reuse
+        # a name; without this every subsequent launch fails with exit 125.
+        "--replace",
         "--userns=keep-id",
         # host networking shares the abstract socket namespace, which is how host X11
         # clients reach the nested Xwayland.
         "--network=host",
-        "--ipc=host",
         # Gamescope decides a launched Steam game is "ready" (and dismisses its loading
         # spinner) by walking the process tree/cgroup it launched. A default podman run
         # puts sway in its own pid/cgroup namespace, orphaned from that tree, so gamescope
@@ -147,13 +487,13 @@ def compositor_command(config: Path, runtime_dir: Path, home: Path | None = None
         *([f"--cgroup-parent=/{parent}"] if parent else []),
         f"--volume={runtime_dir}:{runtime_dir}",
         f"--volume={home}:{home}",
-        # Shared (not private/empty) so the nested sway's wlr_x11_backend can connect out
-        # to the host's per-game Xwayland socket. Must be read-write, not read-only:
-        # sway's own nested Xwayland (`xwayland enable` in compositor.py) also creates a
-        # new socket file here for needs_x11 profiles (Cemu, melonDS) — the host-side
-        # emulator process connects to that new socket, which a ro mount would prevent
-        # the container from creating in the first place.
-        "--volume=/tmp/.X11-unix:/tmp/.X11-unix",
+        # /tmp/.X11-unix cannot be mounted straight through: it is root-owned, which maps to
+        # nobody under --userns=keep-id, and wlroots then refuses to create its Xwayland
+        # socket there ("not owned by root or us"), leaving DISPLAY empty and every
+        # needs_x11 profile with a black screen. Mount a directory we own in its place, and
+        # expose the real one separately so the symlinks inside it still resolve outward.
+        f"--volume={x11_bridge_dir(runtime_dir)}:/tmp/.X11-unix",
+        f"--volume={HOST_X11_DIR}:{CONTAINER_HOST_X11_DIR}",
         # The touch bridge reads and grabs Sunshine's virtual input devices.
         "--volume=/dev/input:/dev/input",
         "--device=/dev/input",

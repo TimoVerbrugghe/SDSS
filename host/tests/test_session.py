@@ -1,16 +1,19 @@
+import contextlib
 import fcntl
 import os
+import signal
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from sdss import runtime
-from sdss.profiles import AZAHAR
-from sdss.session import Session
+from sdss.profiles import AZAHAR, CEMU
+from sdss.session import Session, SessionError, SessionInterrupted
 
 
 class WriteArtifactsTests(unittest.TestCase):
@@ -48,10 +51,9 @@ class WriteArtifactsTests(unittest.TestCase):
         config = artifacts["sway_config"].read_text()
         self.assertIn("output WL-1 mode 1280x800@60Hz position 0 0", config)
 
-    def test_headless_output_uses_the_profiles_native_second_size(self):
-        # Regression test: write_artifacts() used to hardcode a 1280x800 HEADLESS-1
-        # output for every profile, silently ignoring each Profile's own
-        # `second_size` (e.g. Azahar's 320x240 native second-screen resolution).
+    def test_headless_output_is_always_the_decks_panel_resolution(self):
+        # HEADLESS-1 must match Moonlight's requested Deck panel resolution. The emulator's
+        # native second-screen size is not the streamed output size.
         with mock.patch.object(
             runtime, "outer_gamescope_resolution", return_value=(1280, 800)
         ), mock.patch.object(runtime, "parent_display", return_value=("wayland", "gamescope-0")):
@@ -59,8 +61,7 @@ class WriteArtifactsTests(unittest.TestCase):
             artifacts = session.write_artifacts()
 
         config = artifacts["sway_config"].read_text()
-        width, height = AZAHAR.second_size
-        self.assertIn(f"output HEADLESS-1 mode {width}x{height}@60Hz", config)
+        self.assertIn("output HEADLESS-1 mode 1280x800@60Hz", config)
 
     def test_falls_back_to_1920x1080_when_no_outer_gamescope_found(self):
         with mock.patch.object(
@@ -159,13 +160,22 @@ class SunshinePinFifoTests(unittest.TestCase):
         session = Session(profile=AZAHAR, command=["azahar"])
         fake_proc = mock.Mock()
         fake_proc.poll.return_value = 0
-        with mock.patch("sdss.session.stream.default_spec"), mock.patch(
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LD_PRELOAD": "/steam/gameoverlayrenderer.so",
+                "SDSS_EMULATOR_LD_PRELOAD": "/steam/gameoverlayrenderer.so",
+            },
+        ), mock.patch("sdss.session.stream.default_spec"), mock.patch(
             "sdss.session.stream.launch_command", return_value=["sunshine"]
         ), mock.patch("sdss.session.subprocess.Popen", return_value=fake_proc) as popen:
             session._start_sunshine("wayland-1")
 
         keepalive_fd = session._pin_keepalive_fd
         self.assertIsNotNone(keepalive_fd)
+        helper_env = popen.call_args.kwargs["env"]
+        self.assertNotIn("LD_PRELOAD", helper_env)
+        self.assertNotIn("SDSS_EMULATOR_LD_PRELOAD", helper_env)
         child_fd = popen.call_args.kwargs["stdin"]
         with self.assertRaises(OSError):
             fcntl.fcntl(child_fd, fcntl.F_GETFL)
@@ -173,6 +183,390 @@ class SunshinePinFifoTests(unittest.TestCase):
         session.cleanup()
         with self.assertRaises(OSError):
             fcntl.fcntl(keepalive_fd, fcntl.F_GETFL)
+
+
+class CleanupContainerTests(unittest.TestCase):
+    """cleanup() must reap the container, not just its own children.
+
+    Verified on hardware: leftover conmon/fuse-overlayfs/Xwayland kept Steam's per-game
+    cgroup scope populated, so the next launch failed with "Game already running".
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        patcher = mock.patch.dict(
+            "os.environ",
+            {
+                "XDG_RUNTIME_DIR": str(root / "runtime"),
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_STATE_HOME": str(root / "state"),
+                "XDG_DATA_HOME": str(root / "data"),
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_cleanup_removes_the_compositor_container(self):
+        session = Session(profile=AZAHAR, command=["azahar"])
+        with mock.patch("sdss.session.runtime.native_sway", return_value=None), mock.patch(
+            "sdss.session.runtime.remove_container"
+        ) as remove:
+            session.cleanup()
+        remove.assert_called_once()
+
+    def test_cleanup_skips_podman_when_sway_is_native(self):
+        session = Session(profile=AZAHAR, command=["azahar"])
+        with mock.patch("sdss.session.runtime.native_sway", return_value="/usr/bin/sway"), (
+            mock.patch("sdss.session.runtime.remove_container")
+        ) as remove:
+            session.cleanup()
+        remove.assert_not_called()
+
+    def test_cleanup_survives_a_failing_podman(self):
+        # cleanup() runs from a `finally`; teardown must never mask the real error.
+        session = Session(profile=AZAHAR, command=["azahar"])
+        with mock.patch("sdss.session.runtime.native_sway", return_value=None), mock.patch(
+            "sdss.session.runtime.remove_container", side_effect=OSError("no podman")
+        ):
+            session.cleanup()
+
+    def test_cleanup_terminates_process_groups(self):
+        session = Session(profile=AZAHAR, command=["azahar"])
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.pid = 1234
+        session._processes.append(process)
+        with mock.patch("sdss.session.os.killpg") as killpg, mock.patch(
+            "sdss.session.runtime.native_sway", return_value="/usr/bin/sway"
+        ):
+            session.cleanup()
+        killpg.assert_called_once_with(1234, signal.SIGTERM)
+        process.wait.assert_called_once_with(timeout=5)
+
+    def test_cleanup_sends_sigkill_immediately_to_the_emulator(self):
+        """Azahar does not shut down reliably on SIGTERM.
+
+        Verified on hardware: it usually just ignores SIGTERM for the full 5s timeout
+        (harmless), but on the occasions it reacted within milliseconds instead, sway,
+        Xwayland and sdss_inputd crashed with SIGBUS moments later — a triple coredump,
+        immediately followed by the classic Steam allocator abort in the next session. A
+        repeated hardware test that let SIGTERM go fully unanswered (5s timeout, then the
+        SIGKILL escalation) produced a clean teardown every time. The emulator must never
+        get a chance to react to SIGTERM at all; SIGKILL is the only path confirmed safe.
+        """
+        session = Session(profile=AZAHAR, command=["azahar"])
+        emulator = mock.Mock()
+        emulator.poll.return_value = None
+        emulator.pid = 4321
+        session._processes.append(emulator)
+        session._emulator_proc = emulator
+        with mock.patch("sdss.session.os.killpg") as killpg, mock.patch(
+            "sdss.session.runtime.native_sway", return_value="/usr/bin/sway"
+        ):
+            session.cleanup()
+        killpg.assert_called_once_with(4321, signal.SIGKILL)
+
+    def test_cleanup_still_sends_sigterm_first_to_the_compositor(self):
+        """Only the emulator skips straight to SIGKILL; sway keeps its graceful exit."""
+        session = Session(profile=AZAHAR, command=["azahar"])
+        sway_proc = mock.Mock()
+        sway_proc.poll.return_value = None
+        sway_proc.pid = 1111
+        emulator = mock.Mock()
+        emulator.poll.return_value = None
+        emulator.pid = 2222
+        session._processes.extend([sway_proc, emulator])
+        session._emulator_proc = emulator
+        with mock.patch("sdss.session.os.killpg") as killpg, mock.patch(
+            "sdss.session.runtime.native_sway", return_value="/usr/bin/sway"
+        ):
+            session.cleanup()
+        killpg.assert_any_call(1111, signal.SIGTERM)
+        killpg.assert_any_call(2222, signal.SIGKILL)
+
+    def test_terminate_process_kills_descendants_outside_process_group(self):
+        process = mock.Mock()
+        process.pid = 1234
+        process.wait.return_value = None
+        with mock.patch.object(Session, "_descendant_pids", return_value=[5678]), mock.patch(
+            "sdss.session.os.kill"
+        ) as kill, mock.patch("sdss.session.os.killpg"):
+            Session._terminate_process(process)
+        kill.assert_any_call(5678, signal.SIGTERM)
+        kill.assert_any_call(5678, signal.SIGKILL)
+
+    def test_terminate_process_graceful_false_never_sends_sigterm(self):
+        """graceful=False must not give the target any chance to react to SIGTERM."""
+        process = mock.Mock()
+        process.pid = 1234
+        process.wait.return_value = None
+        with mock.patch.object(Session, "_descendant_pids", return_value=[5678]), mock.patch(
+            "sdss.session.os.kill"
+        ) as kill, mock.patch("sdss.session.os.killpg") as killpg:
+            Session._terminate_process(process, graceful=False)
+        kill.assert_any_call(5678, signal.SIGKILL)
+        killpg.assert_called_once_with(1234, signal.SIGKILL)
+        for call in kill.call_args_list:
+            self.assertNotEqual(call.args[1], signal.SIGTERM)
+        for call in killpg.call_args_list:
+            self.assertNotEqual(call.args[1], signal.SIGTERM)
+
+    def test_start_sway_force_removes_a_stale_container_first(self):
+        """`--replace` alone is not enough when the previous conmon died unclean.
+
+        Verified on hardware: podman reported "conmon exited prematurely" and the new
+        container died ~16ms in, so sway never wrote its env dump and the launch failed
+        with "nested compositor did not report its Wayland socket".
+        """
+        session = Session(profile=AZAHAR, command=["azahar"])
+        order = []
+        with mock.patch(
+            "sdss.session.runtime.parent_display", return_value=("wayland", "wayland-0")
+        ), mock.patch(
+            "sdss.session.runtime.compositor_command", return_value=["podman", "run"]
+        ), mock.patch(
+            "sdss.session.runtime.remove_container",
+            side_effect=lambda *a, **k: order.append("remove"),
+        ), mock.patch(
+            "sdss.session.subprocess.Popen",
+            side_effect=lambda *a, **k: order.append("run") or mock.MagicMock(),
+        ):
+            session._start_sway(Path("/tmp/sway.conf"))
+        self.assertEqual(order, ["remove", "run"])
+
+    def test_start_sway_prepares_the_x11_bridge_before_running_the_container(self):
+        """The bridge dir must exist, and be ours, before podman mounts it.
+
+        Verified on hardware: with the host's root-owned /tmp/.X11-unix mounted straight
+        through, wlroots logged "/tmp/.X11-unix not owned by root or us" for all 33 display
+        slots and gave up ("Failed to start Xwayland"), so DISPLAY came back empty and Cemu
+        rendered nothing.
+        """
+        session = Session(profile=AZAHAR, command=["azahar"])
+        order = []
+        with mock.patch(
+            "sdss.session.runtime.parent_display", return_value=("wayland", "wayland-0")
+        ), mock.patch(
+            "sdss.session.runtime.compositor_command", return_value=["podman", "run"]
+        ), mock.patch("sdss.session.runtime.remove_container"), mock.patch(
+            "sdss.session.runtime.prepare_x11_bridge",
+            side_effect=lambda *a, **k: order.append("bridge"),
+        ), mock.patch(
+            "sdss.session.subprocess.Popen",
+            side_effect=lambda *a, **k: order.append("run") or mock.MagicMock(),
+        ):
+            session._start_sway(Path("/tmp/sway.conf"))
+        self.assertEqual(order, ["bridge", "run"])
+
+    def test_start_sway_does_not_inherit_steam_overlay(self):
+        session = Session(profile=AZAHAR, command=["azahar"])
+        process = mock.MagicMock()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "LD_PRELOAD": "/steam/gameoverlayrenderer.so",
+                "SDSS_EMULATOR_LD_PRELOAD": "/steam/gameoverlayrenderer.so",
+            },
+        ), mock.patch(
+            "sdss.session.runtime.parent_display", return_value=("x11", ":1")
+        ), mock.patch(
+            "sdss.session.runtime.compositor_command", return_value=["podman", "run"]
+        ), mock.patch(
+            "sdss.session.runtime.remove_container"
+        ), mock.patch(
+            "sdss.session.runtime.prepare_x11_bridge"
+        ), mock.patch(
+            "sdss.session.subprocess.Popen", return_value=process
+        ) as popen:
+            session._start_sway(Path("/tmp/sway.conf"))
+
+        helper_env = popen.call_args.kwargs["env"]
+        self.assertNotIn("LD_PRELOAD", helper_env)
+        self.assertNotIn("SDSS_EMULATOR_LD_PRELOAD", helper_env)
+
+
+class SessionLockTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        patcher = mock.patch.dict(
+            "os.environ",
+            {
+                "XDG_RUNTIME_DIR": str(root / "runtime"),
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_STATE_HOME": str(root / "state"),
+                "XDG_DATA_HOME": str(root / "data"),
+            },
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_second_session_is_rejected(self):
+        first = Session(profile=AZAHAR, command=["azahar"])
+        second = Session(profile=CEMU, command=["cemu"])
+        with first._session_lock():
+            with self.assertRaisesRegex(SessionError, "another SDSS emulator session"):
+                with second._session_lock():
+                    pass
+
+    def test_lock_is_released_after_session(self):
+        first = Session(profile=AZAHAR, command=["azahar"])
+        second = Session(profile=CEMU, command=["cemu"])
+        with first._session_lock():
+            pass
+        with second._session_lock():
+            pass
+
+    def test_sigterm_enters_cleanup_path_and_handlers_are_restored(self):
+        session = Session(profile=AZAHAR, command=["azahar"])
+        original = signal.getsignal(signal.SIGTERM)
+        session._install_signal_handlers()
+        self.addCleanup(session._restore_signal_handlers)
+
+        with self.assertRaises(SessionInterrupted):
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+
+        session._restore_signal_handlers()
+        self.assertIs(signal.getsignal(signal.SIGTERM), original)
+
+    def test_second_signal_does_not_interrupt_cleanup(self):
+        session = Session(profile=AZAHAR, command=["azahar"])
+        session._install_signal_handlers()
+        self.addCleanup(session._restore_signal_handlers)
+        handler = signal.getsignal(signal.SIGTERM)
+
+        with self.assertRaises(SessionInterrupted):
+            handler(signal.SIGTERM, None)
+        handler(signal.SIGTERM, None)
+
+    def test_run_disarms_parent_watch_before_cleanup(self):
+        session = Session(profile=AZAHAR, command=["azahar"])
+        order = []
+        with mock.patch.object(
+            session, "_session_lock", return_value=contextlib.nullcontext()
+        ), mock.patch.object(
+            session, "_install_signal_handlers"
+        ), mock.patch.object(
+            session, "_restore_signal_handlers"
+        ), mock.patch.object(
+            session,
+            "write_artifacts",
+            return_value={"sway_config": Path("/tmp/sway.conf")},
+        ), mock.patch.object(
+            session, "_start_sway", side_effect=SessionError("boom")
+        ), mock.patch.object(
+            session, "cleanup", side_effect=lambda: order.append("cleanup")
+        ), mock.patch.object(
+            runtime, "arm_parent_death_signal"
+        ), mock.patch.object(
+            runtime,
+            "disarm_parent_death_watch",
+            side_effect=lambda: order.append("disarm"),
+        ):
+            with self.assertRaisesRegex(SessionError, "boom"):
+                session.run()
+
+        self.assertEqual(order, ["disarm", "cleanup"])
+
+
+class EmulatorLaunchBackendTests(unittest.TestCase):
+    def test_azahar_is_started_on_the_nested_xwayland(self):
+        session = Session(profile=AZAHAR, command=["azahar", "game.cci"])
+        process = mock.Mock()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SDSS_EMULATOR_LD_PRELOAD": "/steam/gameoverlayrenderer.so",
+            },
+            clear=True,
+        ), mock.patch("sdss.session.subprocess.Popen", return_value=process) as popen:
+            session._start_emulator({"WAYLAND_DISPLAY": "wayland-1", "DISPLAY": ":2"})
+
+        env = popen.call_args.kwargs["env"]
+        self.assertEqual(env["DISPLAY"], ":2")
+        self.assertEqual(env["QT_QPA_PLATFORM"], "xcb")
+        self.assertEqual(env["GDK_BACKEND"], "x11")
+        # Verified on hardware: Azahar's Steam overlay is enabled again (profiles.py's
+        # AZAHAR.notes) now that the OpenGL override and the graceful compositor teardown
+        # in runtime.py address the reasons it was previously disabled.
+        self.assertEqual(env["LD_PRELOAD"], "/steam/gameoverlayrenderer.so")
+        self.assertNotIn("SDSS_EMULATOR_LD_PRELOAD", env)
+
+    def test_cemu_keeps_steam_overlay(self):
+        session = Session(profile=CEMU, command=["cemu", "game.wua"])
+        process = mock.Mock()
+        with mock.patch.dict(
+            os.environ,
+            {"SDSS_EMULATOR_LD_PRELOAD": "/steam/gameoverlayrenderer.so"},
+            clear=True,
+        ), mock.patch("sdss.session.subprocess.Popen", return_value=process) as popen:
+            session._start_emulator({"WAYLAND_DISPLAY": "wayland-1", "DISPLAY": ":2"})
+        self.assertEqual(
+            popen.call_args.kwargs["env"]["LD_PRELOAD"],
+            "/steam/gameoverlayrenderer.so",
+        )
+
+
+class AwaitNestedDisplayTests(unittest.TestCase):
+    """DISPLAY can lag WAYLAND_DISPLAY in the env dump; needs_x11 profiles must wait.
+
+    Verified on hardware: sway wrote the dump with an empty DISPLAY and Cemu failed with
+    "needs Xwayland but the compositor reported no DISPLAY" while sway and Sunshine were
+    both healthy — a black second screen and no emulator.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.env_file = Path(self._tmp.name) / "sway-env"
+
+    def test_waits_for_display_when_the_profile_needs_x11(self):
+        self.assertTrue(CEMU.needs_x11)
+        session = Session(profile=CEMU, command=["cemu"])
+        # _await_nested_display() unlinks the file first, so the dump has to appear
+        # during polling — same as sway writing it after the compositor comes up.
+        writes = iter(
+            [
+                "WAYLAND_DISPLAY=wayland-1\nDISPLAY=\n",
+                "WAYLAND_DISPLAY=wayland-1\nDISPLAY=:2\n",
+            ]
+        )
+
+        def advance(_):
+            self.env_file.write_text(next(writes))
+
+        with mock.patch("sdss.session.time.sleep", side_effect=advance):
+            values = session._await_nested_display(self.env_file)
+        self.assertEqual(values["DISPLAY"], ":2")
+
+    def test_returns_immediately_for_a_wayland_only_profile(self):
+        profile = replace(AZAHAR, needs_x11=False)
+        session = Session(profile=profile, command=["azahar"])
+        calls = []
+
+        def advance(_):
+            calls.append(1)
+            self.env_file.write_text("WAYLAND_DISPLAY=wayland-1\nDISPLAY=\n")
+
+        with mock.patch("sdss.session.time.sleep", side_effect=advance):
+            values = session._await_nested_display(self.env_file)
+        self.assertEqual(values["WAYLAND_DISPLAY"], "wayland-1")
+        # A blank DISPLAY must not hold up a profile that never asked for Xwayland.
+        self.assertEqual(len(calls), 1)
+
+    def test_times_out_when_xwayland_never_appears(self):
+        session = Session(profile=CEMU, command=["cemu"])
+
+        def advance(_):
+            self.env_file.write_text("WAYLAND_DISPLAY=wayland-1\nDISPLAY=\n")
+
+        with mock.patch("sdss.session.time.sleep", side_effect=advance), mock.patch(
+            "sdss.session.time.monotonic", side_effect=[0.0, 1.0, 1e6]
+        ), self.assertRaises(SessionError):
+            session._await_nested_display(self.env_file)
 
 
 if __name__ == "__main__":

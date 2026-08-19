@@ -18,7 +18,7 @@ Usage: packaging/uninstall.sh [--keep-configs] [--yes]
 Restores every emulator config SDSS patched, then removes the installed release, the
 `sdss` shim, the desktop launcher, the Decky plugin and the container image.
 
-  --keep-configs  leave emulator configs patched (they will point at a missing SDSS)
+  --keep-configs  leave SDSS-managed emulator settings enabled
   --yes           do not ask for confirmation
 
 The udev rule under /etc is left in place; it is inert without SDSS. Remove it with:

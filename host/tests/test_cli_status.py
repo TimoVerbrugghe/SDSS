@@ -8,10 +8,11 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from sdss import cli, profiles, state
+from sdss import cli, patch, profiles, state
 
 
 class StatusJsonTest(unittest.TestCase):
@@ -25,6 +26,14 @@ class StatusJsonTest(unittest.TestCase):
             if previous is not None
             else os.environ.pop("XDG_STATE_HOME", None)
         )
+        reconcile = mock.patch.object(
+            cli.managed_config, "reconcile", return_value=[]
+        )
+        reconcile.start()
+        self.addCleanup(reconcile.stop)
+        hooks = mock.patch.object(cli.hooks, "reconcile", return_value=False)
+        hooks.start()
+        self.addCleanup(hooks.stop)
 
     def _status(self, *argv: str) -> str:
         parser = cli.build_parser()
@@ -92,6 +101,43 @@ class EnableTest(StatusJsonTest):
         self.assertEqual(self._enable("disable"), 0)
         payload = json.loads(self._status("--json"))
         self.assertFalse(any(entry["enabled"] for entry in payload["profiles"]))
+
+    def test_enable_reconciles_managed_configs_for_effective_profiles(self):
+        self.assertEqual(self._enable("enable"), 0)
+        cli.managed_config.reconcile.assert_called_once_with(
+            {profile.id: True for profile in profiles.PROFILES}
+        )
+
+    def test_restore_disables_state_and_restores_all_managed_configs(self):
+        state.save(state.State(enabled=True))
+        with mock.patch.object(
+            cli.managed_config, "restore_all", return_value=[]
+        ) as restore:
+            self.assertEqual(self._enable("restore"), 0)
+        restore.assert_called_once_with()
+        self.assertFalse(state.load().enabled)
+
+    def test_failed_enable_rolls_configs_back_and_keeps_saved_state(self):
+        disabled = {profile.id: False for profile in profiles.PROFILES}
+        enabled = {profile.id: True for profile in profiles.PROFILES}
+        cli.managed_config.reconcile.side_effect = [
+            patch.PatchError("broken config"),
+            [],
+        ]
+
+        self.assertEqual(self._enable("enable"), 1)
+
+        self.assertFalse(state.load().enabled)
+        self.assertEqual(
+            cli.managed_config.reconcile.call_args_list,
+            [mock.call(enabled), mock.call(disabled)],
+        )
+
+    def test_state_save_is_atomic(self):
+        state.save(state.State(enabled=True))
+        state_path = Path(self._tmp.name) / "sdss/state.json"
+        self.assertTrue(state_path.is_file())
+        self.assertEqual(list(state_path.parent.glob(".state.json.sdss-tmp")), [])
 
 
 if __name__ == "__main__":

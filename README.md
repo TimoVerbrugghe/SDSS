@@ -140,9 +140,10 @@ cd host && python3 -m unittest discover -s tests
 
 ### Decky plugin
 
-The plugin toggles second screen mode (globally and per emulator) and can restore all
-patched emulator configs. It shells out to `sdss`, so config edits always go through the
-patch journal.
+The plugin toggles second screen mode (globally and per emulator). Enabling snapshots and
+applies only SDSS-managed emulator keys; disabling selectively restores those keys while
+preserving unrelated settings. The plugin shells out to `sdss`, so config edits always go
+through the patch journal.
 
 SteamOS has no node, so `plugin/dist/index.js` is committed prebuilt. After changing the
 frontend:
@@ -179,4 +180,5 @@ without touch.
 
 - The SteamOS root filesystem stays **read-only**. Everything installs under `$HOME`
   (Flatpaks + a bundled compositor runtime).
-- Emulator configs are patched with a backup journal and restored byte-identically on exit.
+- Emulator config ownership follows the Decky toggle. Managed keys restore selectively on
+  disable; checksum-verified full backups remain available for recovery.

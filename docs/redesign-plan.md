@@ -1,0 +1,439 @@
+# SDSS — redesign plan
+
+Companion to [docs/architecture.md](architecture.md), which lays out the current shape and
+the hardware evidence for why it destabilizes Steam. This document proposes what to change.
+
+> **Status update, 2026-08-19**: Phase 0 is implemented and validated on hardware — see
+> [Phase 0's result](#phase-0--immediate-low-risk-hardening-do-this-regardless-of-phase-12-outcome)
+> below. A 5-cycle alternating Cemu/Azahar acceptance test, covering the exact adjacent-pair
+> transitions that reliably crashed Steam before, completed with zero crashes and flat memory.
+> Phase 1/2 (the persistent compositor) are downgraded from "likely required to stop the
+> crash" to "a separate, lower-priority improvement toward goal 3" — see
+> [Reassessing Phase 1/2 after Phase 0's result](#reassessing-phase-12-after-phase-0s-result).
+>
+> **Further update, same day**: Azahar's Steam overlay was re-enabled (see
+> [docs/hardware-test-report.md](hardware-test-report.md) for the full account) after the
+> original OpenGL fix and Phase 0 both landed, and a second, unrelated bug (a `runtime.py`
+> parent-watch thread race) was found and fixed. Phase 1 was investigated further and found
+> **not achievable without patching wlroots/sway** — see
+> [Phase 1's result](#phase-1--feasibility-spike-for-the-persistent-compositor) below, now
+> updated with a second confirmed blocker. In its place, a scoped, achievable fix landed in
+> `deck/sdss-connect.sh` for the concrete symptom Phase 2 would have addressed (see
+> [Phase 2's result](#phase-2--build-the-persistent-second-screen-service-contingent-on-phase-1)).
+> A 48-cycle automated hardware acceptance test (alternating Cemu/Azahar, 4 different ROMs
+> each, varied timing) then ran for 2.5 hours with zero crashes before being interrupted by
+> the *orchestrating machine* going to sleep — not a Steam Machine or SDSS failure. Full
+> account in [docs/hardware-test-report.md](hardware-test-report.md).
+>
+> **Correction, same day, later**: the 48-cycle "zero crashes" verdict above was premature.
+> Minutes after it was reported, the user's own manual testing (Cemu → Exit Game → Azahar)
+> reproduced the same OOM abort. Journal forensics found a genuinely new failure mode: the
+> *preceding* session's teardown crashed sway, Xwayland and sdss_inputd with SIGBUS, seemingly
+> triggered by Azahar occasionally (not always) reacting to SIGTERM within milliseconds
+> instead of ignoring it for its usual 5 seconds — the fast reaction crashes instead of
+> exiting, corrupting shared GPU state that the compositor stack then also crashes on. Fixed
+> by sending the emulator SIGKILL immediately instead of SIGTERM, so it never gets a chance to
+> run that crash-prone signal handling at all. Verified on hardware: 23 more cycles (both
+> emulators, 8s–200s sessions, rapid back-to-back restarts), zero coredumps, zero SIGBUS/SIGABRT.
+> Full account in the ["48-cycle verdict was premature"](hardware-test-report.md#the-48-cycle-clean-verdict-above-was-premature-a-new-sigbus-teardown-crash-2026-08-19-later-still)
+> section of docs/hardware-test-report.md. Treat this the way the rest of this document already
+> treats Phase 0: real, verified progress on the evidence gathered so far — not a closed case.
+>
+> **Second correction, same day, later still**: right on cue, the 23-cycle verdict above was
+> also premature. The user reproduced a fresh crash almost immediately after (Azahar, then
+> Cemu) with the emulator-SIGKILL fix already in place, which ruled out that fix's own theory —
+> the emulator's signal handling could not have caused this occurrence. The real trigger turned
+> out to be Phase 0 item 1 itself: `remove_container()`'s graceful `podman kill --signal TERM`
+> occasionally (not reliably) crashes sway with SIGBUS instead of letting it exit cleanly,
+> which is exactly the same triple-coredump signature blamed on the emulator above. The item 1
+> description below is now stale — see its own note — and `remove_container()` goes straight to
+> `--signal KILL` unconditionally. Verified on hardware: 30 more cycles (a 15-cycle Azahar/Cemu
+> hammer test matching the user's exact report, plus 15 cycles of varied 8s–200s sessions),
+> zero coredumps, zero SIGBUS/SIGABRT. Full account in
+> [docs/hardware-test-report.md](hardware-test-report.md#the-emulator-sigkill-fix-was-also-insufficient-the-real-trigger-was-the-compositors-own-graceful-term-2026-08-19-later-still).
+> The user then changed the validation methodology for further cycles from scripted teardown
+> signals to real Steam-overlay "Exit Game" navigation — see that same section for where that
+> stood when the Steam Machine itself stopped responding to the network.
+
+## The goal, verbatim
+
+Three requirements, stated by the project owner, are the fixed target for this redesign —
+everything below is judged against them, not against "does the crash stop happening today":
+
+1. Seamless toggle between SDSS mode and non-SDSS mode via the Decky plugin.
+2. In SDSS mode, launching any ROM shows the second screen on the Deck with touch and
+   gamepad controls.
+3. Outside of the second-screen behavior, the experience must be identical to running
+   without SDSS at all.
+
+Goal 3 is the one the current architecture violates hardest, per
+[docs/architecture.md §2.1](architecture.md#21-what-sdss-adds-enumerated): eleven processes
+spun up and torn down, signal-killed, on every single launch. It's also — per the evidence
+in that document — the most likely source of the recurring Steam crash. Fixing goal 3
+and fixing the crash point at the same change.
+
+## Design principle
+
+> Move everything that doesn't have to happen per-launch out of the per-launch path.
+
+Concretely: the compositor, Sunshine, and the touch bridge do not need to be created and
+destroyed for every game. They need to exist for exactly as long as SDSS mode is toggled
+on — which is a Decky plugin action, already the seam goal 1 names. Only the emulator itself
+needs to start and stop per launch, exactly like it does without SDSS.
+
+This isn't a new mechanism invented for this document — it's the same seam the config
+journal already uses successfully
+([docs/architecture.md §2.3](architecture.md#23-whats-already-scoped-correctly-the-config-journal)).
+Config patches moved from "every session" to "the Decky toggle" earlier in this project and
+that fixed a real class of bugs (drift across long-running SDSS sessions, restores firing on
+every Exit Game). The process lifecycle needs the same move.
+
+## Target architecture
+
+```mermaid
+flowchart TD
+    subgraph "Decky toggle ON  (starts once, lives until toggle OFF)"
+        Sway["sway + its own Xwayland\n(persistent second-screen compositor)"]
+        Sunshine["Sunshine\n(captures HEADLESS-1)"]
+        InputD["sdss-inputd"]
+        Sway --> Headless["HEADLESS-1 (1280x800)"]
+        Sunshine -->|RTSP| Deck[Deck / Moonlight]
+        InputD --> Headless
+    end
+
+    subgraph "Every Steam launch (thin, unchanged from vanilla otherwise)"
+        Steam[Steam] --> Reaper[reaper] --> Wrapper["wrapper\n(hooks.py, thinner)"]
+        Wrapper -->|"exec, LD_PRELOAD untouched"| Emulator["Cemu/Azahar\n(host process)"]
+    end
+
+    Emulator -->|"connects to the ALREADY-RUNNING\nsecond-screen compositor"| Sway
+    Sway -.->|"one-time per launch: point its\nmain output at the new per-game Xwayland"| GamescopeXwayland["gamescope's per-game Xwayland\n(new every launch, not SDSS's doing)"]
+```
+
+The per-launch wrapper's job shrinks to: confirm the persistent service is up, tell it which
+profile is launching (so it applies the right window-routing rules), and exec the real
+emulator command essentially unchanged. No `podman run`, no fresh container, no fresh sway
+process, no fresh Xwayland, no cgroup-parent nesting *per launch*. Those still exist, but
+they're set up once per Decky toggle, not once per game.
+
+### Why this targets the crash directly
+
+[docs/architecture.md §3.4](architecture.md#34-leading-hypothesis-evidence-backed-not-proven)
+identifies the strongest correlate found on hardware: Steam's overlay/session bookkeeping
+staying healthy for exactly one compositor "generation" per Steam boot, and breaking when
+that generation is torn down (mostly by signal) and a fresh one takes its place for the next
+launch. A persistent compositor has, at most, **one** generation for the entire time SDSS is
+toggled on — spanning any number of game launches — which is exactly the condition under
+which every documented incident *didn't* happen. This is offered as a strong, evidence-aligned
+bet, not a proven fix; §4 below defines how to prove it on hardware before relying on it.
+
+## The central open question
+
+Gamescope dismisses a launched game's loading spinner by walking **Steam's own per-launch
+cgroup scope** for a client with a mapped window
+([`own_cgroup()`](/Users/timo/Projects/SDSS/host/src/sdss/runtime.py:408), verified on
+hardware). The X11 client gamescope is actually watching is **sway itself** — sway is what
+connects to gamescope's per-game Xwayland as an X11 client
+([`environment()`](/Users/timo/Projects/SDSS/host/src/sdss/compositor.py:146)); the emulator
+never touches that display directly. If sway becomes long-lived and stops being recreated
+inside each launch's own cgroup scope, does the spinner still dismiss?
+
+This has to be answered on hardware before committing to the persistent-compositor design,
+because getting it wrong silently reintroduces the exact spinner-hang bug that was already
+found and fixed once this project. Two candidate answers, both requiring a hardware spike
+(§4, Phase 1) rather than a guess:
+
+- **Option A — move the process, not the display connection.** A running process's cgroup
+  membership can change at runtime (write its PID into a new `cgroup.procs`). If sway (kept
+  alive across launches) is moved into each new launch's Steam-assigned scope at the moment
+  a new game starts, and wlroots' X11 backend can be told to reconnect its main output to a
+  *new* `DISPLAY` value without restarting the process, this preserves the spinner mechanism
+  exactly while keeping the compositor persistent. **Checked against wlroots source
+  (2026-08-19, `swaywm/wlroots` `backend/x11/backend.c`, sway 1.12 is what's deployed):
+  infeasible as a live reconnect.** `wlr_x11_backend_create(struct wl_display *display,
+  const char *x11_display)` is the only public constructor; it calls `xcb_connect(x11_display,
+  NULL)` exactly once inside it, and the backend's only other lifecycle entry points are
+  `backend_start` (creates outputs against the connection already open) and `backend_destroy`
+  (tears the whole thing down). There is no `wlr_x11_backend_*` call that retargets an
+  existing backend at a different display. Reaching a new per-game Xwayland from a persistent
+  sway process would therefore mean destroying and re-creating just the X11 backend object
+  in-process (removing/re-adding it in sway's `wlr_multi_backend`) rather than a true "one
+  connection for the whole toggle-on session" — smaller than today's full container/conmon/
+  cgroup teardown, but still an unverified capability of sway itself (sway wires backends up
+  once at startup from `WLR_BACKENDS`/env vars, not through a runtime IPC command), and it
+  would require patching sway or wlroots, not just SDSS. Not attempted; recorded here as the
+  reason Option A is now the *harder*, not the default, path if Phase 2 is ever pursued.
+  Whether moving the process's cgroup membership at runtime *independently* satisfies
+  gamescope's spinner walk is still separately untested either way.
+- **Option B — a thin per-launch relay, persistent compositor behind it.** Keep a
+  lightweight, per-launch-scoped process whose only job is to be the X11 client gamescope's
+  spinner check sees (satisfying the cgroup-walk requirement cheaply), while the actual
+  compositor content is produced by the persistent sway and mirrored/relayed to it. More
+  moving parts than Option A, but doesn't depend on wlroots supporting live reconnection.
+  **Unverified**: what relay mechanism (if any) can forward composited output between two
+  Wayland/X11 servers with acceptable latency for a game's primary display.
+
+Given Option A's core premise (live-reconnecting one backend instance) doesn't exist in
+wlroots today, Option B — or accepting an in-process backend recreate per launch, which is a
+smaller change than today's full container teardown but not "zero recreation" — are the
+realistic starting points if this is picked back up. Since Phase 0 already resolved the
+crash this question was originally motivated by (see the status update at the top of this
+document), resolving it further is no longer time-critical; it matters only for how far goal
+3's per-launch process count can eventually be reduced.
+
+If hardware testing shows neither is feasible without disproportionate complexity, the
+fallback is Phase 0 below — it does not depend on resolving this question and is worth doing
+regardless of which way this resolves.
+
+## Phased plan
+
+### Phase 0 — immediate, low-risk hardening (do this regardless of Phase 1/2 outcome)
+
+**Status: implemented and validated on hardware, 2026-08-19.**
+
+1. **Graceful teardown before force — implemented, then reverted; SIGKILL-only is what's
+   actually running.** [`remove_container()`](/Users/timo/Projects/SDSS/host/src/sdss/runtime.py:177)
+   originally sent `podman kill --signal TERM` to the container and waited on `podman wait
+   --condition stopped` (bounded to `GRACEFUL_STOP_TIMEOUT = 3.0` seconds) before falling
+   through to the unconditional `--signal KILL` + `rm --force` backstop. That was verified
+   directly on hardware first, in isolation, before writing any code — a single `podman kill
+   --signal TERM sdss-compositor` against a live session let sway and conmon exit cleanly
+   within 1–3 seconds with no hang — and across the 5-cycle acceptance test below, every
+   teardown completed in ~2 seconds this way. **It was later found, from a fresh hardware
+   crash, that the same TERM signal occasionally (not reliably) crashes sway itself with
+   SIGBUS instead of exiting cleanly** — a small sample of manual verification runs cannot
+   distinguish "always safe" from "usually safe," and this one was only usually safe. See the
+   second correction at the top of this document and the full account in
+   [docs/hardware-test-report.md](hardware-test-report.md#the-emulator-sigkill-fix-was-also-insufficient-the-real-trigger-was-the-compositors-own-graceful-term-2026-08-19-later-still).
+   `remove_container()` now sends only the unconditional `--signal KILL` + `rm --force` — no
+   TERM attempt, no wait. `GRACEFUL_STOP_TIMEOUT` was removed along with the `podman wait`
+   step. Verified on hardware across 30 more cycles: zero coredumps, zero SIGBUS.
+2. **Explicit settle/drain window — turned out to be unnecessary, twice over.** The original
+   reasoning was that `podman wait --condition stopped` (item 1) already provided a genuine
+   settle signal, so no additional artificial delay was needed on top of it. Item 1's wait
+   step is now gone too (see above), which removes even that settle signal — and 30 hardware
+   cycles going straight from SIGKILL to `rm --force`, with no wait or delay of any kind in
+   between, still produced zero coredumps. Whatever settling the container needs, waiting for
+   it has not been necessary in practice at either the TERM-then-wait stage or the
+   immediate-SIGKILL stage.
+3. **Drop `--ipc=host` — done.** Removed from
+   [`compositor_command()`](/Users/timo/Projects/SDSS/host/src/sdss/runtime.py:459), with a
+   regression test (`test_container_does_not_share_the_host_ipc_namespace`) locking in its
+   absence. Verified on hardware across 5 diverse sessions (Cemu on two different ROMs,
+   Azahar on two different ROMs) — Cemu and Azahar both rendered normally, the second screen
+   streamed, and nothing regressed. No replacement flag was needed.
+4. **Re-run the exact alternating-cycle test — done, passed cleanly.** Ran 5 real
+   Steam-launched sessions in sequence: Cemu (Wind Waker HD) → Azahar (A Link Between Worlds)
+   → Cemu (Twilight Princess HD) → Azahar (Animal Crossing New Leaf) → Cemu (Wind Waker HD
+   again) — covering the Cemu→Azahar and Azahar→Cemu adjacent-pair transitions twice each,
+   the exact pattern documented in
+   [docs/architecture.md §3.3](architecture.md#33-fresh-reproduction-2026-08-19-it-is-not-about-which-emulator-or-whether-its-overlay-is-even-enabled)
+   as reliably fatal before. Each session was observed live for 60–90+ seconds, exceeding
+   every historically-recorded crash window (45–90 seconds). Result: Steam's PID
+   (`102424`) never changed across all 5 cycles, its RSS stayed flat (~238–241 MB, no linear
+   growth) throughout, and every teardown left zero podman containers, zero orphaned
+   processes, and zero stale `app-steam-app*.scope` units. The "first launch clean, second
+   fatal" correlation did **not** reproduce.
+
+   One separate, non-blocking finding from this run: Azahar does not exit on `SIGTERM` (it
+   was sent twice, 3 seconds apart, and ignored both times; `SIGKILL` was required to
+   unblock the session). Real usage is unaffected — Azahar is exited via its own in-emulator
+   Select+Start hotkey, not an external signal — but it does mean
+   [`_terminate_process`](/Users/timo/Projects/SDSS/host/src/sdss/session.py:168)'s
+   SIGTERM-then-5s-wait-then-SIGKILL sequence always falls through to the SIGKILL branch for
+   Azahar specifically, adding a predictable ~5 second delay to its teardown. Not addressed
+   here; noted for a future look if Azahar's teardown latency becomes a user-visible problem.
+
+### Reassessing Phase 1/2 after Phase 0's result
+
+Phase 0 was written as a no-regrets hardening step to do "regardless of Phase 1/2 outcome" —
+it was not expected to be sufficient on its own, given how many prior targeted fixes had each
+worked around one proximate cause without stopping the recurring abort. It turned out to
+resolve the reproduction directly: the graceful-teardown change gives sway's X11 connection to
+gamescope's per-game Xwayland an actual chance to close cleanly (a real protocol disconnect
+Steam's side can observe) instead of being severed by SIGKILL every time, which is exactly the
+mechanism [§3.4's hypothesis](architecture.md#34-leading-hypothesis-evidence-backed-not-proven)
+pointed at.
+
+This changes the priority of Phases 1–3, but does not delete them:
+
+- The persistent-compositor redesign (Phases 1–2) is no longer believed necessary *to stop
+  the crash*. It remains a real improvement toward **goal 3** on its own merits — the
+  per-launch process count in
+  [docs/architecture.md §2.1](architecture.md#21-what-sdss-adds-enumerated) is still eleven
+  entries recreated every launch, which is still far from "identical outside the second
+  screen" even with the crash gone. Treat Phases 1–3 as a goal-3-driven architectural
+  improvement to pursue when there's room for it, not as an urgent fix.
+- Given Phase 0 alone closed every reproduction attempted so far, do not treat this as
+  absolute proof the mechanism can never recur under a condition not yet tested (a longer
+  play session, a different emulator combination, a slower/loaded machine). Keep the
+  hardware evidence-gathering discipline from this document (live monitor, real Steam
+  launches, exact reproduction steps) as the standing method for any future report, rather
+  than assuming Phase 0 makes this section purely historical.
+
+### Phase 1 — feasibility spike for the persistent compositor
+
+Answer the open question in isolation, without touching the shipped session lifecycle:
+
+1. **Done, negative result.** Spiked sway/wlroots' ability to reconnect a running
+   compositor's X11 output to a different `DISPLAY` at runtime (Option A) by reading
+   upstream wlroots source (`swaywm/wlroots` `backend/x11/backend.c`) rather than assuming —
+   see the central open question above. `wlr_x11_backend_create()` opens its `xcb_connect()`
+   once at construction; there is no runtime retarget call, in this wlroots or in sway's own
+   IPC surface. Live reconnection would require patching wlroots/sway, not just SDSS. Option
+   A is downgraded to "harder than Option B" rather than ruled in.
+2. **Turned out not to be independently testable — recorded rather than run.** The plan
+   was to spike whether moving a running process's cgroup membership at runtime satisfies
+   gamescope's spinner-dismissal walk, independent of the output-reconnection question, using
+   a synthetic long-lived process. That doesn't isolate cleanly: gamescope's walk requires an
+   actual window-owning X11 client on *that specific launch's* per-game Xwayland (a display
+   that doesn't exist until gamescope creates it for this launch), so any synthetic process
+   would need to connect to a display it can't know in advance — which is exactly the live
+   reconnection capability #1 just found doesn't exist. There's no way to construct a
+   valid test of "cgroup migration alone" with today's wlroots/sway that doesn't also require
+   the reconnect capability. This sub-question is therefore blocked on the same gap as Option
+   A, not a separate one — Option A is blocked on a single capability gap, not two.
+3. **Done, second negative result (2026-08-19, later the same day).** Tested whether a
+   persistent Sunshine target was achievable a different way: give the nested sway a *fixed*
+   Wayland socket name (so a long-lived Sunshine could always point at the same target
+   without needing wlroots' output-reconnect at all) by setting `WAYLAND_DISPLAY` before
+   launching it. Tested directly against the real `localhost/sdss-compositor:latest` image on
+   hardware: sway/wlroots ignores that env var for its own server socket and always
+   self-assigns the next `wayland-N` name (`wayland-1` in the test, regardless of the
+   requested value). This closes off the simple "fixed-socket Sunshine" workaround too —
+   Sunshine would still need to be told a new socket path on every session, which is exactly
+   the coordination Phase 2 was trying to avoid needing.
+4. Given both results, evaluating Option B's relay approach (a thin per-launch relay process
+   in front of a persistent compositor) is the only remaining avenue for a *full* persistent
+   compositor, and was not attempted — the achievable win identified instead was fixing the
+   concrete symptom (see Phase 2 below) rather than the full architecture. Phase 0 remains the
+   shipped mitigation for the crash, and this document's "necessary vs incidental" framing
+   still stands as the record of what SDSS *should* look like if a future spike into Option B
+   succeeds.
+
+### Phase 2 — build the persistent second-screen service (contingent on Phase 1)
+
+**Status: the full persistent-compositor design remains blocked on Phase 1's two findings
+above. A scoped, achievable fix for its motivating symptom was implemented and verified on
+hardware instead — see below.**
+
+While investigating Phase 1, hardware testing surfaced a concrete, distinct reliability gap
+that a persistent Sunshine/compositor would have solved as a side effect: **an
+already-connected Deck stream goes black and does not recover on its own when the Steam
+Machine's session tears down and a new one starts**, even though the `moonlight` process
+stays alive throughout. Verified repeatedly on hardware:
+
+- A fresh Deck-side launch against a stable, already-running host session shows live content
+  immediately (confirmed by screenshot).
+- Closing that host session and starting a new one, *without* touching the Deck's already-running
+  Moonlight process, leaves it showing a frozen last frame — confirmed byte-identical
+  screenshots (matching MD5) taken 2 minutes apart, and confirmed the `moonlight` process
+  burns near-zero CPU while "stalled" versus visibly non-trivial CPU while actually streaming.
+- Manually killing and relaunching the Deck shortcut against the new host session reconnects
+  and shows live content immediately.
+
+This is Moonlight/Sunshine's own behavior, not something SDSS's process lifecycle causes
+directly — but SDSS's per-launch Sunshine restart is what repeatedly creates the conditions
+for it, and Phase 2's persistent-service design would have avoided the problem entirely by
+never restarting Sunshine underneath an existing connection. Since that full design is
+blocked, the fix landed at the point actually in SDSS's control: the Deck-side connection
+script.
+
+**Implemented and verified in [`deck/sdss-connect.sh`](/Users/timo/Projects/SDSS/deck/sdss-connect.sh):**
+a CPU-tick-based stall detector polls the running `moonlight` process every 5 seconds; if its
+CPU ticks stay essentially flat (a real, actively-decoding 60fps stream burns continuous CPU,
+a stalled one does not) for a 15-second grace window, the script kills and transparently
+restarts the stream — all inside the same wrapper process Steam already tracks, so this never
+looks like a launch/exit to Steam itself. Verified on hardware:
+
+- Normal Steam-driven stop (SIGTERM delivered to the wrapper script's own PID, matching how
+  Steam's reaper actually signals it) still tears down cleanly, in ~6 seconds, with the new
+  stall-detection loop active — the existing "no `exec`, explicit Flatpak `kill` on any exit
+  signal" cleanup guarantee this script already had is unchanged.
+- A real host-session transition (one game session closed, a different one started) was left
+  to run under the existing connection; the stall detector caught it and reconnected within
+  its grace window, confirmed via a fresh screenshot showing the new session's live content
+  afterward, with no manual intervention.
+
+This directly closes the gap Phase 2 would have closed for this specific symptom, without
+any of Phase 2's architectural risk or its dependency on the blocked wlroots capabilities.
+The remaining Phase 2 design (items 1–5 below) is retained as the reference design for a
+*full* persistent second-screen service, should Option B (the relay approach) or a future
+wlroots capability make it feasible — it is not being pursued further right now.
+
+Original design, retained for reference:
+
+1. A long-lived service (systemd `--user` unit is the natural fit, matching how
+   `sdss-memory-monitor.service` was already run as a transient unit successfully during this
+   investigation) owns sway, Sunshine, and `sdss-inputd` for the entire time SDSS is enabled.
+2. `sdss enable`/`disable` (already the Decky-driven seam, per
+   [`cmd_enable`](/Users/timo/Projects/SDSS/host/src/sdss/cli.py:182)) starts/stops this
+   service in addition to its existing config-journal and wrapper-reconciliation work. This
+   is an additive change to an already-correct seam, not a new one — goal 1 is satisfied by
+   construction.
+3. Decide what the second screen shows when SDSS is on but no emulator is running (idle
+   state) — a blank output, a static "waiting for a game" scene, or the last frame. Needs a
+   product decision, not just an engineering one.
+4. The per-launch wrapper (`hooks.py`-generated script → `sdss run`) shrinks to: confirm the
+   service is healthy (a socket/health probe, not "assume it's there"), apply the Option
+   A/B mechanism from Phase 1 to attach this launch's game to the persistent compositor, and
+   exec the emulator. If the service is unexpectedly down, decide whether to start it
+   on-demand (slower, but self-healing) or fail loudly rather than silently launching without
+   a second screen.
+5. Window-routing rules are already profile-specific data
+   ([profiles.py](/Users/timo/Projects/SDSS/host/src/sdss/profiles.py:116)); with a
+   persistent sway, these become a `swaymsg`-driven reload against the running compositor
+   instead of baked into a config file at process start. Confirm sway supports reloading
+   `for_window`/`assign` criteria without restarting (it does, via `swaymsg reload`) so this
+   is a config regen + reload, not new infrastructure.
+
+### Phase 3 — shrink the wrapper further
+
+Once Phase 2 is live, re-examine every remaining per-launch deviation from vanilla against
+goal 3:
+- `DISABLE_GAMESCOPE_WSI=1` and the `LD_PRELOAD` save/restore dance around the emulator
+  ([launch.py](/Users/timo/Projects/SDSS/host/src/sdss/launch.py)) still apply per-launch
+  and should stay — they're targeted, verified fixes for the emulator's *own* process, not
+  architectural overhead.
+- The AppImage shadow-wrapper mechanism ([hooks.py](/Users/timo/Projects/SDSS/host/src/sdss/hooks.py))
+  stays; it's how goal 1's "seamless" requirement is met for a normal Steam Library launch,
+  and it's already minimal — one exec hop, no polling, no state left behind when SDSS is off.
+- Re-audit `_start_emulator`'s environment build for anything that's a leftover assumption
+  from the per-launch-compositor world (e.g. `WAYLAND_DISPLAY`/`DISPLAY` values computed
+  fresh each session) and adjust it to address the persistent service instead.
+
+## What does not change
+
+- The config-patch journal ([managed_config.py](/Users/timo/Projects/SDSS/host/src/sdss/managed_config.py),
+  [patch.py](/Users/timo/Projects/SDSS/host/src/sdss/patch.py)) is already scoped to the
+  Decky toggle, not the game session. Nothing in this plan touches it.
+  [docs/architecture.md §2.3](architecture.md#23-whats-already-scoped-correctly-the-config-journal)
+  documents why it's already correct.
+- Profile data staying data-only ([profiles.py](/Users/timo/Projects/SDSS/host/src/sdss/profiles.py))
+  — the persistent compositor's window-routing reload in Phase 2 still reads from the same
+  `Profile` dataclasses; only *how* the config reaches sway (reload vs. process start)
+  changes.
+- Touch routing ([`sdss-inputd`](/Users/timo/Projects/SDSS/runtime/inputd/sdss_inputd.py))
+  keeps its job unchanged — it moves from "restarted per launch" to "long-lived," but its
+  `EVIOCGRAB`/rescale/inject logic is unaffected.
+- The read-only rootfs / `$HOME`-only constraint, and every other invariant in
+  [docs/PLAN.md](PLAN.md), still hold.
+
+## Acceptance criteria, tied back to the three goals
+
+1. **Seamless toggle**: already true today for the config/wrapper layer (`sdss
+   enable`/`disable` reconciles both under one lock); would extend to starting/stopping the
+   persistent service too if Phase 2 is built. Not blocked on anything in this plan.
+2. **Second screen on any ROM launch, and Steam stays stable doing it**: validated on
+   hardware for the current (Phase-0-hardened) architecture — the 5-cycle alternating test
+   above reproduced no crash and no leak. This criterion is met today, without Phase 1/2.
+3. **Identical outside the second screen**: **not yet met** — this is the remaining gap.
+   Measured against [docs/architecture.md §2.1](architecture.md#21-what-sdss-adds-enumerated)'s
+   table, the per-launch process count is still eleven entries recreated every launch; Phase
+   0 fixed *how* they're torn down, not *how often*. Phases 1–3 are what would close this
+   specific gap, and remain worth pursuing on that basis — just no longer as crash fixes.
+
+Both architecture.md's evidence and this plan's phasing should be revisited whenever new
+hardware evidence appears (a crash reproduction under conditions not yet tested, a Phase 1
+spike result, or further goal-3 work) — this is a living pair of documents, not a
+one-time write-up.

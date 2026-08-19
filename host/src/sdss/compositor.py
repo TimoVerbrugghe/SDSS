@@ -18,6 +18,7 @@ MAIN_OUTPUT_WAYLAND = "WL-1"
 HEADLESS_OUTPUT = "HEADLESS-1"
 MAIN_WORKSPACE = "main"
 SECOND_WORKSPACE = "second"
+DECK_PANEL_RESOLUTION = (1280, 800)
 
 
 @dataclass(frozen=True)
@@ -62,7 +63,10 @@ def render_config(spec: CompositorSpec) -> str:
         "default_border none",
         "default_floating_border none",
         "focus_follows_mouse no",
-        "xwayland enable",
+        # `enable` is lazy: sway only spawns Xwayland once an X11 client connects, so
+        # $DISPLAY is still empty in the environment `exec` sees. `force` starts it during
+        # compositor init, which is what makes the env dump below carry a usable DISPLAY.
+        "xwayland force",
         "",
         main_output_line,
         f"output {HEADLESS_OUTPUT} mode {spec.second} position {headless_x} 0",
@@ -153,20 +157,23 @@ def environment(backend: str, parent_display: str) -> dict[str, str]:
     — is what makes the window visible to that exact readiness check, so it must be
     preferred whenever Steam provides one.
     """
+    env = {
+        "WLR_NO_HARDWARE_CURSORS": "1",
+    }
+
     if backend == "x11":
         return {
+            **env,
             "WLR_BACKENDS": "x11,headless",
             "WLR_X11_OUTPUTS": "1",
             "WLR_HEADLESS_OUTPUTS": "1",
             "DISPLAY": parent_display,
-            "WLR_NO_HARDWARE_CURSORS": "1",
         }
     return {
+        **env,
         # Wayland output = a window inside gamescope (TV); headless output = the stream.
         "WLR_BACKENDS": "wayland,headless",
         "WLR_WL_OUTPUTS": "1",
         "WLR_HEADLESS_OUTPUTS": "1",
         "WAYLAND_DISPLAY": parent_display,
-        # gamescope only ever shows one window, so sway must not open extra surfaces.
-        "WLR_NO_HARDWARE_CURSORS": "1",
     }
