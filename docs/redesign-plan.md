@@ -104,9 +104,23 @@ found and fixed once this project. Two candidate answers, both requiring a hardw
   alive across launches) is moved into each new launch's Steam-assigned scope at the moment
   a new game starts, and wlroots' X11 backend can be told to reconnect its main output to a
   *new* `DISPLAY` value without restarting the process, this preserves the spinner mechanism
-  exactly while keeping the compositor persistent. **Unverified**: whether wlroots' X11
-  backend supports live output reconnection to a different X11 display at all — this may
-  require sway/wlroots source inspection or an upstream feature that doesn't exist.
+  exactly while keeping the compositor persistent. **Checked against wlroots source
+  (2026-08-19, `swaywm/wlroots` `backend/x11/backend.c`, sway 1.12 is what's deployed):
+  infeasible as a live reconnect.** `wlr_x11_backend_create(struct wl_display *display,
+  const char *x11_display)` is the only public constructor; it calls `xcb_connect(x11_display,
+  NULL)` exactly once inside it, and the backend's only other lifecycle entry points are
+  `backend_start` (creates outputs against the connection already open) and `backend_destroy`
+  (tears the whole thing down). There is no `wlr_x11_backend_*` call that retargets an
+  existing backend at a different display. Reaching a new per-game Xwayland from a persistent
+  sway process would therefore mean destroying and re-creating just the X11 backend object
+  in-process (removing/re-adding it in sway's `wlr_multi_backend`) rather than a true "one
+  connection for the whole toggle-on session" — smaller than today's full container/conmon/
+  cgroup teardown, but still an unverified capability of sway itself (sway wires backends up
+  once at startup from `WLR_BACKENDS`/env vars, not through a runtime IPC command), and it
+  would require patching sway or wlroots, not just SDSS. Not attempted; recorded here as the
+  reason Option A is now the *harder*, not the default, path if Phase 2 is ever pursued.
+  Whether moving the process's cgroup membership at runtime *independently* satisfies
+  gamescope's spinner walk is still separately untested either way.
 - **Option B — a thin per-launch relay, persistent compositor behind it.** Keep a
   lightweight, per-launch-scoped process whose only job is to be the X11 client gamescope's
   spinner check sees (satisfying the cgroup-walk requirement cheaply), while the actual
@@ -114,6 +128,14 @@ found and fixed once this project. Two candidate answers, both requiring a hardw
   moving parts than Option A, but doesn't depend on wlroots supporting live reconnection.
   **Unverified**: what relay mechanism (if any) can forward composited output between two
   Wayland/X11 servers with acceptable latency for a game's primary display.
+
+Given Option A's core premise (live-reconnecting one backend instance) doesn't exist in
+wlroots today, Option B — or accepting an in-process backend recreate per launch, which is a
+smaller change than today's full container teardown but not "zero recreation" — are the
+realistic starting points if this is picked back up. Since Phase 0 already resolved the
+crash this question was originally motivated by (see the status update at the top of this
+document), resolving it further is no longer time-critical; it matters only for how far goal
+3's per-launch process count can eventually be reduced.
 
 If hardware testing shows neither is feasible without disproportionate complexity, the
 fallback is Phase 0 below — it does not depend on resolving this question and is worth doing
@@ -198,12 +220,24 @@ This changes the priority of Phases 1–3, but does not delete them:
 
 Answer the open question in isolation, without touching the shipped session lifecycle:
 
-1. Spike sway/wlroots' ability to reconnect a running compositor's X11 output to a different
-   `DISPLAY` at runtime (Option A). Check upstream wlroots issues/source before assuming;
-   this is a fact to discover, not a design decision to make blind.
-2. In parallel or as a fallback, spike whether moving a running process's cgroup membership
-   at runtime actually satisfies gamescope's spinner-dismissal walk (independent of the
-   output-reconnection question — this part can be tested today with a synthetic process).
+1. **Done, negative result.** Spiked sway/wlroots' ability to reconnect a running
+   compositor's X11 output to a different `DISPLAY` at runtime (Option A) by reading
+   upstream wlroots source (`swaywm/wlroots` `backend/x11/backend.c`) rather than assuming —
+   see the central open question above. `wlr_x11_backend_create()` opens its `xcb_connect()`
+   once at construction; there is no runtime retarget call, in this wlroots or in sway's own
+   IPC surface. Live reconnection would require patching wlroots/sway, not just SDSS. Option
+   A is downgraded to "harder than Option B" rather than ruled in.
+2. **Turned out not to be independently testable — recorded rather than run.** The plan
+   was to spike whether moving a running process's cgroup membership at runtime satisfies
+   gamescope's spinner-dismissal walk, independent of the output-reconnection question, using
+   a synthetic long-lived process. That doesn't isolate cleanly: gamescope's walk requires an
+   actual window-owning X11 client on *that specific launch's* per-game Xwayland (a display
+   that doesn't exist until gamescope creates it for this launch), so any synthetic process
+   would need to connect to a display it can't know in advance — which is exactly the live
+   reconnection capability #1 just found doesn't exist. There's no way to construct a
+   valid test of "cgroup migration alone" with today's wlroots/sway that doesn't also require
+   the reconnect capability. This sub-question is therefore blocked on the same gap as Option
+   A, not a separate one — Option A is blocked on a single capability gap, not two.
 3. If both fail, evaluate Option B's relay approach for latency/complexity before ruling out
    the persistent-compositor direction entirely; if that also fails, stop here — Phase 0
    remains the shipped mitigation, and this document's "necessary vs incidental" framing
