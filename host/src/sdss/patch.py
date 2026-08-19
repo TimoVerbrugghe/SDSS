@@ -28,16 +28,146 @@ class Edit:
     key: str
     value: str
     section: str | None = None
+    required: bool = True
 
 
 class PatchError(Exception):
     pass
 
 
+def _extract_xml_tag(text: str, tag: str) -> tuple[bool, str]:
+    pattern = re.compile(rf"<{re.escape(tag)}>(.*?)</{re.escape(tag)}>", re.DOTALL)
+    match = pattern.search(text)
+    if not match:
+        return False, ""
+    return True, match.group(1)
+
+
+def _extract_section_key(text: str, section: str, key: str) -> tuple[bool, str]:
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.split(newline)
+    header = f"[{section}]"
+    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=\s*(.*)$")
+
+    start = next((i for i, line in enumerate(lines) if line.strip() == header), None)
+    if start is None:
+        return False, ""
+
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i].lstrip().startswith("["):
+            end = i
+            break
+
+    for i in range(start + 1, end):
+        match = key_re.match(lines[i])
+        if match:
+            return True, match.group(1).strip()
+    return False, ""
+
+
+def _section_exists(text: str, section: str) -> bool:
+    header = f"[{section}]"
+    return any(line.strip() == header for line in text.splitlines())
+
+
+def _remove_section_key(text: str, section: str, key: str) -> str:
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.split(newline)
+    header = f"[{section}]"
+    key_re = re.compile(rf"^\s*{re.escape(key)}\s*=")
+
+    start = next((i for i, line in enumerate(lines) if line.strip() == header), None)
+    if start is None:
+        return text
+
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i].lstrip().startswith("["):
+            end = i
+            break
+
+    for i in range(start + 1, end):
+        if key_re.match(lines[i]):
+            del lines[i]
+            return newline.join(lines)
+    return text
+
+
+def _remove_empty_section(text: str, section: str) -> str:
+    newline = "\r\n" if "\r\n" in text else "\n"
+    lines = text.split(newline)
+    header = f"[{section}]"
+    start = next((i for i, line in enumerate(lines) if line.strip() == header), None)
+    if start is None:
+        return text
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if lines[i].lstrip().startswith("["):
+            end = i
+            break
+    if any(line.strip() for line in lines[start + 1 : end]):
+        return text
+    del lines[start:end]
+    return newline.join(lines)
+
+
+def _snapshot(text: str, fmt: str, edit: Edit) -> dict:
+    if fmt == XML:
+        present, value = _extract_xml_tag(text, edit.key)
+        return {
+            "format": fmt,
+            "section": None,
+            "key": edit.key,
+            "present": present,
+            "value": value,
+            "required": edit.required,
+        }
+    if fmt in (INI, TOML):
+        if edit.section is None:
+            raise PatchError(f"{fmt} edit for {edit.key!r} needs a section")
+        present, value = _extract_section_key(text, edit.section, edit.key)
+        return {
+            "format": fmt,
+            "section": edit.section,
+            "key": edit.key,
+            "present": present,
+            "value": value,
+            "required": edit.required,
+            "section_present": _section_exists(text, edit.section),
+        }
+    raise PatchError(f"unsupported config format: {fmt}")
+
+
+def _restore_snapshot(text: str, snapshot: dict) -> str:
+    fmt = snapshot["format"]
+    section = snapshot.get("section")
+    key = snapshot["key"]
+    present = bool(snapshot.get("present"))
+    value = str(snapshot.get("value", ""))
+    required = bool(snapshot.get("required", True))
+    if fmt == XML:
+        if not present:
+            if required:
+                raise PatchError(f"cannot restore missing XML tag <{key}>")
+            return text
+        return _set_xml_tag(text, key, value)
+    if fmt in (INI, TOML):
+        if section is None:
+            raise PatchError(f"{fmt} snapshot for {key!r} is missing section")
+        if present:
+            return _set_section_key(text, fmt, section, key, value)
+        restored = _remove_section_key(text, section, key)
+        if not bool(snapshot.get("section_present", True)):
+            restored = _remove_empty_section(restored, section)
+        return restored
+    raise PatchError(f"unsupported config format: {fmt}")
+
+
 def apply_edits(text: str, fmt: str, edits: tuple[Edit, ...]) -> str:
     for edit in edits:
         if fmt == XML:
-            text = _set_xml_tag(text, edit.key, edit.value)
+            text = _set_xml_tag(text, edit.key, edit.value, required=edit.required)
         elif fmt in (INI, TOML):
             if edit.section is None:
                 raise PatchError(f"{fmt} edit for {edit.key!r} needs a section")
@@ -47,10 +177,12 @@ def apply_edits(text: str, fmt: str, edits: tuple[Edit, ...]) -> str:
     return text
 
 
-def _set_xml_tag(text: str, tag: str, value: str) -> str:
+def _set_xml_tag(text: str, tag: str, value: str, *, required: bool = True) -> str:
     pattern = re.compile(rf"(<{re.escape(tag)}>)(.*?)(</{re.escape(tag)}>)", re.DOTALL)
     if not pattern.search(text):
-        raise PatchError(f"<{tag}> not found")
+        if required:
+            raise PatchError(f"<{tag}> not found")
+        return text
     return pattern.sub(lambda m: f"{m.group(1)}{value}{m.group(3)}", text, count=1)
 
 
@@ -149,6 +281,32 @@ class Journal:
         entries.append(entry)
         self._save(entries)
 
+    def record_snapshots(
+        self, path: Path, fmt: str, edits: tuple[Edit, ...], original: str
+    ) -> None:
+        entries = self._load()
+        for entry in entries:
+            if entry["path"] != str(path):
+                continue
+            snapshots = entry.setdefault("snapshots", [])
+            existing = {
+                (snapshot["format"], snapshot.get("section"), snapshot["key"])
+                for snapshot in snapshots
+            }
+            for edit in edits:
+                snapshot = _snapshot(original, fmt, edit)
+                identity = (
+                    snapshot["format"],
+                    snapshot.get("section"),
+                    snapshot["key"],
+                )
+                if identity not in existing:
+                    snapshots.append(snapshot)
+                    existing.add(identity)
+            self._save(entries)
+            return
+        raise PatchError(f"config {path} was not recorded before storing snapshots")
+
     def restore(self) -> list[Path]:
         restored: list[Path] = []
         for entry in self._load():
@@ -173,9 +331,63 @@ class Journal:
         self.discard()
         return restored
 
+    def restore_snapshots(self) -> list[Path]:
+        restored: list[Path] = []
+        for entry in self._load():
+            path = Path(entry["path"])
+            snapshots = entry.get("snapshots")
+            if isinstance(snapshots, list):
+                if path.is_file():
+                    current = path.read_text()
+                    updated = current
+                    for snapshot in snapshots:
+                        updated = _restore_snapshot(updated, snapshot)
+                    if updated != current:
+                        _write_atomic(path, updated.encode())
+                    restored.append(path)
+                    continue
+
+                if entry["existed"]:
+                    self._restore_backup(path, entry)
+                restored.append(path)
+                continue
+
+            if entry["existed"]:
+                self._restore_backup(path, entry)
+            elif path.exists():
+                path.unlink()
+            restored.append(path)
+        self.discard()
+        return restored
+
+    def _restore_backup(self, path: Path, entry: dict) -> None:
+        backup = self.files / entry["backup"]
+        try:
+            data = backup.read_bytes()
+        except FileNotFoundError as exc:
+            raise PatchError(
+                f"backup for {path} is missing (expected at {backup}) — refusing to restore"
+            ) from exc
+        expected = entry.get("sha256")
+        if expected is not None and _digest(data) != expected:
+            raise PatchError(
+                f"backup for {path} is corrupted (sha256 mismatch) — refusing to restore"
+            )
+        _write_atomic(path, data)
+
     def discard(self) -> None:
         if self.dir.exists():
             shutil.rmtree(self.dir)
+
+
+def write_file_if_absent(path: Path, content: str, journal: Journal) -> bool:
+    """Create a default file without ever overwriting a user-owned one."""
+    if path.is_file():
+        return False
+    journal.record(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_atomic(path, content.encode())
+    return True
 
 
 def patch_file(path: Path, fmt: str, edits: tuple[Edit, ...], journal: Journal) -> bool:
@@ -185,6 +397,7 @@ def patch_file(path: Path, fmt: str, edits: tuple[Edit, ...], journal: Journal) 
     original = path.read_text()
     patched = apply_edits(original, fmt, edits)
     journal.record(path)
+    journal.record_snapshots(path, fmt, edits, original)
     if patched == original:
         return False
     # Atomic for the same reason `restore` is: SteamOS SIGKILLs the whole session on

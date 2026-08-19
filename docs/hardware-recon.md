@@ -118,6 +118,50 @@ Two traps that cost a lot of debugging time; both bite anything launched over SS
   Verified: with those set, both Azahar windows map, `Secondary Window` lands on
   `HEADLESS-1`, and the unit survives SSH logout.
 
+### Steam shortcut launch procedure
+
+For Steam Game Mode validation, start the Deck's generated `Second Screen`
+shortcut from Steam. A direct `sdss-connect <host>` command over SSH is not an
+equivalent test: it bypasses Steam's game scope and must be reserved for
+pairing or isolated Moonlight diagnostics. When automation is necessary, send
+the Steam URL to the already-running Steam client after sourcing the live
+gamescope environment.
+
+The reliable SSH-side launch procedure is:
+
+```
+export XDG_RUNTIME_DIR=/run/user/1000
+set -a; source /run/user/1000/gamescope-environment; set +a
+/home/deck/.local/share/Steam/steam.sh "steam://rungameid/<64-bit-gameid>"
+```
+
+Before launching, confirm Game Mode with Steam's `-steamdeck -gamepadui`
+process and an active `wayland` user session. After launching, confirm the
+Moonlight process is descended from Steam's `reaper SteamLaunch` process and
+that `gameprocess_log.txt` records the shortcut's 64-bit gameid. Do not use
+`nohup`, `setsid`, or a direct Moonlight/`sdss-connect` process to stand in for
+the Steam shortcut when validating the end-to-end flow.
+
+The 64-bit gameids currently verified in `shortcuts.vdf` are Azahar
+`13816419520748716032`, Cemu Wind Waker HD `15768959151553642496`, and Deck Second
+Screen `13044482501723029504`. The 32-bit shortcut appid does not launch the shortcut
+through this path. Bare `steam <url>` and an unsourced SSH environment also silently
+fail to hand the launch to gamescope.
+
+During teardown testing, killing the Steam-managed emulator process tree with `pkill`
+left Steam's client alive but its game state wedged; subsequent URLs appeared to do
+nothing. Prefer stopping the game through Steam. If this occurs, restart the user
+gamescope session, wait for Steam to return, source the newly generated
+`gamescope-environment`, and retry. A known-good Azahar launch then produced:
+
+```
+sdss: detected outer gamescope resolution 1280x800@60Hz
+sdss: starting nested compositor on parent x11 display :1
+sdss: nested compositor on wayland-1 (xwayland :2)
+sdss: starting Sunshine on port 47989
+sdss: launching emulator on wayland-1
+```
+
 ## Second screen, end to end (verified)
 
 Deck touch → Moonlight → Sunshine `Touch passthrough` → `sdss-inputd` →
@@ -322,6 +366,21 @@ reaper SteamLaunch AppId=… -> sdss-connect <host>
 
 ### `wlgrab`'s log ordering is misleading
 
+### Capturing the Steam Machine screen
+
+Use Gamescope's control tool for screenshots rather than `spectacle` or an
+`ffmpeg` display grab. The live gamescope environment is required:
+
+```sh
+export XDG_RUNTIME_DIR=/run/user/1000
+set -a; source /run/user/1000/gamescope-environment; set +a
+/usr/bin/gamescopectl screenshot /home/deck/sdss-debug/steam-machine.png
+```
+
+The command writes a PNG and captures the outer Steam Machine display. It is
+useful for diagnosing Steam's spinner, library screen, or a visible emulator;
+it does not capture SDSS's streamed `HEADLESS-1` output.
+
 Sunshine enumerates every output, printing `Name:` / `Offset` / `Logical size` for each,
 then prints `Selected monitor [...]` immediately after the **last one enumerated** — which
 is not necessarily the one selected. A `Logical size: 2560x1440` line can therefore sit
@@ -345,6 +404,33 @@ the sockets into a user-owned `$XDG_RUNTIME_DIR/sdss-x11` (sticky bit applied *a
 - **Emulator stderr is not captured** into the SDSS log. This has cost real time twice.
 - Stale `sdss_inputd` / `sunshine` processes leak across failed runs and hold port 48010.
   Kill them and `podman rm -af` between test runs.
+- A Steam UI OOM abort does not imply that the emulator scope stopped. On 2026-08-18,
+  a failed Cemu close left a 1.1 GiB Cemu process alive while a new Azahar launch
+  started another 1.1 GiB emulator; Steam then aborted with `cannot allocate memory
+  for thread-local data`. Before a new Steam launch, verify the previous emulator
+  process group is gone, not just that Steam has restarted.
+- SDSS now holds a per-user session lock and rejects a second `sdss run` while one session
+  is active. It also handles `SIGTERM`/`SIGINT` by entering the normal process-cleanup path.
+  Emulator configs are no longer part of that path: enabled state owns per-profile selective
+  journals, so Steam-native close only needs to reap the emulator, Sunshine, and compositor.
+- Azahar's native Wayland path is not stable under Steam on this image. Animal Crossing:
+  New Leaf reproduced `wl_display#1: error 1: invalid method 1` followed by Steam's
+  allocator abort. Nested Xwayland is stable, preserves the Steam overlay, and exposes
+  `WM_CLASS=Azahar`; the secondary-window rule must match that class as well as the native
+  `org.azahar_emu.Azahar` app ID.
+- Watching only the Steam reaper's lifetime is insufficient: Steam can abort and restart
+  while the reaper and application scope survive. The SDSS lineage watcher must also track
+  the actual `steam` ancestor so that a client restart triggers normal session cleanup.
+- Never let SDSS helpers inherit Steam's `gameoverlayrenderer.so`. The wrapper saves the
+  preload and removes it before the coordinator starts; only the emulator gets it back.
+  Cemu then matches stock memory behavior instead of driving Steam above 2 GiB.
+- Vulkan Azahar through nested Xwayland leaks roughly 430–480 MiB from Steam every five
+  seconds when the overlay is present. A journaled OpenGL override keeps the overlay working
+  without loading `steamoverlayvulkanlayer.so`.
+- Podman's pause helper is identified by `$XDG_RUNTIME_DIR/libpod/tmp/pause.pid`, not by a
+  stable cgroup layout. Kill it only when its parent belongs to the current launch ancestry.
+- Emulator config journals belong to enabled state, not a game session. Their snapshots
+  restore only declared keys; game exit is process teardown only.
 - SDSS wraps the *emulator binary*, not the EmuDeck launcher. AppImage emulators get an
   in-place wrapper plus a `.sdss-real` shadow and are honoured; melonDS is **bypassed**
   because EmuDeck's `melonds.sh` hardcodes `/usr/bin/flatpak run`.

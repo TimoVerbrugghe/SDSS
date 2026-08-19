@@ -1,4 +1,6 @@
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -55,6 +57,277 @@ class CompositorCommandTests(unittest.TestCase):
         # cgroupfs manager must be selected — and as a global flag, before "run".
         self.assertIn("--cgroup-manager=cgroupfs", command)
         self.assertLess(command.index("--cgroup-manager=cgroupfs"), command.index("run"))
+
+
+class ParentLifecycleTests(unittest.TestCase):
+    def test_parent_death_signal_is_registered_with_prctl(self):
+        libc = mock.Mock()
+        libc.prctl.return_value = 0
+        with mock.patch.object(runtime.sys, "platform", "linux"), mock.patch.object(
+            runtime.ctypes, "CDLL", return_value=libc
+        ), mock.patch.object(runtime.os, "getppid", return_value=1234), mock.patch.object(
+            runtime, "_arm_parent_lineage_watch"
+        ):
+            runtime.arm_parent_death_signal()
+        libc.prctl.assert_called_once_with(
+            runtime.PR_SET_PDEATHSIG, runtime.signal.SIGTERM, 0, 0, 0
+        )
+
+    def test_parent_watch_tracks_reaper_and_steam_client(self):
+        parents = {1234: 2000, 2000: 3000, 3000: 1632, 1632: 1}
+        names = {2000: "reaper", 3000: "steam", 1632: "systemd"}
+        with mock.patch.object(
+            runtime, "_parent_pid", side_effect=lambda pid: parents.get(pid)
+        ), mock.patch.object(
+            runtime, "_process_name", side_effect=lambda pid: names.get(pid)
+        ):
+            watched = runtime._watched_parent_pids(1234)
+        self.assertEqual(watched, (2000, 3000))
+
+    def test_parent_watch_falls_back_to_reaper_off_steam(self):
+        parents = {1234: 2000, 2000: 1632, 1632: 1}
+        with mock.patch.object(
+            runtime, "_parent_pid", side_effect=lambda pid: parents.get(pid)
+        ), mock.patch.object(runtime, "_process_name", return_value=None):
+            watched = runtime._watched_parent_pids(1234)
+        self.assertEqual(watched, (2000,))
+
+
+class X11BridgeTests(unittest.TestCase):
+    def test_bridge_dir_is_ours_and_links_back_to_the_host_sockets(self):
+        # The host's /tmp/.X11-unix is root-owned. Under --userns=keep-id host uid 0 maps
+        # to nobody, so wlroots rejects it ("not owned by root or us"), Xwayland never
+        # starts, DISPLAY comes back empty and needs_x11 profiles get a black screen.
+        # Verified on hardware. The bridge is a directory we own, with the host's sockets
+        # symlinked to their path under the second mount so they still resolve outward.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_dir = Path(tmp) / "run"
+            host_x11 = Path(tmp) / "host-x11"
+            host_x11.mkdir()
+            (host_x11 / "X0").touch()
+            (host_x11 / "X1").touch()
+            (host_x11 / "not-a-socket").touch()
+            with mock.patch.object(runtime, "HOST_X11_DIR", host_x11):
+                bridge = runtime.prepare_x11_bridge(runtime_dir)
+
+            self.assertNotEqual(bridge, host_x11)
+            self.assertEqual(sorted(p.name for p in bridge.iterdir()), ["X0", "X1"])
+            self.assertEqual(
+                os.readlink(bridge / "X0"),
+                str(runtime.CONTAINER_HOST_X11_DIR / "X0"),
+            )
+
+            # Re-running must not accumulate or trip over the previous links.
+            with mock.patch.object(runtime, "HOST_X11_DIR", host_x11):
+                runtime.prepare_x11_bridge(runtime_dir)
+            self.assertEqual(sorted(p.name for p in bridge.iterdir()), ["X0", "X1"])
+
+    def test_command_mounts_the_bridge_over_the_x11_dir(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            runtime, "native_sway", return_value=None
+        ), mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime, "own_cgroup", return_value=None
+        ):
+            command = runtime.compositor_command(
+                Path("/run/user/1000/sdss/session/sway.conf"),
+                Path(tmp),
+                home=Path("/home/deck"),
+            )
+        # The straight passthrough is what broke Xwayland; it must not come back.
+        self.assertNotIn("--volume=/tmp/.X11-unix:/tmp/.X11-unix", command)
+        self.assertIn(f"--volume={tmp}/sdss/x11:/tmp/.X11-unix", command)
+        # ...and the real directory still has to be reachable for the symlinks to resolve.
+        self.assertIn(
+            f"--volume={runtime.HOST_X11_DIR}:{runtime.CONTAINER_HOST_X11_DIR}", command
+        )
+
+
+class ContainerTeardownTests(unittest.TestCase):
+    """Steam refuses the next launch while anything survives in its per-game cgroup scope.
+
+    Verified on hardware: after a session, conmon, fuse-overlayfs and the nested Xwayland
+    were still in app-steam-app<id>-<pid>.scope and Steam reported "Game already running".
+    Terminating the `podman run` child does not reap them -- they are not its children.
+    """
+
+    def test_container_is_named_so_teardown_can_reach_it(self):
+        with mock.patch.object(runtime, "native_sway", return_value=None), mock.patch.object(
+            runtime, "podman_available", return_value=True
+        ), mock.patch.object(runtime, "own_cgroup", return_value=None):
+            command = runtime.compositor_command(
+                Path("/run/user/1000/sdss/session/sway.conf"),
+                Path("/run/user/1000"),
+                home=Path("/home/deck"),
+            )
+        self.assertIn(f"--name={runtime.CONTAINER_NAME}", command)
+        # A crashed session leaves the container behind and podman refuses to reuse a name.
+        self.assertIn("--replace", command)
+
+    def test_remove_container_force_removes_by_name(self):
+        with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime.subprocess, "run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=0)
+            self.assertTrue(runtime.remove_container())
+        self.assertEqual(run.call_count, 2)
+        kill_argv = run.call_args_list[0][0][0]
+        self.assertEqual(kill_argv[:2], ["podman", "kill"])
+        self.assertIn("--signal", kill_argv)
+        self.assertIn("KILL", kill_argv)
+        self.assertIn(runtime.CONTAINER_NAME, kill_argv)
+        self.assertNotIn("--ignore", kill_argv)
+        argv = run.call_args_list[1][0][0]
+        self.assertEqual(argv[:2], ["podman", "rm"])
+        self.assertIn("--force", argv)
+        # Removing an already-gone container must not be reported as a failure.
+        self.assertIn("--ignore", argv)
+        self.assertIn(runtime.CONTAINER_NAME, argv)
+
+    def test_remove_container_is_a_noop_without_podman(self):
+        with mock.patch.object(runtime, "podman_available", return_value=False), mock.patch.object(
+            runtime.subprocess, "run"
+        ) as run:
+            self.assertFalse(runtime.remove_container())
+        run.assert_not_called()
+
+    def test_remove_container_reports_failure(self):
+        with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime.subprocess, "run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=1)
+            self.assertFalse(runtime.remove_container())
+
+    def test_remove_container_reaps_orphaned_helpers(self):
+        with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime.subprocess, "run"
+        ) as run, mock.patch.object(runtime, "reap_orphaned_helpers") as reap:
+            run.return_value = mock.Mock(returncode=0)
+            runtime.remove_container()
+        reap.assert_called_once_with(runtime.CONTAINER_NAME)
+
+    def test_reap_orphaned_helpers_kills_named_processes(self):
+        with mock.patch.object(runtime.os, "listdir", return_value=["123", "456"]), mock.patch.object(
+            runtime.os, "getpid", return_value=999
+        ), mock.patch.object(
+            runtime.Path,
+            "read_bytes",
+            side_effect=[b"/usr/bin/conmon\0-n\0sdss-compositor\0", b"python\0sdss_inputd.py\0"],
+        ), mock.patch.object(runtime.os, "kill") as kill:
+            runtime.reap_orphaned_helpers()
+        self.assertEqual(
+            kill.call_args_list,
+            [mock.call(123, runtime.signal.SIGKILL), mock.call(456, runtime.signal.SIGKILL)],
+        )
+
+    def test_reap_orphaned_helpers_kills_stale_nested_graphics_helpers(self):
+        commands = [
+            b"/usr/bin/Xwayland\0:2\0-rootless\0-wm\041\0",
+            b"/usr/bin/fuse-overlayfs\0upperdir=/home/deck/.local/share/containers/storage/overlay/abc/merged\0",
+            b"/usr/bin/Xwayland\0:1\0-rootless\0",
+            b"/usr/bin/fuse-overlayfs\0upperdir=/tmp/other-container\0",
+        ]
+        with mock.patch.object(runtime.os, "listdir", return_value=["123", "456", "789", "999"]), mock.patch.object(
+            runtime.os, "getpid", return_value=1000
+        ), mock.patch.object(runtime.Path, "read_bytes", side_effect=commands), mock.patch.object(
+            runtime, "own_cgroup", return_value="user.slice/app-steam.scope"
+        ), mock.patch.object(
+            runtime,
+            "_belongs_to_cgroup",
+            side_effect=lambda pid, _parent: pid in (123, 456),
+        ), mock.patch.object(
+            runtime.os, "kill"
+        ) as kill:
+            runtime.reap_orphaned_helpers()
+        self.assertEqual(
+            kill.call_args_list,
+            [mock.call(123, runtime.signal.SIGKILL), mock.call(456, runtime.signal.SIGKILL)],
+        )
+
+    def test_reap_orphaned_helpers_preserves_graphics_helpers_from_other_scope(self):
+        commands = [
+            b"/usr/bin/Xwayland\0:3\0-rootless\0-wm\041\0",
+            b"/usr/bin/fuse-overlayfs\0upperdir=/home/deck/.local/share/containers/storage/overlay/other/merged\0",
+        ]
+        with mock.patch.object(
+            runtime.os, "listdir", return_value=["123", "456"]
+        ), mock.patch.object(
+            runtime.os, "getpid", return_value=1000
+        ), mock.patch.object(
+            runtime.Path, "read_bytes", side_effect=commands
+        ), mock.patch.object(
+            runtime, "own_cgroup", return_value="user.slice/app-steam.scope"
+        ), mock.patch.object(
+            runtime, "_belongs_to_cgroup", return_value=False
+        ), mock.patch.object(runtime.os, "kill") as kill:
+            runtime.reap_orphaned_helpers()
+        kill.assert_not_called()
+
+    def test_reap_orphaned_helpers_kills_launch_owned_podman_pause(self):
+        with mock.patch.object(runtime, "reap_orphaned_appimage_mounts"), mock.patch.object(
+            runtime, "_ancestor_pids", return_value=(2000, 3000)
+        ), mock.patch.object(
+            runtime.os, "listdir", return_value=["123"]
+        ), mock.patch.object(
+            runtime.os, "getpid", return_value=1000
+        ), mock.patch.object(
+            runtime.Path, "read_bytes", return_value=b"catatonit\0-P\0"
+        ), mock.patch.object(
+            runtime, "_parent_pid", return_value=2000
+        ), mock.patch.object(
+            runtime, "_podman_pause_pid", return_value=123
+        ), mock.patch.object(runtime.os, "kill") as kill:
+            runtime.reap_orphaned_helpers()
+        kill.assert_called_once_with(123, runtime.signal.SIGKILL)
+
+    def test_reap_orphaned_helpers_preserves_unrelated_podman_pause(self):
+        with mock.patch.object(runtime, "reap_orphaned_appimage_mounts"), mock.patch.object(
+            runtime, "_ancestor_pids", return_value=(2000, 3000)
+        ), mock.patch.object(
+            runtime.os, "listdir", return_value=["123"]
+        ), mock.patch.object(
+            runtime.os, "getpid", return_value=1000
+        ), mock.patch.object(
+            runtime.Path, "read_bytes", return_value=b"catatonit\0-P\0"
+        ), mock.patch.object(
+            runtime, "_parent_pid", return_value=4000
+        ), mock.patch.object(runtime, "_podman_pause_pid") as pause_pid, mock.patch.object(
+            runtime.os, "kill"
+        ) as kill:
+            runtime.reap_orphaned_helpers()
+        pause_pid.assert_not_called()
+        kill.assert_not_called()
+
+    def test_reap_orphaned_helpers_preserves_other_launch_catatonit(self):
+        with mock.patch.object(runtime, "reap_orphaned_appimage_mounts"), mock.patch.object(
+            runtime, "_ancestor_pids", return_value=(2000, 3000)
+        ), mock.patch.object(
+            runtime.os, "listdir", return_value=["123"]
+        ), mock.patch.object(
+            runtime.os, "getpid", return_value=1000
+        ), mock.patch.object(
+            runtime.Path, "read_bytes", return_value=b"catatonit\0-P\0"
+        ), mock.patch.object(
+            runtime, "_parent_pid", return_value=2000
+        ), mock.patch.object(
+            runtime, "_podman_pause_pid", return_value=456
+        ), mock.patch.object(runtime.os, "kill") as kill:
+            runtime.reap_orphaned_helpers()
+        kill.assert_not_called()
+
+    def test_reap_orphaned_helpers_unmounts_sdss_appimage_mounts(self):
+        mountinfo = (
+            "42 35 0:99 / /tmp/.mount_Cemu.ABC rw,nosuid - fuseblk "
+            "/home/deck/Cemu.AppImage.sdss-real rw\n"
+        )
+        with mock.patch.object(runtime.Path, "read_text", return_value=mountinfo), mock.patch.object(
+            runtime.shutil, "which", return_value="/usr/bin/fusermount3"
+        ), mock.patch.object(runtime.subprocess, "run") as run:
+            runtime.reap_orphaned_appimage_mounts()
+        run.assert_called_once_with(
+            ["/usr/bin/fusermount3", "-u", "-z", "/tmp/.mount_Cemu.ABC"],
+            capture_output=True,
+            check=False,
+        )
 
 
 class OuterGamescopeResolutionTests(unittest.TestCase):

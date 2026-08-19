@@ -47,6 +47,11 @@ def hooks_lock_file() -> Path:
     return state_dir() / "hooks.lock"
 
 
+def session_lock_file() -> Path:
+    """Serializes active emulator sessions for this user."""
+    return state_dir() / "session.lock"
+
+
 def ensure(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path

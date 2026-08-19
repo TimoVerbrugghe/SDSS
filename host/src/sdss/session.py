@@ -1,25 +1,31 @@
-"""Session lifecycle: patch configs, start sway + Sunshine, run the emulator, restore."""
+"""Session lifecycle: start sway + Sunshine, run the emulator, and tear processes down."""
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import logging
 import os
+import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import compositor, launch, paths, patch, runtime, stream
-from .compositor import CompositorSpec, OutputMode, environment, render_config
+from . import compositor, launch, paths, runtime, stream
+from .compositor import DECK_PANEL_RESOLUTION, CompositorSpec, OutputMode, environment, render_config
 from .profiles import Profile
 
 log = logging.getLogger("sdss.session")
 
-JOURNAL_NAME = "session"
 ENV_DUMP_TIMEOUT = 15.0
 
 
 class SessionError(Exception):
+    pass
+
+
+class SessionInterrupted(SessionError):
     pass
 
 
@@ -31,14 +37,12 @@ class Session:
     dry_run: bool = False
     _processes: list[subprocess.Popen] = field(default_factory=list, repr=False)
     _pin_keepalive_fd: int | None = field(default=None, repr=False)
+    _signal_handlers: dict[int, object] = field(default_factory=dict, repr=False)
+    _stopping: bool = field(default=False, repr=False)
 
     @property
     def runtime(self) -> Path:
         return paths.runtime_dir() / "session"
-
-    @property
-    def journal(self) -> patch.Journal:
-        return patch.Journal(paths.backup_dir(), JOURNAL_NAME)
 
     @staticmethod
     def _session_runtime_dir() -> str:
@@ -86,7 +90,7 @@ class Session:
             profile=self.profile,
             env_dump=str(dump),
             tv=tv,
-            second=OutputMode(*self.profile.second_size),
+            second=OutputMode(*DECK_PANEL_RESOLUTION),
             main_output=main_output,
         )
         config = runtime_dir / "sway.conf"
@@ -100,41 +104,141 @@ class Session:
             "sunshine_conf": sunshine.config_dir / "sunshine.conf",
         }
 
-    def patch_configs(self) -> list[Path]:
-        journal = self.journal
-        if journal.exists:
-            log.warning("stale journal found — restoring before starting")
-            journal.restore()
-        changed: list[Path] = []
-        for target in self.profile.configs:
-            path = target.resolve()
-            if patch.patch_file(path, target.format, target.edits, journal):
-                changed.append(path)
-        return changed
-
     # --- run -------------------------------------------------------------------------
 
     def run(self) -> int:
-        artifacts = self.write_artifacts()
         if self.dry_run:
+            self.write_artifacts()
             return 0
 
+        with self._session_lock():
+            self._install_signal_handlers()
+            try:
+                runtime.arm_parent_death_signal()
+                artifacts = self.write_artifacts()
+                sway_proc = self._start_sway(artifacts["sway_config"])
+                nested = self._await_nested_display(artifacts["sway_env"])
+                self._start_sunshine(nested["WAYLAND_DISPLAY"])
+                emulator = self._start_emulator(nested)
+                code = emulator.wait()
+                log.info("emulator exited with %s — tearing down the session", code)
+                if sway_proc.poll() is None:
+                    self._terminate_process(sway_proc)
+                return code
+            finally:
+                self._stopping = True
+                runtime.disarm_parent_death_watch()
+                try:
+                    self.cleanup()
+                finally:
+                    self._restore_signal_handlers()
+
+    @contextlib.contextmanager
+    def _session_lock(self):
+        lock_path = paths.session_lock_file()
+        handle = paths.ensure(lock_path.parent).joinpath(lock_path.name).open("w")
         try:
-            # Inside the try: a PatchError from the second of three config targets used to
-            # leave the first one patched with a populated journal and no restore, because
-            # this ran before the `finally` was armed.
-            self.patch_configs()
-            sway_proc = self._start_sway(artifacts["sway_config"])
-            nested = self._await_nested_display(artifacts["sway_env"])
-            self._start_sunshine(nested["WAYLAND_DISPLAY"])
-            emulator = self._start_emulator(nested)
-            code = emulator.wait()
-            log.info("emulator exited with %s — tearing down the session", code)
-            if sway_proc.poll() is None:
-                sway_proc.terminate()
-            return code
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise SessionError("another SDSS emulator session is already running") from exc
+            yield
         finally:
-            self.cleanup()
+            handle.close()
+
+    def _install_signal_handlers(self) -> None:
+        def interrupted(signum, _frame):
+            name = signal.Signals(signum).name
+            if self._stopping:
+                log.warning("received %s while already stopping — ignoring", name)
+                return
+            self._stopping = True
+            log.warning("received %s — stopping the SDSS session", name)
+            raise SessionInterrupted(f"session interrupted by {name}")
+
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            self._signal_handlers[signum] = signal.signal(signum, interrupted)
+
+    def _restore_signal_handlers(self) -> None:
+        for signum, handler in self._signal_handlers.items():
+            signal.signal(signum, handler)
+        self._signal_handlers.clear()
+
+    @staticmethod
+    def _terminate_process(proc: subprocess.Popen) -> None:
+        """Stop a launched process and the wrappers it may have spawned."""
+        descendants = Session._descendant_pids(proc.pid)
+        for pid in descendants:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                continue
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except PermissionError as exc:
+            log.warning("could not terminate process group %s: %s", proc.pid, exc)
+            return
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                log.warning("could not kill process group %s: %s", proc.pid, exc)
+            for pid in descendants:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    continue
+            proc.wait()
+        else:
+            # Flatpak and container runtimes can move their init process into a
+            # separate process group; do not leave it holding Steam's reaper.
+            for pid in descendants:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    continue
+
+    @staticmethod
+    def _descendant_pids(root_pid: int) -> list[int]:
+        """Return a snapshot of all descendants, including escaped process groups."""
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return []
+        parents: dict[int, list[int]] = {}
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                status = Path(f"/proc/{pid}/status").read_text()
+            except OSError:
+                continue
+            parent = next(
+                (
+                    int(line.split("\t", 1)[1])
+                    for line in status.splitlines()
+                    if line.startswith("PPid:\t")
+                ),
+                None,
+            )
+            if parent is not None:
+                parents.setdefault(parent, []).append(pid)
+
+        descendants: list[int] = []
+        pending = [root_pid]
+        while pending:
+            parent = pending.pop()
+            children = parents.get(parent, [])
+            descendants.extend(children)
+            pending.extend(children)
+        return descendants
 
     def _start_emulator(self, nested: dict[str, str]) -> subprocess.Popen:
         wayland_display = nested["WAYLAND_DISPLAY"]
@@ -144,19 +248,22 @@ class Session:
                 f"{self.profile.name} needs Xwayland but the compositor reported no DISPLAY"
             )
         runtime_dir = self._session_runtime_dir()
-        command = launch.build_command(self.command, wayland_display)
+        command = launch.build_command(
+            self.command, wayland_display, self.profile.launch_args
+        )
         env = launch.build_env(
             dict(os.environ),
             wayland_display,
             runtime_dir,
             x11_display=x11_display,
             prefer_x11=self.profile.needs_x11,
+            steam_overlay=self.profile.steam_overlay,
         )
         log.info(
             "launching emulator on %s", x11_display if self.profile.needs_x11 else wayland_display
         )
         try:
-            proc = subprocess.Popen(command, env=env)
+            proc = subprocess.Popen(command, env=env, start_new_session=True)
         except OSError as exc:
             raise SessionError(f"could not launch emulator {command[0]!r}: {exc}") from exc
         self._processes.append(proc)
@@ -164,14 +271,24 @@ class Session:
 
     def _start_sway(self, config: Path) -> subprocess.Popen:
         backend, parent = runtime.parent_display()
-        env = {**os.environ, **environment(backend, parent), **self.profile.extra_env}
+        env = launch.helper_env(
+            {**os.environ, **environment(backend, parent), **self.profile.extra_env}
+        )
         try:
             command = runtime.compositor_command(config, paths.runtime_dir().parent)
         except RuntimeError as exc:
             raise SessionError(str(exc)) from exc
         log.info("starting nested compositor on parent %s display %s", backend, parent)
+        # Must exist and be owned by us before the container mounts it over /tmp/.X11-unix,
+        # or wlroots refuses to start Xwayland and needs_x11 profiles get a black screen.
+        runtime.prepare_x11_bridge(paths.runtime_dir().parent)
+        # `podman run --replace` refuses to take over a container whose conmon died
+        # without cleaning up (a hard kill, or a crashed previous run): it reports
+        # "conmon exited prematurely" and the new container dies immediately. A forced
+        # remove first is the only thing that reliably clears that state.
+        runtime.remove_container()
         try:
-            proc = subprocess.Popen(command, env=env)
+            proc = subprocess.Popen(command, env=env, start_new_session=True)
         except OSError as exc:
             raise SessionError(f"could not start compositor {command[0]!r}: {exc}") from exc
         self._processes.append(proc)
@@ -187,7 +304,13 @@ class Session:
                     for line in env_file.read_text().splitlines()
                     if "=" in line
                 )
-                if values.get("WAYLAND_DISPLAY"):
+                # `xwayland force` starts Xwayland at compositor init, so DISPLAY is
+                # normally already set by the time sway runs the env dump. Keep waiting
+                # rather than accepting a blank one, so a slow start surfaces as a timeout
+                # instead of "needs Xwayland but the compositor reported no DISPLAY".
+                if values.get("WAYLAND_DISPLAY") and not (
+                    self.profile.needs_x11 and not values.get("DISPLAY")
+                ):
                     log.info(
                         "nested compositor on %s (xwayland %s)",
                         values["WAYLAND_DISPLAY"],
@@ -204,7 +327,12 @@ class Session:
         keepalive_fd, child_fd = self._pin_fifo()
         started = False
         try:
-            proc = subprocess.Popen(command, stdin=child_fd)
+            proc = subprocess.Popen(
+                command,
+                env=launch.helper_env(dict(os.environ)),
+                stdin=child_fd,
+                start_new_session=True,
+            )
             started = True
         except OSError as exc:
             raise SessionError(f"could not start Sunshine {command[0]!r}: {exc}") from exc
@@ -241,24 +369,19 @@ class Session:
     def cleanup(self) -> None:
         for proc in reversed(self._processes):
             if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+                self._terminate_process(proc)
         self._processes.clear()
+        runtime.reap_orphaned_helpers()
+        # `podman run` is a child, but conmon, fuse-overlayfs and the nested Xwayland are not.
+        # Asking podman to remove the container reaps those remaining container processes.
+        if not runtime.native_sway():
+            try:
+                runtime.remove_container()
+            except OSError as exc:
+                # cleanup() runs from a `finally`; never let teardown replace the real error.
+                log.warning("could not remove compositor container: %s", exc)
         if self._pin_keepalive_fd is not None:
             os.close(self._pin_keepalive_fd)
             self._pin_keepalive_fd = None
         pin_path = self.runtime / "pin"
         pin_path.unlink(missing_ok=True)
-        journal = self.journal
-        if journal.exists:
-            try:
-                restored = journal.restore()
-            except patch.PatchError as exc:
-                # cleanup() runs from a `finally`; raising here would replace whatever
-                # actually ended the session. The backups are still on disk either way.
-                log.error("could not restore config files: %s", exc)
-            else:
-                log.info("restored %d config file(s)", len(restored))

@@ -47,12 +47,29 @@ if ! grep -qx "$APP_NAME" <<<"$apps"; then
     exit 1
 fi
 
-# `exec` bypasses shell functions, so the flatpak has to be spelled out here.
+# Do NOT `exec` here. Flatpak's own sandbox helper reparents the real moonlight
+# process (and its bwrap wrapper) to the user's systemd, detached from whatever
+# spawned `flatpak run` -- so when Steam's reaper sends SIGTERM to this script's
+# PID, killing that PID (or even exec'ing straight into flatpak and killing the
+# result) never reaches the actual streaming process. Steam's `steam://closeapp`
+# / `steam://stopgame` then reports success while `bwrap`+`moonlight` keep running
+# forever, which is exactly the "artifact left behind after a Steam stop" failure
+# mode this project treats as a hard bug. Instead: launch in the background, trap
+# the signals Steam's reaper actually sends, and on any of them explicitly ask
+# Flatpak to kill this specific app instance before this script exits.
 # Touch reliability depends primarily on the Steam Input layout for this shortcut:
 # add the Always-On command `System -> Touchscreen Native Support`.
 # Keep `--no-touchscreen-trackpad` as a Moonlight-side guardrail to avoid trackpad
 # emulation paths on clients that default touchscreen to trackpad behavior.
-exec flatpak run "$MOONLIGHT_ID" stream "$host" "$APP_NAME" \
+cleanup() {
+    # Idempotent: harmless if moonlight already exited on its own.
+    flatpak kill "$MOONLIGHT_ID" 2>/dev/null || true
+}
+trap cleanup EXIT TERM INT HUP
+
+flatpak run "$MOONLIGHT_ID" stream "$host" "$APP_NAME" \
     --resolution "$RESOLUTION" --fps "$FPS" \
     --display-mode fullscreen --no-vsync \
-    --no-touchscreen-trackpad "$@"
+    --no-touchscreen-trackpad "$@" &
+child=$!
+wait "$child"

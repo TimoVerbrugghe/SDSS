@@ -1,6 +1,8 @@
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -35,6 +37,7 @@ class TestWindowMatch(unittest.TestCase):
     def test_azahar_matches_only_the_secondary_window(self):
         rules = profiles.AZAHAR.second_window.rules()
         self.assertTrue(all(rule.endswith('title="Secondary Window$"') for rule in rules))
+        self.assertIn('class="^Azahar$" title="Secondary Window$"', rules)
 
     def test_app_id_match_covers_wayland_and_xwayland(self):
         rules = profiles.MELONDS.second_window.rules()
@@ -47,11 +50,52 @@ class TestWindowMatch(unittest.TestCase):
 
 
 class TestX11Requirement(unittest.TestCase):
-    def test_wayland_incapable_emulators_are_flagged(self):
-        # cemu-project/Cemu#1809; melonDS maps no window on Wayland either.
+    def test_steam_profiles_use_the_stable_xwayland_path(self):
+        # Cemu and melonDS cannot map correctly on Wayland. Azahar can map there, but native
+        # Wayland has failed under Steam with a protocol error and no usable Steam overlay.
         self.assertTrue(profiles.CEMU.needs_x11)
         self.assertTrue(profiles.MELONDS.needs_x11)
-        self.assertFalse(profiles.AZAHAR.needs_x11)
+        self.assertTrue(profiles.AZAHAR.needs_x11)
+
+
+class TestConfigTargets(unittest.TestCase):
+    def test_cemu_edits_read_gamepad_profile_at_resolution_time(self):
+        target = profiles.CEMU.configs[0]
+        with mock.patch.dict(
+            os.environ, {"SDSS_CEMU_GAMEPAD_PROFILE": "DeckGamePad"}
+        ):
+            edits = target.resolved_edits()
+        values = {(edit.key, edit.value) for edit in edits}
+        self.assertIn(("open_pad", "true"), values)
+        self.assertIn(("controllerProfile", "DeckGamePad"), values)
+        self.assertIn(("controller_profile", "DeckGamePad"), values)
+
+    def test_no_gamepad_profile_means_no_optional_edits_or_files(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            edits = profiles.CEMU.configs[0].resolved_edits()
+            files = profiles.CEMU.resolved_files()
+        self.assertEqual({(edit.key, edit.value) for edit in edits}, {("open_pad", "true")})
+        self.assertEqual(files, ())
+
+    def test_cemu_default_profile_file_uses_safe_name(self):
+        with mock.patch.dict(
+            os.environ, {"SDSS_CEMU_GAMEPAD_PROFILE": "DeckGamePad"}
+        ):
+            target = profiles.CEMU.resolved_files()[0]
+        self.assertEqual(
+            target.resolve(),
+            Path(os.path.expanduser("~/.config/Cemu/controllerProfiles/DeckGamePad.txt")),
+        )
+        self.assertIn("emulate = Wii U GamePad", target.content)
+
+    def test_cemu_profile_path_traversal_is_rejected(self):
+        with mock.patch.dict(
+            os.environ, {"SDSS_CEMU_GAMEPAD_PROFILE": "../../etc/x"}
+        ):
+            with self.assertRaises(ValueError):
+                profiles.CEMU.resolved_files()
+            with self.assertRaises(ValueError):
+                profiles.CEMU.configs[0].resolved_edits()
 
 
 class TestSwayConfig(unittest.TestCase):
@@ -63,6 +107,15 @@ class TestSwayConfig(unittest.TestCase):
             second=OutputMode(1280, 800),
         )
         return render_config(spec)
+
+    def test_xwayland_is_forced_not_lazy(self):
+        # `xwayland enable` makes sway spawn Xwayland only when the first X11 client
+        # connects. Nothing connects before the env-dump `exec` runs, so DISPLAY is
+        # empty and every needs_x11 profile dies with "needs Xwayland but the compositor
+        # reported no DISPLAY". `force` starts it during compositor init instead.
+        config = self.render(profiles.CEMU)
+        self.assertIn("xwayland force", config)
+        self.assertNotIn("xwayland enable", config)
 
     def test_outputs_do_not_overlap(self):
         config = self.render(profiles.CEMU)
@@ -108,6 +161,20 @@ class TestSwayConfig(unittest.TestCase):
 
     def test_env_dump_runs_inside_the_compositor(self):
         self.assertIn("exec /run/user/1000/sdss/session/dump-env.sh", self.render(profiles.AZAHAR))
+
+    def test_azahar_requests_native_fullscreen(self):
+        self.assertEqual(profiles.AZAHAR.launch_args, ("-f",))
+
+    def test_azahar_uses_opengl_for_nested_steam_overlay(self):
+        edits = {
+            (edit.section, edit.key): edit.value
+            for target in profiles.AZAHAR.configs
+            for edit in target.edits
+        }
+        self.assertEqual(edits[("Renderer", "graphics_api")], "1")
+        self.assertEqual(edits[("Renderer", "graphics_api\\default")], "false")
+        self.assertFalse(profiles.AZAHAR.steam_overlay)
+        self.assertTrue(profiles.CEMU.steam_overlay)
 
     def test_emulator_is_not_started_by_the_compositor(self):
         # sway runs in a container and cannot exec host binaries.

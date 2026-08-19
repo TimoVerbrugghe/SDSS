@@ -19,8 +19,7 @@ class SdssError(RuntimeError):
     pass
 
 
-# Every sdss subcommand the plugin issues is a config edit or a status read; none of them
-# should take anywhere near this long.
+# Toggle commands reconcile managed config keys and wrappers; none should take this long.
 COMMAND_TIMEOUT = 15.0
 
 
@@ -95,7 +94,7 @@ class Plugin:
         return await self.get_state()
 
     async def restore(self) -> dict:
-        """Undo every emulator config edit recorded in the patch journal."""
+        """Disable SDSS and selectively restore every managed emulator setting."""
         try:
             await self._run("restore")
         except SdssError as error:

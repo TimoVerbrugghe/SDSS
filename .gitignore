@@ -21,3 +21,6 @@ plugin/dist/*
 # infrastructure and is unresolvable anywhere else. Reproducibility comes from exact (not
 # caret) version pins in plugin/package.json instead.
 plugin/package-lock.json
+
+# Local, non-committed testing session notes (agent scratchpad)
+/docs/testing-notes.local.md

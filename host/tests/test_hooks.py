@@ -30,6 +30,14 @@ class WrapperInstallTest(unittest.TestCase):
         self.assertIn("sdss run --profile azahar", self.launcher.read_text())
         self.assertTrue(hooks.is_installed(self.profile))
 
+    def test_wrapper_keeps_steam_overlay_for_the_emulator_only(self):
+        hooks.install(self.profile)
+        wrapper = self.launcher.read_text()
+        save = 'export SDSS_EMULATOR_LD_PRELOAD="${LD_PRELOAD-}"'
+        self.assertIn(save, wrapper)
+        self.assertIn("unset LD_PRELOAD", wrapper)
+        self.assertLess(wrapper.index(save), wrapper.index("exec "))
+
     def test_install_is_idempotent(self):
         hooks.install(self.profile)
         wrapper_text = self.launcher.read_text()
@@ -60,19 +68,18 @@ class WrapperInstallTest(unittest.TestCase):
         self.assertFalse(hooks.install(profile))
         self.assertFalse(hooks.remove(profile))
 
-    def test_emudeck_update_drift_refuses_to_replace_the_existing_shadow(self):
-        """Never discard the prior real binary just because a new binary appeared at the
-        launcher path while the old shadow still exists."""
+    def test_emudeck_update_rewraps_the_new_binary(self):
         hooks.install(self.profile)
-        # Simulate EmuDeck's downloader clobbering the wrapper with a fresh AppImage.
         self.launcher.write_bytes(b"#!/bin/bash\necho new-version\n")
         self.launcher.chmod(0o755)
 
-        with self.assertRaises(OSError):
-            hooks.install(self.profile)
-        self.assertFalse(hooks.is_installed(self.profile))
+        self.assertTrue(hooks.install(self.profile))
+        self.assertTrue(hooks.is_installed(self.profile))
         shadow = self.launcher.with_name(self.launcher.name + ".sdss-real")
-        self.assertEqual(shadow.read_bytes(), b"#!/bin/bash\necho real-appimage\n")
+        self.assertEqual(shadow.read_bytes(), b"#!/bin/bash\necho new-version\n")
+        self.assertFalse(
+            self.launcher.with_name(f".{self.launcher.name}.sdss-previous").exists()
+        )
 
     def test_handles_symlink_launcher_like_melonds_flatpak_export(self):
         real_target = Path(self._tmp.name) / "real-melonds"
@@ -141,6 +148,24 @@ class WrapperInstallTest(unittest.TestCase):
         self.assertTrue(self.launcher.is_file())
         self.assertEqual(self.launcher.read_bytes(), original)
         self.assertFalse(hooks.is_installed(self.profile))
+
+    def test_update_rewrap_failure_restores_new_binary_and_old_shadow(self):
+        hooks.install(self.profile)
+        shadow = self.launcher.with_name(self.launcher.name + ".sdss-real")
+        old_shadow = shadow.read_bytes()
+        self.launcher.write_bytes(b"#!/bin/bash\necho new-version\n")
+
+        with mock.patch.object(
+            hooks, "_write_wrapper", side_effect=OSError("no space")
+        ):
+            with self.assertRaises(OSError):
+                hooks.install(self.profile)
+
+        self.assertEqual(
+            self.launcher.read_bytes(),
+            b"#!/bin/bash\necho new-version\n",
+        )
+        self.assertEqual(shadow.read_bytes(), old_shadow)
 
     def test_install_recovers_a_launcher_lost_mid_swap(self):
         hooks.install(self.profile)

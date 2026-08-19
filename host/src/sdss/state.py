@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 
 from . import paths
@@ -34,4 +35,10 @@ def load() -> State:
 def save(state: State) -> None:
     path = paths.state_file()
     paths.ensure(path.parent)
-    path.write_text(json.dumps(asdict(state), indent=2) + "\n")
+    tmp = path.with_name(f".{path.name}.sdss-tmp")
+    try:
+        tmp.write_text(json.dumps(asdict(state), indent=2) + "\n")
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
