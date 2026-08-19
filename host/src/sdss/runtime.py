@@ -59,15 +59,24 @@ def _arm_parent_lineage_watch(parent_pid: int) -> None:
     watched_pids = _watched_parent_pids(parent_pid)
     if not watched_pids:
         return
-    _parent_watch_stop = threading.Event()
+    stop_event = threading.Event()
+    _parent_watch_stop = stop_event
 
     def watch() -> None:
-        while not _parent_watch_stop.is_set():
+        # Bound to the local `stop_event`, not the module-global `_parent_watch_stop`: the
+        # global is reassigned to a new Event (or None) by disarm_parent_death_watch() from
+        # the main thread, and re-reading it here raced with that reassignment. Verified on
+        # hardware: this thread crashed with "AttributeError: 'NoneType' object has no
+        # attribute 'is_set'" when disarm ran between an iteration's wait() and its next
+        # while-check. Harmless to the running session (the thread was already being told to
+        # stop), but a real bug — an unhandled exception in a background thread — worth
+        # closing regardless of whether it caused any particular observed crash.
+        while not stop_event.is_set():
             for pid in watched_pids:
                 if not Path(f"/proc/{pid}").exists():
                     os.kill(os.getpid(), signal.SIGTERM)
                     return
-            _parent_watch_stop.wait(0.5)
+            stop_event.wait(0.5)
 
     threading.Thread(target=watch, name="sdss-parent-watch", daemon=True).start()
 

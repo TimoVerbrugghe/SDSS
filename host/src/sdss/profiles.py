@@ -196,13 +196,20 @@ AZAHAR = Profile(
     verified=True,
     needs_x11=True,
     launch_args=("-f",),
-    steam_overlay=False,
     launcher_path="~/Applications/azahar.AppImage",
     notes="Qt writes a `key\\default` marker next to every setting; it must be false or "
     "Azahar restores its own default on launch. Steam launches use nested Xwayland because "
     "the native-Wayland path has produced fatal protocol errors and prevents reliable Steam "
     "overlay handling. SDSS temporarily selects OpenGL because Steam's Vulkan overlay leaks "
-    "memory continuously on nested Xwayland.",
+    "memory continuously on nested Xwayland. steam_overlay was disabled entirely for a "
+    "period after that fix still left occasional Steam crashes; the actual cause turned out "
+    "to be an unrelated ungraceful compositor teardown (see docs/architecture.md), now fixed, "
+    "and re-enabling it live on hardware surfaced a *different* failure instead: invoking the "
+    "(deliberately absent) overlay left Steam's client waiting on a handshake with no game-side "
+    "client to answer it, which stalled and crashed Steam on its own internal deadlock "
+    "watchdog a couple of minutes later. steam_overlay is back to its True default so the "
+    "overlay works normally; if the Vulkan leak resurfaces even with the OpenGL override in "
+    "place, disabling it again is the fallback, not this handshake-stall failure mode.",
 )
 
 MELONDS = Profile(

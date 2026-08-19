@@ -173,7 +173,13 @@ class TestSwayConfig(unittest.TestCase):
         }
         self.assertEqual(edits[("Renderer", "graphics_api")], "1")
         self.assertEqual(edits[("Renderer", "graphics_api\\default")], "false")
-        self.assertFalse(profiles.AZAHAR.steam_overlay)
+        # Verified on hardware: with the OpenGL override and the graceful compositor
+        # teardown in runtime.py, the Steam overlay works for Azahar again. Disabling it
+        # entirely (steam_overlay=False) was a defensive measure for a Steam crash later
+        # found to be caused by something else (docs/architecture.md); it also introduced
+        # its own crash, a Steam-side deadlock when the overlay is invoked with no game-side
+        # client to answer it (see profiles.py's AZAHAR.notes).
+        self.assertTrue(profiles.AZAHAR.steam_overlay)
         self.assertTrue(profiles.CEMU.steam_overlay)
 
     def test_emulator_is_not_started_by_the_compositor(self):

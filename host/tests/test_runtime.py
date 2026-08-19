@@ -1,6 +1,7 @@
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -109,6 +110,48 @@ class ParentLifecycleTests(unittest.TestCase):
         ), mock.patch.object(runtime, "_process_name", return_value=None):
             watched = runtime._watched_parent_pids(1234)
         self.assertEqual(watched, (2000,))
+
+    def test_watch_thread_survives_disarm_racing_its_own_wait(self):
+        """Regression: the watch loop re-read the *module-global* `_parent_watch_stop` on
+        every iteration. disarm_parent_death_watch() reassigns that global to None (after
+        signalling the event it still held a reference to) -- if that happened between one
+        iteration's wait() returning and the loop's next while-check re-reading the global,
+        the thread crashed with "AttributeError: 'NoneType' object has no attribute
+        'is_set'". Verified on hardware during a real teardown. The fix binds the loop to a
+        local reference captured once at thread start, immune to the global being reassigned
+        later. This test forces disarm to fire in exactly that window, deterministically,
+        rather than hoping to hit the real race by timing.
+        """
+
+        class RacingEvent(threading.Event):
+            def wait(self, timeout=None):
+                runtime.disarm_parent_death_watch()
+                return super().wait(timeout)
+
+        created_threads: list[threading.Thread] = []
+        real_thread_cls = threading.Thread
+
+        class CapturingThread(real_thread_cls):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created_threads.append(self)
+
+        captured: list[object] = []
+        original_hook = threading.excepthook
+        threading.excepthook = captured.append
+        try:
+            with mock.patch.object(runtime.threading, "Event", RacingEvent), mock.patch.object(
+                runtime.threading, "Thread", CapturingThread
+            ), mock.patch.object(runtime, "_watched_parent_pids", return_value=(os.getpid(),)):
+                runtime._arm_parent_lineage_watch(1234)
+            self.assertEqual(len(created_threads), 1)
+            thread = created_threads[0]
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive(), "watch thread should have stopped cleanly")
+            self.assertEqual(captured, [], "watch thread must not raise on disarm")
+        finally:
+            threading.excepthook = original_hook
+            runtime._parent_watch_stop = None
 
 
 class X11BridgeTests(unittest.TestCase):

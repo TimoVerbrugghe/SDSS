@@ -432,7 +432,10 @@ class EmulatorLaunchBackendTests(unittest.TestCase):
         self.assertEqual(env["DISPLAY"], ":2")
         self.assertEqual(env["QT_QPA_PLATFORM"], "xcb")
         self.assertEqual(env["GDK_BACKEND"], "x11")
-        self.assertNotIn("LD_PRELOAD", env)
+        # Verified on hardware: Azahar's Steam overlay is enabled again (profiles.py's
+        # AZAHAR.notes) now that the OpenGL override and the graceful compositor teardown
+        # in runtime.py address the reasons it was previously disabled.
+        self.assertEqual(env["LD_PRELOAD"], "/steam/gameoverlayrenderer.so")
         self.assertNotIn("SDSS_EMULATOR_LD_PRELOAD", env)
 
     def test_cemu_keeps_steam_overlay(self):

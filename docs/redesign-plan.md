@@ -10,6 +10,20 @@ the hardware evidence for why it destabilizes Steam. This document proposes what
 > Phase 1/2 (the persistent compositor) are downgraded from "likely required to stop the
 > crash" to "a separate, lower-priority improvement toward goal 3" — see
 > [Reassessing Phase 1/2 after Phase 0's result](#reassessing-phase-12-after-phase-0s-result).
+>
+> **Further update, same day**: Azahar's Steam overlay was re-enabled (see
+> [docs/hardware-test-report.md](hardware-test-report.md) for the full account) after the
+> original OpenGL fix and Phase 0 both landed, and a second, unrelated bug (a `runtime.py`
+> parent-watch thread race) was found and fixed. Phase 1 was investigated further and found
+> **not achievable without patching wlroots/sway** — see
+> [Phase 1's result](#phase-1--feasibility-spike-for-the-persistent-compositor) below, now
+> updated with a second confirmed blocker. In its place, a scoped, achievable fix landed in
+> `deck/sdss-connect.sh` for the concrete symptom Phase 2 would have addressed (see
+> [Phase 2's result](#phase-2--build-the-persistent-second-screen-service-contingent-on-phase-1)).
+> A 48-cycle automated hardware acceptance test (alternating Cemu/Azahar, 4 different ROMs
+> each, varied timing) then ran for 2.5 hours with zero crashes before being interrupted by
+> the *orchestrating machine* going to sleep — not a Steam Machine or SDSS failure. Full
+> account in [docs/hardware-test-report.md](hardware-test-report.md).
 
 ## The goal, verbatim
 
@@ -238,12 +252,75 @@ Answer the open question in isolation, without touching the shipped session life
    valid test of "cgroup migration alone" with today's wlroots/sway that doesn't also require
    the reconnect capability. This sub-question is therefore blocked on the same gap as Option
    A, not a separate one — Option A is blocked on a single capability gap, not two.
-3. If both fail, evaluate Option B's relay approach for latency/complexity before ruling out
-   the persistent-compositor direction entirely; if that also fails, stop here — Phase 0
-   remains the shipped mitigation, and this document's "necessary vs incidental" framing
-   still stands as the record of what SDSS *should* look like if a future spike succeeds.
+3. **Done, second negative result (2026-08-19, later the same day).** Tested whether a
+   persistent Sunshine target was achievable a different way: give the nested sway a *fixed*
+   Wayland socket name (so a long-lived Sunshine could always point at the same target
+   without needing wlroots' output-reconnect at all) by setting `WAYLAND_DISPLAY` before
+   launching it. Tested directly against the real `localhost/sdss-compositor:latest` image on
+   hardware: sway/wlroots ignores that env var for its own server socket and always
+   self-assigns the next `wayland-N` name (`wayland-1` in the test, regardless of the
+   requested value). This closes off the simple "fixed-socket Sunshine" workaround too —
+   Sunshine would still need to be told a new socket path on every session, which is exactly
+   the coordination Phase 2 was trying to avoid needing.
+4. Given both results, evaluating Option B's relay approach (a thin per-launch relay process
+   in front of a persistent compositor) is the only remaining avenue for a *full* persistent
+   compositor, and was not attempted — the achievable win identified instead was fixing the
+   concrete symptom (see Phase 2 below) rather than the full architecture. Phase 0 remains the
+   shipped mitigation for the crash, and this document's "necessary vs incidental" framing
+   still stands as the record of what SDSS *should* look like if a future spike into Option B
+   succeeds.
 
 ### Phase 2 — build the persistent second-screen service (contingent on Phase 1)
+
+**Status: the full persistent-compositor design remains blocked on Phase 1's two findings
+above. A scoped, achievable fix for its motivating symptom was implemented and verified on
+hardware instead — see below.**
+
+While investigating Phase 1, hardware testing surfaced a concrete, distinct reliability gap
+that a persistent Sunshine/compositor would have solved as a side effect: **an
+already-connected Deck stream goes black and does not recover on its own when the Steam
+Machine's session tears down and a new one starts**, even though the `moonlight` process
+stays alive throughout. Verified repeatedly on hardware:
+
+- A fresh Deck-side launch against a stable, already-running host session shows live content
+  immediately (confirmed by screenshot).
+- Closing that host session and starting a new one, *without* touching the Deck's already-running
+  Moonlight process, leaves it showing a frozen last frame — confirmed byte-identical
+  screenshots (matching MD5) taken 2 minutes apart, and confirmed the `moonlight` process
+  burns near-zero CPU while "stalled" versus visibly non-trivial CPU while actually streaming.
+- Manually killing and relaunching the Deck shortcut against the new host session reconnects
+  and shows live content immediately.
+
+This is Moonlight/Sunshine's own behavior, not something SDSS's process lifecycle causes
+directly — but SDSS's per-launch Sunshine restart is what repeatedly creates the conditions
+for it, and Phase 2's persistent-service design would have avoided the problem entirely by
+never restarting Sunshine underneath an existing connection. Since that full design is
+blocked, the fix landed at the point actually in SDSS's control: the Deck-side connection
+script.
+
+**Implemented and verified in [`deck/sdss-connect.sh`](/Users/timo/Projects/SDSS/deck/sdss-connect.sh):**
+a CPU-tick-based stall detector polls the running `moonlight` process every 5 seconds; if its
+CPU ticks stay essentially flat (a real, actively-decoding 60fps stream burns continuous CPU,
+a stalled one does not) for a 15-second grace window, the script kills and transparently
+restarts the stream — all inside the same wrapper process Steam already tracks, so this never
+looks like a launch/exit to Steam itself. Verified on hardware:
+
+- Normal Steam-driven stop (SIGTERM delivered to the wrapper script's own PID, matching how
+  Steam's reaper actually signals it) still tears down cleanly, in ~6 seconds, with the new
+  stall-detection loop active — the existing "no `exec`, explicit Flatpak `kill` on any exit
+  signal" cleanup guarantee this script already had is unchanged.
+- A real host-session transition (one game session closed, a different one started) was left
+  to run under the existing connection; the stall detector caught it and reconnected within
+  its grace window, confirmed via a fresh screenshot showing the new session's live content
+  afterward, with no manual intervention.
+
+This directly closes the gap Phase 2 would have closed for this specific symptom, without
+any of Phase 2's architectural risk or its dependency on the blocked wlroots capabilities.
+The remaining Phase 2 design (items 1–5 below) is retained as the reference design for a
+*full* persistent second-screen service, should Option B (the relay approach) or a future
+wlroots capability make it feasible — it is not being pursued further right now.
+
+Original design, retained for reference:
 
 1. A long-lived service (systemd `--user` unit is the natural fit, matching how
    `sdss-memory-monitor.service` was already run as a transient unit successfully during this

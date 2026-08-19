@@ -613,3 +613,97 @@ mechanism this is believed to fix, and what remains open (the persistent
 compositor is downgraded from "likely required to stop the crash" to "a
 separate improvement toward `docs/redesign-plan.md`'s goal 3," since Phase 0
 alone closed every reproduction attempted so far).
+
+### Azahar overlay re-enabled, a second unrelated race fixed, and a 48-cycle acceptance run (2026-08-19, later)
+
+With Phase 0 deployed, the user manually tested Azahar and reported the
+Steam overlay would not come up. This was expected: `AZAHAR.steam_overlay`
+was still `False`, a defensive measure from before Phase 0 existed. Since
+the original two reasons for disabling it (helper-preload inheritance, and
+the Vulkan-overlay memory leak) were both already fixed independently
+(overlay-preload isolation, and Azahar's journaled OpenGL override), and
+Phase 0 addressed the graceful-teardown mechanism believed to explain the
+remaining crash, `steam_overlay` was set back to its default (`True`) for
+Azahar and deployed.
+
+The very next manual test reproduced a *new*, different Steam abort:
+`fatal stalled cross-thread pipe` / `Fatal assert; application exiting` in
+`src/common/pipes.cpp`, roughly 110 seconds after Azahar's own session had
+already torn down cleanly (`sdss: emulator exited with 0`, container
+removed, nothing left running). This is a Steam-internal deadlock watchdog,
+not the memory-exhaustion abort Phase 0 targets, and the leading hypothesis
+was that invoking the overlay on a game session that has since ended left
+Steam's client waiting on a handshake with no game-side client left to
+answer it.
+
+A real, unrelated bug was found and fixed in the same investigation: a race
+in `runtime.py`'s parent-lineage watch thread, which read the *module-global*
+`_parent_watch_stop` on every loop iteration. `disarm_parent_death_watch()`
+reassigns that global to `None` after signalling the event it still held a
+reference to; if that reassignment landed between one iteration's `wait()`
+returning and the loop's next `while` check re-reading the global, the
+thread crashed with `AttributeError: 'NoneType' object has no attribute
+'is_set'` — reproduced verbatim in the real journal capture. The fix binds
+the loop to a local reference captured once at thread start. A deterministic
+regression test forces the race by making a `RacingEvent.wait()` call
+`disarm_parent_death_watch()` itself, and was confirmed to fail against the
+pre-fix code with the exact same `AttributeError` before the fix was
+applied.
+
+Azahar's overlay was re-enabled and retested directly: a single Azahar
+session (A Link Between Worlds) ran for 44 minutes, including five
+simulated Guide-button presses via a virtual `evdev` gamepad, with one
+small (~10 MB) one-time RSS bump that immediately plateaued and no
+sustained leak. The user then confirmed physically on hardware that
+Shift+Tab correctly brings up the Steam overlay on Azahar.
+
+An automated, continuously-varying acceptance test was then run directly
+against the deployed Phase-0 + re-enabled-overlay + race-fixed code: 48
+cycles alternating Cemu (Wind Waker HD / Twilight Princess HD) and Azahar (A
+Link Between Worlds / Animal Crossing New Leaf / Majora's Mask 3D /
+Detective Pikachu) over about 2.5 hours, deliberately varying the settle
+time (8–25 s), the number of Shift+Tab overlay presses per session (1–4),
+and the gap between closing one session and starting the next (5–30 s,
+including several back-to-back launches faster than the originally-reported
+20-second gap). 47 of 48 cycles logged an explicit "session torn down
+cleanly"; the 48th was still in flight when the *orchestrating machine*
+(not the Steam Machine) went to sleep, interrupting the test — the user
+manually closed the in-flight Cemu session and confirmed it "was still
+working." Zero warnings, zero "never appeared" failures, and zero crashes
+were logged. Steam's PID never changed across the entire test — the same
+PID from the last real crash (12:55) was still running 3.5 hours later.
+Its RSS grew from about 302 MB to 437 MB over the automated portion
+(roughly 1 MB/minute), categorically different from the roughly 65 MB/s
+climb that preceded every crash before Phase 0, and consistent with normal
+Steam UI/cache growth rather than a leak.
+
+A separate, genuine reliability gap was found and fixed during this same
+session, unrelated to the crash: an already-connected Deck stream does not
+recover when the Steam Machine's session tears down and a new one starts,
+because SDSS restarts Sunshine fresh for every session and Moonlight does
+not treat that as a dropped connection to retry. Verified on hardware with
+byte-identical (matching MD5) screenshots taken minutes apart showing a
+frozen last frame, and confirmed the stalled `moonlight` process burns
+near-zero CPU versus visibly non-trivial CPU while actually streaming.
+`deck/sdss-connect.sh` now polls the running `moonlight` process's CPU
+ticks every 5 seconds and, after 15 seconds of no meaningful ticks,
+transparently kills and restarts the stream inside the same wrapper process
+Steam already tracks — verified on hardware to both leave the normal
+Steam-driven stop path intact (clean teardown in about 6 seconds) and to
+recover a real stalled connection within its grace window, confirmed by a
+follow-up screenshot showing the new session's live content.
+
+Investigating whether a full persistent second-screen service (this
+report's Phase 1/2) could be built instead concluded it cannot, without
+patching wlroots or sway: beyond the earlier-documented lack of a live
+X11-backend reconnect API, this session additionally tested — directly
+against the real `localhost/sdss-compositor:latest` image — whether sway's
+own Wayland server socket honors a fixed `WAYLAND_DISPLAY` value set before
+launch, which would have let a persistent Sunshine always target the same
+socket without needing output reconnection at all. It does not: sway always
+self-assigns the next `wayland-N` name regardless of the requested value.
+Full detail and the updated Phase 1/2 status are in
+[docs/redesign-plan.md](redesign-plan.md).
+
+All 288 host tests pass, including two new regression tests (the parent-watch
+race, and the `steam_overlay` default flipping back to `True` for Azahar).
