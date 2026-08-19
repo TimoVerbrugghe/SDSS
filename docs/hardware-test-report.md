@@ -783,3 +783,78 @@ receiving SIGKILL immediately in `cleanup()`, the compositor still receiving
 graceful SIGTERM first, and `_terminate_process(graceful=False)` never
 sending SIGTERM to any target. Each was confirmed to fail against the
 pre-fix code before being confirmed to pass against the fix.
+
+### The emulator-SIGKILL fix was also insufficient: the real trigger was the compositor's own graceful TERM (2026-08-19, later still)
+
+The 23-cycle verdict above was itself premature, in exactly the same way the
+48-cycle verdict before it was. The user reproduced a fresh crash almost
+immediately after: Azahar launched once, then Cemu — crashed again, no
+different from before.
+
+This result ruled out the previous fix's own theory. The emulator was by
+then already receiving SIGKILL immediately in `cleanup()`, never SIGTERM, so
+its signal handling could not have been the cause of this occurrence. Fresh
+journal forensics around the new crash found the identical triple-coredump
+signature as before — `sway`, `Xwayland` and `sdss_inputd` all crashing with
+SIGBUS within a few hundred milliseconds of each other during a preceding
+session's teardown — but this time with the emulator process already reaped
+by SIGKILL before the compositor stack crashed. The only remaining piece of
+`cleanup()`'s teardown sequence still capable of sending the compositor
+container a signal was `runtime.remove_container()`'s own graceful attempt,
+added by the ["graceful compositor teardown"](#graceful-compositor-teardown-and---ipchost-removal-2026-08-19)
+fix above: `podman kill --signal TERM sdss-compositor`, waited on with a
+bounded `podman wait --condition stopped`.
+
+That fix's own hardware test, at the time, had verified that a single TERM
+against a live session let sway exit cleanly within 1–3 seconds. What it
+could not have caught is a failure mode that is itself only occasional: TERM
+against the compositor container crashes sway with SIGBUS — backtrace inside
+Mesa's `libgallium`, consistent with a shared GPU buffer becoming invalid
+mid-teardown — often enough to reproduce within a handful of real sessions,
+but not reliably enough for a small sample of manual verification runs to
+have caught it. A crash is exactly as abrupt a disconnect, from Steam's side,
+as the SIGKILL the graceful path was written to avoid — so the entire
+premise of "TERM first is safer" never held; it was trading a guaranteed-safe
+abrupt disconnect for an occasional crash-then-abrupt-disconnect instead.
+
+**Fix:** `remove_container()` no longer sends the compositor container TERM
+at all. It goes straight to the unconditional `--signal KILL` + `rm --force`
+backstop that was already there as the fallback. The now-unused
+`GRACEFUL_STOP_TIMEOUT` constant and the `podman wait` step were removed.
+sway and Sunshine's own process-level teardown (in `Session.cleanup()`, a
+separate code path from the container-level kill discussed here) keeps its
+existing graceful SIGTERM-first behaviour unchanged — this fix is scoped
+strictly to the container-level signal `remove_container()` sends.
+
+**Hardware acceptance test:** 30 cycles across two separate runs. The first
+15 cycles reproduced the user's exact reported sequence (Azahar, then Cemu,
+repeated) as a hammer test. The second 15 varied session duration from 8s to
+200s, including rapid back-to-back restarts. All 30 completed with **zero
+coredumps and zero SIGBUS/SIGABRT journal entries**; Steam's PID never
+changed across any cycle.
+
+290 host tests pass. `test_remove_container_tries_graceful_term_before_force_kill`
+was replaced with `test_remove_container_sends_sigkill_immediately`, which
+asserts the container receives exactly one `podman kill --signal KILL` call
+and no `TERM` call at all; `test_remove_container_survives_a_graceful_wait_timeout`
+was removed since there is no longer a wait step to time out.
+
+As with the fix before it, this is strong evidence gathered honestly, not a
+declaration that the crash is now impossible — the same probabilistic,
+not-every-time nature of the failure that made the 23-cycle and 48-cycle
+verdicts premature applies here too. The one thing this occurrence changed
+is methodology, not just code: the user asked to stop validating teardown
+with scripted signals (`kill -INT` simulating Steam's "Exit Game") entirely,
+and instead run further cycles exiting through the real Steam overlay's
+"Exit Game" menu option, navigated with injected keyboard/gamepad input and
+confirmed by screenshot at each step — on the reasoning that a scripted
+signal might not be exercising the exact teardown path a real player
+triggers. That testing was in progress, and had not yet produced a
+completed cycle, when the Steam Machine stopped responding to the network
+entirely (no SSH, no ICMP, ARP resolution failing from two independent
+hosts on the same LAN) partway through building the input-injection
+tooling. Whether that outage is connected to this crash mechanism, a
+separate hardware/OS fault, or an unrelated event is not yet known — it
+requires physical access to resolve, and is recorded here rather than left
+undocumented so the next session picks up the actual state rather than an
+assumed-clean one.

@@ -30,6 +30,21 @@ abort. [docs/redesign-plan.md](redesign-plan.md) proposes what to do about it.
 > all. Verified on hardware over 23 more cycles: zero coredumps, zero SIGBUS/SIGABRT. Full
 > account in [docs/hardware-test-report.md](hardware-test-report.md). Given the pattern this
 > document itself names, treat this as the current best evidence, not a final closure.
+>
+> **Yet another update, same day, later still**: right on cue, the 23-cycle verdict was also
+> premature. A fresh crash reproduced (Azahar, then Cemu) with the emulator already receiving
+> immediate SIGKILL, which ruled out that fix's own theory. The actual trigger was one level
+> up the stack: `runtime.remove_container()`'s own graceful `podman kill --signal TERM` against
+> the *compositor* container occasionally (not reliably) crashes sway with SIGBUS itself,
+> producing the identical triple-coredump signature previously blamed on the emulator. Fixed by
+> removing the graceful TERM attempt entirely — the container now goes straight to
+> `--signal KILL`. Verified on hardware over 30 more cycles: zero coredumps, zero SIGBUS. Full
+> account in [docs/hardware-test-report.md](hardware-test-report.md#the-emulator-sigkill-fix-was-also-insufficient-the-real-trigger-was-the-compositors-own-graceful-term-2026-08-19-later-still).
+> Validation then moved from scripted teardown signals to real Steam-overlay "Exit Game"
+> navigation, at the user's request, on the reasoning that a script might not exercise the same
+> path a real player does — see that section for where that testing stood when the Steam
+> Machine itself stopped responding to the network. As ever: current best evidence, not a
+> final closure.
 
 Read this alongside [docs/PLAN.md](PLAN.md) (the original design rationale) and
 [docs/hardware-recon.md](hardware-recon.md) (verified hardware facts). Nothing here

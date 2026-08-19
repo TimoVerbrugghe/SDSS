@@ -38,6 +38,22 @@ the hardware evidence for why it destabilizes Steam. This document proposes what
 > Full account in the ["48-cycle verdict was premature"](hardware-test-report.md#the-48-cycle-clean-verdict-above-was-premature-a-new-sigbus-teardown-crash-2026-08-19-later-still)
 > section of docs/hardware-test-report.md. Treat this the way the rest of this document already
 > treats Phase 0: real, verified progress on the evidence gathered so far — not a closed case.
+>
+> **Second correction, same day, later still**: right on cue, the 23-cycle verdict above was
+> also premature. The user reproduced a fresh crash almost immediately after (Azahar, then
+> Cemu) with the emulator-SIGKILL fix already in place, which ruled out that fix's own theory —
+> the emulator's signal handling could not have caused this occurrence. The real trigger turned
+> out to be Phase 0 item 1 itself: `remove_container()`'s graceful `podman kill --signal TERM`
+> occasionally (not reliably) crashes sway with SIGBUS instead of letting it exit cleanly,
+> which is exactly the same triple-coredump signature blamed on the emulator above. The item 1
+> description below is now stale — see its own note — and `remove_container()` goes straight to
+> `--signal KILL` unconditionally. Verified on hardware: 30 more cycles (a 15-cycle Azahar/Cemu
+> hammer test matching the user's exact report, plus 15 cycles of varied 8s–200s sessions),
+> zero coredumps, zero SIGBUS/SIGABRT. Full account in
+> [docs/hardware-test-report.md](hardware-test-report.md#the-emulator-sigkill-fix-was-also-insufficient-the-real-trigger-was-the-compositors-own-graceful-term-2026-08-19-later-still).
+> The user then changed the validation methodology for further cycles from scripted teardown
+> signals to real Steam-overlay "Exit Game" navigation — see that same section for where that
+> stood when the Steam Machine itself stopped responding to the network.
 
 ## The goal, verbatim
 
@@ -175,20 +191,31 @@ regardless of which way this resolves.
 
 **Status: implemented and validated on hardware, 2026-08-19.**
 
-1. **Graceful teardown before force — done.** [`remove_container()`](/Users/timo/Projects/SDSS/host/src/sdss/runtime.py:168)
-   now sends `podman kill --signal TERM` to the container and waits on `podman wait
+1. **Graceful teardown before force — implemented, then reverted; SIGKILL-only is what's
+   actually running.** [`remove_container()`](/Users/timo/Projects/SDSS/host/src/sdss/runtime.py:177)
+   originally sent `podman kill --signal TERM` to the container and waited on `podman wait
    --condition stopped` (bounded to `GRACEFUL_STOP_TIMEOUT = 3.0` seconds) before falling
-   through to the original unconditional `--signal KILL` + `rm --force` backstop, which is
-   unchanged and still guarantees teardown even if the graceful attempt times out. Verified
-   directly on hardware first, in isolation, before writing any code: `podman kill --signal
-   TERM sdss-compositor` against a live session let sway and conmon exit cleanly within 1–3
-   seconds with no hang and nothing left behind — disproving the assumption (never actually
-   tested before) that only an immediate SIGKILL was reliable here. Across the 5-cycle
-   acceptance test below, every teardown completed in ~2 seconds.
-2. **Explicit settle/drain window — done, subsumed by #1.** A separate artificial delay
-   turned out to be unnecessary: `podman wait --condition stopped` only returns once the
-   container's process has actually exited, which is a genuine settle signal (not a guessed
-   timer) already. No additional polling was added.
+   through to the unconditional `--signal KILL` + `rm --force` backstop. That was verified
+   directly on hardware first, in isolation, before writing any code — a single `podman kill
+   --signal TERM sdss-compositor` against a live session let sway and conmon exit cleanly
+   within 1–3 seconds with no hang — and across the 5-cycle acceptance test below, every
+   teardown completed in ~2 seconds this way. **It was later found, from a fresh hardware
+   crash, that the same TERM signal occasionally (not reliably) crashes sway itself with
+   SIGBUS instead of exiting cleanly** — a small sample of manual verification runs cannot
+   distinguish "always safe" from "usually safe," and this one was only usually safe. See the
+   second correction at the top of this document and the full account in
+   [docs/hardware-test-report.md](hardware-test-report.md#the-emulator-sigkill-fix-was-also-insufficient-the-real-trigger-was-the-compositors-own-graceful-term-2026-08-19-later-still).
+   `remove_container()` now sends only the unconditional `--signal KILL` + `rm --force` — no
+   TERM attempt, no wait. `GRACEFUL_STOP_TIMEOUT` was removed along with the `podman wait`
+   step. Verified on hardware across 30 more cycles: zero coredumps, zero SIGBUS.
+2. **Explicit settle/drain window — turned out to be unnecessary, twice over.** The original
+   reasoning was that `podman wait --condition stopped` (item 1) already provided a genuine
+   settle signal, so no additional artificial delay was needed on top of it. Item 1's wait
+   step is now gone too (see above), which removes even that settle signal — and 30 hardware
+   cycles going straight from SIGKILL to `rm --force`, with no wait or delay of any kind in
+   between, still produced zero coredumps. Whatever settling the container needs, waiting for
+   it has not been necessary in practice at either the TERM-then-wait stage or the
+   immediate-SIGKILL stage.
 3. **Drop `--ipc=host` — done.** Removed from
    [`compositor_command()`](/Users/timo/Projects/SDSS/host/src/sdss/runtime.py:459), with a
    regression test (`test_container_does_not_share_the_host_ipc_namespace`) locking in its
