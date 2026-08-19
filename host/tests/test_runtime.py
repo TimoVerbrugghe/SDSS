@@ -224,58 +224,30 @@ class ContainerTeardownTests(unittest.TestCase):
         # A crashed session leaves the container behind and podman refuses to reuse a name.
         self.assertIn("--replace", command)
 
-    def test_remove_container_tries_graceful_term_before_force_kill(self):
-        # A plain SIGKILL never lets sway close its X11 connection to gamescope's per-game
-        # Xwayland cleanly — verified on hardware (docs/architecture.md) that the abrupt
-        # severing is a plausible contributor to Steam-side corruption on the *next* launch.
-        # TERM must be sent, and waited on, before the unconditional KILL/rm backstop.
+    def test_remove_container_sends_sigkill_immediately(self):
+        # Verified on hardware: sending the container --signal TERM first, on the theory
+        # that it lets sway close its X11 connection to gamescope's per-game Xwayland
+        # cleanly, occasionally (not reliably) crashes sway itself with SIGBUS instead,
+        # taking Xwayland and sdss_inputd down with it. A crash is just as abrupt a
+        # disconnect as SIGKILL from the other side's perspective, so the graceful attempt
+        # bought nothing reliable at the cost of an occasional hard crash. Go straight to
+        # SIGKILL.
         with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
             runtime.subprocess, "run"
         ) as run:
             run.return_value = mock.Mock(returncode=0)
             self.assertTrue(runtime.remove_container())
-        self.assertEqual(run.call_count, 4)
+        self.assertEqual(run.call_count, 2)
 
-        term_argv = run.call_args_list[0][0][0]
-        self.assertEqual(term_argv[:2], ["podman", "kill"])
-        self.assertIn("--signal", term_argv)
-        self.assertIn("TERM", term_argv)
-        self.assertIn(runtime.CONTAINER_NAME, term_argv)
-
-        wait_call = run.call_args_list[1]
-        wait_argv = wait_call[0][0]
-        self.assertEqual(wait_argv[:2], ["podman", "wait"])
-        self.assertIn("--ignore", wait_argv)
-        self.assertIn("stopped", wait_argv)
-        self.assertIn(runtime.CONTAINER_NAME, wait_argv)
-        # Must never block the caller indefinitely if the container refuses to stop.
-        self.assertIn("timeout", wait_call[1])
-        self.assertEqual(wait_call[1]["timeout"], runtime.GRACEFUL_STOP_TIMEOUT)
-
-        kill_argv = run.call_args_list[2][0][0]
+        kill_argv = run.call_args_list[0][0][0]
         self.assertEqual(kill_argv[:2], ["podman", "kill"])
+        self.assertIn("--signal", kill_argv)
         self.assertIn("KILL", kill_argv)
+        self.assertNotIn("TERM", kill_argv)
+        self.assertIn(runtime.CONTAINER_NAME, kill_argv)
 
-        rm_argv = run.call_args_list[3][0][0]
+        rm_argv = run.call_args_list[1][0][0]
         self.assertEqual(rm_argv[:2], ["podman", "rm"])
-
-    def test_remove_container_survives_a_graceful_wait_timeout(self):
-        # A container that never stops on TERM must not hang the whole teardown — the
-        # unconditional SIGKILL backstop still has to run.
-        def run_side_effect(argv, **kwargs):
-            if argv[:2] == ["podman", "wait"]:
-                raise runtime.subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
-            return mock.Mock(returncode=0)
-
-        with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
-            runtime.subprocess, "run", side_effect=run_side_effect
-        ) as run:
-            self.assertTrue(runtime.remove_container())
-        argv_sequence = [call[0][0][:2] for call in run.call_args_list]
-        self.assertEqual(
-            argv_sequence,
-            [["podman", "kill"], ["podman", "wait"], ["podman", "kill"], ["podman", "rm"]],
-        )
 
     def test_remove_container_force_removes_by_name(self):
         with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
@@ -283,14 +255,14 @@ class ContainerTeardownTests(unittest.TestCase):
         ) as run:
             run.return_value = mock.Mock(returncode=0)
             self.assertTrue(runtime.remove_container())
-        self.assertEqual(run.call_count, 4)
-        kill_argv = run.call_args_list[2][0][0]
+        self.assertEqual(run.call_count, 2)
+        kill_argv = run.call_args_list[0][0][0]
         self.assertEqual(kill_argv[:2], ["podman", "kill"])
         self.assertIn("--signal", kill_argv)
         self.assertIn("KILL", kill_argv)
         self.assertIn(runtime.CONTAINER_NAME, kill_argv)
         self.assertNotIn("--ignore", kill_argv)
-        argv = run.call_args_list[3][0][0]
+        argv = run.call_args_list[1][0][0]
         self.assertEqual(argv[:2], ["podman", "rm"])
         self.assertIn("--force", argv)
         # Removing an already-gone container must not be reported as a failure.

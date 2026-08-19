@@ -174,11 +174,8 @@ def image_present() -> bool:
     return result.returncode == 0
 
 
-GRACEFUL_STOP_TIMEOUT = 3.0
-
-
 def remove_container(name: str = CONTAINER_NAME) -> bool:
-    """Gracefully stop, then force-kill and remove, the compositor container.
+    """Force-kill and remove the compositor container.
 
     Terminating the `podman run` process is not enough: conmon supervises the container in
     its own process and, together with fuse-overlayfs and the nested Xwayland, keeps running
@@ -186,33 +183,22 @@ def remove_container(name: str = CONTAINER_NAME) -> bool:
     non-empty scope as the game still running, so the next launch is refused with "Game
     already running" until those are reaped. Verified on hardware.
 
-    A plain SIGKILL (the only signal this sent before) never gives sway a chance to close its
-    X11 connection to gamescope's per-game Xwayland — the kernel just drops the socket. That
-    connection is exactly what Steam's own client watches this compositor generation through
-    (see docs/architecture.md), so an abrupt severing rather than a clean protocol disconnect
-    is a plausible contributor to the Steam-side corruption documented there. `--signal TERM`
-    is tried first and bounded by a short `podman wait`; verified on hardware that this exits
-    within about a second and does not hang or leave conmon behind (the concern the original
-    force-first approach was written to avoid). The unconditional SIGKILL below is kept
-    exactly as before as a backstop — if the graceful attempt didn't finish in time, or the
-    container was already gone, it and the following `rm --force` are harmless no-ops.
+    This used to try `--signal TERM` first, bounded by a short `podman wait`, on the theory
+    that a plain SIGKILL never gives sway a chance to close its X11 connection to gamescope's
+    per-game Xwayland cleanly, and that the abrupt severing was a plausible contributor to the
+    Steam-side corruption documented in docs/architecture.md. That theory was never proven,
+    and hardware testing found something worse than an unproven theory: sending the container
+    `--signal TERM` occasionally (not reliably) makes sway itself crash with SIGBUS within a
+    few hundred milliseconds, taking Xwayland and sdss_inputd down with it (a triple coredump,
+    reproduced twice — once with the emulator's own SIGTERM handling also implicated, once
+    with the emulator already reaped by SIGKILL beforehand, ruling that out as the cause). A
+    crash is not a clean protocol disconnect either — the kernel closes the socket the same
+    abrupt way SIGKILL would have — so the graceful attempt was buying, at best, an
+    occasional clean disconnect at the cost of an occasional hard crash, not a reliable
+    improvement over SIGKILL. Going straight to SIGKILL removes that crash mode entirely.
     """
     if not podman_available():
         return False
-    subprocess.run(
-        ["podman", "kill", "--signal", "TERM", name],
-        capture_output=True,
-        check=False,
-    )
-    try:
-        subprocess.run(
-            ["podman", "wait", "--ignore", "--condition", "stopped", name],
-            capture_output=True,
-            check=False,
-            timeout=GRACEFUL_STOP_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        pass
     # The compositor uses --pid=host, so sway is not necessarily in podman's client process
     # group. Kill the container first; otherwise `rm --force` can hang or leave conmon behind.
     subprocess.run(
