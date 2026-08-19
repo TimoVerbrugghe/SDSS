@@ -24,6 +24,20 @@ the hardware evidence for why it destabilizes Steam. This document proposes what
 > each, varied timing) then ran for 2.5 hours with zero crashes before being interrupted by
 > the *orchestrating machine* going to sleep — not a Steam Machine or SDSS failure. Full
 > account in [docs/hardware-test-report.md](hardware-test-report.md).
+>
+> **Correction, same day, later**: the 48-cycle "zero crashes" verdict above was premature.
+> Minutes after it was reported, the user's own manual testing (Cemu → Exit Game → Azahar)
+> reproduced the same OOM abort. Journal forensics found a genuinely new failure mode: the
+> *preceding* session's teardown crashed sway, Xwayland and sdss_inputd with SIGBUS, seemingly
+> triggered by Azahar occasionally (not always) reacting to SIGTERM within milliseconds
+> instead of ignoring it for its usual 5 seconds — the fast reaction crashes instead of
+> exiting, corrupting shared GPU state that the compositor stack then also crashes on. Fixed
+> by sending the emulator SIGKILL immediately instead of SIGTERM, so it never gets a chance to
+> run that crash-prone signal handling at all. Verified on hardware: 23 more cycles (both
+> emulators, 8s–200s sessions, rapid back-to-back restarts), zero coredumps, zero SIGBUS/SIGABRT.
+> Full account in the ["48-cycle verdict was premature"](hardware-test-report.md#the-48-cycle-clean-verdict-above-was-premature-a-new-sigbus-teardown-crash-2026-08-19-later-still)
+> section of docs/hardware-test-report.md. Treat this the way the rest of this document already
+> treats Phase 0: real, verified progress on the evidence gathered so far — not a closed case.
 
 ## The goal, verbatim
 

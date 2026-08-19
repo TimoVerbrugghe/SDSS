@@ -707,3 +707,79 @@ Full detail and the updated Phase 1/2 status are in
 
 All 288 host tests pass, including two new regression tests (the parent-watch
 race, and the `steam_overlay` default flipping back to `True` for Azahar).
+
+### The 48-cycle "clean" verdict above was premature: a new SIGBUS teardown crash (2026-08-19, later still)
+
+Minutes after the 48-cycle run above was declared clean, the user's own manual
+testing reproduced a fresh crash: Cemu (Wind Waker HD) via Steam's "Exit Game",
+wait for the home screen, then Azahar (A Link Between Worlds) — which hit the
+same "cannot allocate memory for thread-local data" abort about 43 seconds
+after launch. The user was right to push back on the "verified fixed" framing;
+Phase 0 was real but incomplete.
+
+Journal forensics on the window around the crash found a failure mode never
+seen before in this project: the session immediately *preceding* the crashing
+one (Animal Crossing: New Leaf via Azahar, launched 16:54:12) received its
+normal SIGINT at 16:56:58 — and during that teardown, `sway`, `Xwayland` and
+`sdss_inputd` **all crashed with SIGBUS (signal 7)** within about 300ms of
+each other, immediately after Azahar itself (`AppRun.wrapped`) crashed with
+SIGABRT — all within roughly 150ms of the SIGINT, with coredumps generated
+for all four processes. sway's own coredump backtrace was inside
+`libgallium` (Mesa's GPU driver), consistent with a shared GPU buffer
+becoming invalid mid-access. The Cemu and Azahar sessions that followed and
+eventually hit the classic OOM abort both started *after* this SIGBUS
+teardown, making it the leading suspect for whatever the OOM abort's
+proximate corruption actually is.
+
+A controlled hardware reproduction — launch Azahar via the real Steam
+shortcut, play for a realistic ~183s, then `kill -INT` the `sdss` process
+exactly as Steam's "Exit Game" does — came back clean on the first attempt,
+but its *timing* explained the crash: the emulator did not react to SIGTERM
+at all for the full 5s timeout already in `Session._terminate_process`, then
+got SIGKILL'd, and that teardown was clean throughout. In the crashed run,
+by contrast, the container-kill event fired only ~4ms after the SIGINT,
+meaning the reversed emulator → Sunshine → sway teardown loop had already
+run to completion in single-digit milliseconds. The only way that loop
+finishes that fast is if the emulator itself exited (crashed) almost
+instantly instead of ignoring SIGTERM for its usual 5 seconds — matching the
+already-documented but previously unexplained fact that Azahar does not
+shut down reliably on SIGTERM. It usually just ignores it (safe: SIGKILL
+after 5s), but evidently not always — and the rare fast reaction is what let
+it, and through shared GPU state sway/Xwayland/sdss_inputd, crash inside
+its own signal handling rather than being reaped cleanly by the kernel.
+
+The fix: `Session._terminate_process()` now takes a `graceful` flag, and
+`cleanup()` passes `graceful=False` for the tracked emulator process
+specifically, sending SIGKILL immediately instead of SIGTERM. sway and
+Sunshine keep their existing graceful SIGTERM-first behaviour, which has
+never shown this failure mode. SIGKILL never runs any of the target's own
+signal handling, so the emulator can no longer take the fast, crash-prone
+path at all — it is reaped by the kernel the same way the safe, slow path
+already was, just without the 5-second wait.
+
+Verified on hardware: 23 consecutive launch/play/teardown cycles across both
+Azahar and Cemu, with session lengths from 8s to 200s (including several
+rapid back-to-back restarts 8-15s apart, and multiple realistic-length
+sessions past 150s), produced **zero coredumps and zero SIGBUS/SIGABRT
+journal entries**. Teardown time became a consistent ~507ms every single
+cycle, replacing the previous race between ~4ms (crash-prone, when the
+emulator reacted) and 5s+ (safe but slow, when it didn't).
+
+This is strong evidence, not absolute proof — the original failure was
+probabilistic, not deterministic, and 23 clean cycles cannot rule out a
+rarer trigger the same way 47/48 clean cycles didn't rule out this one. What
+it does provide is a concrete, previously-undocumented crash mechanism (a
+GPU-resource race between the emulator's SIGTERM handling and the compositor
+stack), a fix that removes that specific mechanism rather than papering over
+its symptom, and repeated fresh hardware confirmation. Any future recurrence
+of the OOM abort should be checked first for whether it was preceded by a
+*different* session's teardown crashing — that correlation is what broke
+this case open, and journal evidence from the emulator's exact reaction time
+to SIGTERM (fast vs. the full 5s timeout) is the fastest way to tell whether
+this specific mechanism is involved again.
+
+All 291 host tests pass, including three new regression tests: the emulator
+receiving SIGKILL immediately in `cleanup()`, the compositor still receiving
+graceful SIGTERM first, and `_terminate_process(graceful=False)` never
+sending SIGTERM to any target. Each was confirmed to fail against the
+pre-fix code before being confirmed to pass against the fix.

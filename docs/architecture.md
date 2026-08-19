@@ -18,6 +18,18 @@ abort. [docs/redesign-plan.md](redesign-plan.md) proposes what to do about it.
 > remain accurate as a historical/diagnostic record; they no longer describe the live
 > behavior of the current codebase. See the redesign plan's status update for what's still
 > outstanding (goal 3's process-count gap, not a crash risk).
+>
+> **Further update, same day, later**: true to this document's own opening observation — "a
+> new proximate cause every time, the same abort every time" — the crash recurred after a
+> 48-cycle acceptance test had declared Phase 0 sufficient. The new proximate cause this time:
+> sway, Xwayland and sdss_inputd crashing with SIGBUS during a *different* session's teardown,
+> apparently triggered when Azahar's SIGTERM handling occasionally (not reliably) reacts within
+> milliseconds instead of ignoring the signal, crashing instead of exiting and corrupting
+> shared GPU state the compositor stack then also crashes on. Fixed by sending the emulator
+> SIGKILL immediately rather than SIGTERM, removing its chance to run that signal handling at
+> all. Verified on hardware over 23 more cycles: zero coredumps, zero SIGBUS/SIGABRT. Full
+> account in [docs/hardware-test-report.md](hardware-test-report.md). Given the pattern this
+> document itself names, treat this as the current best evidence, not a final closure.
 
 Read this alongside [docs/PLAN.md](PLAN.md) (the original design rationale) and
 [docs/hardware-recon.md](hardware-recon.md) (verified hardware facts). Nothing here
