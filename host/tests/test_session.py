@@ -326,6 +326,55 @@ class CleanupContainerTests(unittest.TestCase):
             ],
         )
 
+    def test_cleanup_kills_compositor_before_sunshine_or_anything_else(self):
+        """The compositor must die immediately after the emulator, not after Sunshine.
+
+        Verified on hardware, 100%-reproducible: launch a needs_x11 profile, run ~20s,
+        exit via the Steam overlay. sway/Xwayland crash with SIGBUS every time (signal 7,
+        confirmed via systemd-coredump's own log line), even though the emulator already
+        gets SIGKILL immediately. The exposure is how long the compositor stays alive
+        *after* the emulator disappears -- with Sunshine's own graceful shutdown sitting
+        between them, that window is wider than it needs to be. Assert the order
+        directly: emulator, then compositor, then Sunshine/anything else -- not emulator,
+        Sunshine, compositor, which is what shipped before this test existed.
+        """
+        session = Session(profile=AZAHAR, command=["azahar"])
+        compositor = mock.Mock()
+        compositor.poll.return_value = None
+        compositor.pid = 1111
+        sunshine = mock.Mock()
+        sunshine.poll.return_value = None
+        sunshine.pid = 3333
+        emulator = mock.Mock()
+        emulator.poll.return_value = None
+        emulator.pid = 2222
+        # Startup order: compositor, sunshine, emulator (matches _start_sway/_start_sunshine/
+        # _start_emulator's own append order).
+        session._processes.extend([compositor, sunshine, emulator])
+        session._compositor_proc = compositor
+        session._emulator_proc = emulator
+        calls: list[tuple[str, int | None, bool | None]] = []
+
+        def terminate(proc, *, graceful=True):
+            calls.append(("terminate", proc.pid, graceful))
+            proc.poll.return_value = 0
+
+        with mock.patch("sdss.session.runtime.native_sway", return_value=None), mock.patch(
+            "sdss.session.runtime.remove_container",
+            side_effect=lambda: calls.append(("remove_container", None, None)),
+        ), mock.patch.object(Session, "_terminate_process", side_effect=terminate):
+            session.cleanup()
+
+        self.assertEqual(
+            calls,
+            [
+                ("terminate", 2222, False),
+                ("remove_container", None, None),
+                ("terminate", 1111, False),
+                ("terminate", 3333, True),
+            ],
+        )
+
     def test_terminate_process_kills_descendants_outside_process_group(self):
         process = mock.Mock()
         process.pid = 1234

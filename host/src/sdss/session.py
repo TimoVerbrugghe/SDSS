@@ -172,14 +172,16 @@ class Session:
         needs this: Azahar does not shut down reliably on SIGTERM. Usually it just
         ignores it for the full 5s timeout below (harmless — the SIGKILL escalation
         handles that), but verified on hardware that it occasionally reacts within
-        milliseconds instead, and that fast reaction is what correlates with sway,
-        Xwayland and sdss_inputd then crashing with SIGBUS moments later — a triple
-        coredump within ~300ms of the fast exit, immediately followed by the classic
-        Steam allocator abort in the *next* session. A repeated hardware test that let
-        the same signal sequence run its full 5s course (i.e. the emulator never
-        reacted to SIGTERM at all) produced a clean teardown every time. A plain SIGKILL
-        never gives the emulator's own signal handling a chance to run, which is the
-        one path confirmed clean.
+        milliseconds instead, and that fast reaction correlates with sway, Xwayland and
+        sdss_inputd then crashing with SIGBUS moments later.
+
+        SIGKILL to the emulator does *not* eliminate that crash on its own, though —
+        verified on hardware again later (a fresh, 100%-reproducible test: launch, wait
+        ~20s, exit via the Steam overlay): sway/Xwayland still crash with SIGBUS even
+        though the emulator already gets SIGKILL immediately here. The remaining exposure
+        is *how long Xwayland stays alive after* the emulator (its GPU-rendering client)
+        disappears abruptly — see cleanup()'s ordering, which now tears the compositor
+        down immediately after the emulator instead of after Sunshine's own shutdown.
         """
         first_signal = signal.SIGTERM if graceful else signal.SIGKILL
         descendants = Session._descendant_pids(proc.pid)
@@ -384,17 +386,33 @@ class Session:
         return keepalive_fd, child_fd
 
     def cleanup(self) -> None:
+        """Tear the session down: emulator, then compositor, then everything else.
+
+        Verified on hardware, 100%-reproducible: launch a needs_x11 profile (Cemu or
+        Azahar), let it run ~20s, exit via the Steam overlay. sway and Xwayland crash
+        with SIGBUS every time — signal 7, confirmed via systemd-coredump's own log line
+        (though the dump itself never becomes readable through coredumpctl, so this does
+        not show up as a listed coredump; Steam's own minidump generator also fails on
+        it). The crash correlates with the compositor staying alive after the emulator,
+        its GPU-rendering client, disappears — not with *how* the emulator is killed
+        (SIGKILL here already, per _terminate_process's docstring) but with what happens
+        *after*: the previous ordering ran Sunshine's own shutdown between "emulator
+        dead" and "compositor dead", stretching that window every time. The compositor
+        (sway/Xwayland/sdss_inputd) is now torn down immediately after the emulator,
+        before Sunshine or anything else, to close that window as much as SDSS's own
+        code can. Not yet re-verified crash-free on hardware after this change — treat
+        the ordering as the current best hypothesis, not a confirmed fix.
+        """
         compositor_proc = self._compositor_proc
+        emulator_proc = self._emulator_proc
         uses_native_sway = runtime.native_sway() is not None
-        for proc in reversed(self._processes):
-            if proc.poll() is None:
-                if proc is compositor_proc and not uses_native_sway:
-                    continue
-                self._terminate_process(proc, graceful=proc is not self._emulator_proc)
-        self._processes.clear()
-        self._emulator_proc = None
-        self._compositor_proc = None
+
+        if emulator_proc is not None and emulator_proc.poll() is None:
+            self._terminate_process(emulator_proc, graceful=False)
+
         if uses_native_sway:
+            if compositor_proc is not None and compositor_proc.poll() is None:
+                self._terminate_process(compositor_proc, graceful=True)
             runtime.reap_orphaned_helpers()
         else:
             # Do not terminate the local `podman run` child first. With `--rm`, even that can
@@ -407,6 +425,18 @@ class Session:
                 log.warning("could not remove compositor container: %s", exc)
             if compositor_proc is not None and compositor_proc.poll() is None:
                 self._terminate_process(compositor_proc, graceful=False)
+
+        # Everything else (currently just Sunshine) gets its ordinary graceful shutdown
+        # only now — after the emulator/compositor pair that must die back-to-back.
+        for proc in reversed(self._processes):
+            if proc is emulator_proc or proc is compositor_proc:
+                continue
+            if proc.poll() is None:
+                self._terminate_process(proc, graceful=True)
+
+        self._processes.clear()
+        self._emulator_proc = None
+        self._compositor_proc = None
         if self._pin_keepalive_fd is not None:
             os.close(self._pin_keepalive_fd)
             self._pin_keepalive_fd = None
