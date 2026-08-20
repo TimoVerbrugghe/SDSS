@@ -213,18 +213,22 @@ def remove_container(name: str = CONTAINER_NAME) -> bool:
     # Must run before `podman kill` and `rm --force`: it kills sway/Xwayland/sdss_inputd and
     # confirms they are actually gone before Podman can remove the rootfs their code is still
     # demand-paged from.
+    log.info("remove_container(%s): calling reap_orphaned_helpers", name)
     reap_orphaned_helpers(name)
+    log.info("remove_container(%s): calling podman kill", name)
     subprocess.run(
         ["podman", "kill", "--signal", "KILL", name],
         capture_output=True,
         check=False,
     )
+    log.info("remove_container(%s): calling podman rm", name)
     result = subprocess.run(
         ["podman", "rm", "--force", "--ignore", name],
         capture_output=True,
         check=False,
     )
     _repair_invalid_podman_pause()
+    log.info("remove_container(%s): done, rm returncode=%s", name, result.returncode)
     return result.returncode == 0
 
 
@@ -289,12 +293,41 @@ def reap_orphaned_helpers(name: str = CONTAINER_NAME) -> None:
         elif is_named_container or is_sdss_overlay or is_launch_pause:
             supervisors.append(pid)
 
+    # Diagnostic breadcrumbs: two separate hardware reproductions have shown sway/Xwayland
+    # still crashing with SIGBUS during ordinary teardown despite this function's ordering
+    # being correct in principle, and neither reproduction left a readable coredump to
+    # explain why. These lines are the ground truth for whether classification/timing here
+    # is actually behaving as designed on the next occurrence, instead of inferring it from
+    # indirect journal noise after the fact.
+    log.info(
+        "reap_orphaned_helpers(%s): launch_cgroup=%s rootfs_clients=%s supervisors=%s",
+        name,
+        launch_cgroup,
+        rootfs_clients,
+        supervisors,
+    )
+
     for pid in rootfs_clients:
         try:
             os.kill(pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
+        except (ProcessLookupError, PermissionError) as exc:
+            log.info("reap_orphaned_helpers: pid %s already gone before SIGKILL (%s)", pid, exc)
             continue
-    _await_process_exit(rootfs_clients, timeout=2.0)
+    wait_start = time.monotonic()
+    still_alive = _await_process_exit(rootfs_clients, timeout=2.0)
+    wait_elapsed = time.monotonic() - wait_start
+    if still_alive:
+        log.warning(
+            "reap_orphaned_helpers: TIMED OUT after %.2fs waiting for rootfs_clients=%s "
+            "to exit -- proceeding to kill supervisors anyway, which is exactly the race "
+            "this function exists to avoid",
+            wait_elapsed,
+            sorted(still_alive),
+        )
+    else:
+        log.info(
+            "reap_orphaned_helpers: confirmed all rootfs_clients gone after %.2fs", wait_elapsed
+        )
 
     for pid in supervisors:
         try:
@@ -303,13 +336,17 @@ def reap_orphaned_helpers(name: str = CONTAINER_NAME) -> None:
             continue
 
 
-def _await_process_exit(pids: list[int], timeout: float) -> None:
+def _await_process_exit(pids: list[int], timeout: float) -> set[int]:
     """Poll until none of ``pids`` are still alive, or ``timeout`` elapses.
 
     A SIGKILL does not mean the target has already stopped running -- the kernel needs a
     scheduling opportunity to deliver it. See reap_orphaned_helpers for why the caller must
     not proceed to remove the container's storage until these PIDs are actually confirmed
     gone, not merely signaled.
+
+    Returns whichever PIDs are still present when this returns (empty on a clean exit,
+    non-empty if the deadline was hit first) so the caller can log the difference between
+    "confirmed dead" and "gave up waiting" -- the two look identical without this.
     """
     deadline = time.monotonic() + timeout
     remaining = set(pids)
@@ -317,6 +354,7 @@ def _await_process_exit(pids: list[int], timeout: float) -> None:
         remaining = {pid for pid in remaining if Path(f"/proc/{pid}").exists()}
         if remaining:
             time.sleep(0.02)
+    return remaining
 
 
 def _belongs_to_cgroup(pid: int, parent: str | None) -> bool:
