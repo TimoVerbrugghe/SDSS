@@ -237,7 +237,7 @@ class ContainerTeardownTests(unittest.TestCase):
         ) as run:
             run.return_value = mock.Mock(returncode=0)
             self.assertTrue(runtime.remove_container())
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 3)
 
         kill_argv = run.call_args_list[0][0][0]
         self.assertEqual(kill_argv[:2], ["podman", "kill"])
@@ -248,6 +248,7 @@ class ContainerTeardownTests(unittest.TestCase):
 
         rm_argv = run.call_args_list[1][0][0]
         self.assertEqual(rm_argv[:2], ["podman", "rm"])
+        self.assertEqual(run.call_args_list[2][0][0], ["podman", "ps", "-a"])
 
     def test_remove_container_force_removes_by_name(self):
         with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
@@ -255,7 +256,7 @@ class ContainerTeardownTests(unittest.TestCase):
         ) as run:
             run.return_value = mock.Mock(returncode=0)
             self.assertTrue(runtime.remove_container())
-        self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_count, 3)
         kill_argv = run.call_args_list[0][0][0]
         self.assertEqual(kill_argv[:2], ["podman", "kill"])
         self.assertIn("--signal", kill_argv)
@@ -268,6 +269,7 @@ class ContainerTeardownTests(unittest.TestCase):
         # Removing an already-gone container must not be reported as a failure.
         self.assertIn("--ignore", argv)
         self.assertIn(runtime.CONTAINER_NAME, argv)
+        self.assertEqual(run.call_args_list[2][0][0], ["podman", "ps", "-a"])
 
     def test_remove_container_is_a_noop_without_podman(self):
         with mock.patch.object(runtime, "podman_available", return_value=False), mock.patch.object(
@@ -305,8 +307,10 @@ class ContainerTeardownTests(unittest.TestCase):
             runtime, "reap_orphaned_helpers", side_effect=lambda *a, **k: calls.append("reap")
         ):
             runtime.remove_container()
-        # [reap_orphaned_helpers, "podman kill", "podman rm --force"]
-        self.assertEqual(calls, ["reap", "subprocess.run", "subprocess.run"])
+        # [reap_orphaned_helpers, "podman kill", "podman rm --force", "podman ps -a"]
+        self.assertEqual(
+            calls, ["reap", "subprocess.run", "subprocess.run", "subprocess.run"]
+        )
 
     def test_reap_orphaned_helpers_kills_named_processes(self):
         with mock.patch.object(runtime.os, "listdir", return_value=["123", "456"]), mock.patch.object(
@@ -514,6 +518,36 @@ class ContainerTeardownTests(unittest.TestCase):
         ), mock.patch.object(runtime.os, "kill") as kill:
             runtime.reap_orphaned_helpers()
         kill.assert_not_called()
+
+    def test_repair_invalid_podman_pause_runs_only_for_pause_status_error(self):
+        invalid = mock.Mock(
+            returncode=125,
+            stdout="",
+            stderr='invalid internal status, try resetting the pause process with "podman system migrate"',
+        )
+        repaired = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(runtime.subprocess, "run", side_effect=[invalid, repaired]) as run:
+            runtime._repair_invalid_podman_pause()
+        self.assertEqual(
+            run.call_args_list,
+            [
+                mock.call(["podman", "ps", "-a"], capture_output=True, text=True, check=False),
+                mock.call(
+                    ["podman", "system", "migrate"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ),
+            ],
+        )
+
+    def test_repair_invalid_podman_pause_ignores_other_podman_errors(self):
+        other = mock.Mock(returncode=125, stdout="", stderr="cannot connect")
+        with mock.patch.object(runtime.subprocess, "run", return_value=other) as run:
+            runtime._repair_invalid_podman_pause()
+        run.assert_called_once_with(
+            ["podman", "ps", "-a"], capture_output=True, text=True, check=False
+        )
 
     def test_reap_orphaned_helpers_unmounts_sdss_appimage_mounts(self):
         mountinfo = (

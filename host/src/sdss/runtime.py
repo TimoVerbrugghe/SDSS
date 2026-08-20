@@ -224,6 +224,7 @@ def remove_container(name: str = CONTAINER_NAME) -> bool:
         capture_output=True,
         check=False,
     )
+    _repair_invalid_podman_pause()
     return result.returncode == 0
 
 
@@ -353,6 +354,24 @@ def _podman_pause_pid() -> int | None:
         return int((runtime_dir / "libpod/tmp/pause.pid").read_text().strip())
     except (OSError, ValueError):
         return None
+
+
+def _repair_invalid_podman_pause() -> None:
+    result = subprocess.run(
+        ["podman", "ps", "-a"], capture_output=True, text=True, check=False
+    )
+    if result.returncode == 0:
+        return
+    message = f"{result.stdout}\n{result.stderr}"
+    if "invalid internal status" not in message or "podman system migrate" not in message:
+        return
+    repaired = subprocess.run(
+        ["podman", "system", "migrate"], capture_output=True, text=True, check=False
+    )
+    if repaired.returncode != 0:
+        log.warning(
+            "could not repair rootless Podman pause status: %s", repaired.stderr.strip()
+        )
 
 
 def reap_orphaned_appimage_mounts() -> None:
