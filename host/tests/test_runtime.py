@@ -526,19 +526,51 @@ class ContainerTeardownTests(unittest.TestCase):
             stderr='invalid internal status, try resetting the pause process with "podman system migrate"',
         )
         repaired = mock.Mock(returncode=0, stdout="", stderr="")
-        with mock.patch.object(runtime.subprocess, "run", side_effect=[invalid, repaired]) as run:
+        with mock.patch.object(runtime.subprocess, "run", side_effect=[invalid, repaired]) as run, (
+            mock.patch.object(runtime.shutil, "which", return_value="/usr/bin/systemd-run")
+        ):
             runtime._repair_invalid_podman_pause()
         self.assertEqual(
             run.call_args_list,
             [
                 mock.call(["podman", "ps", "-a"], capture_output=True, text=True, check=False),
                 mock.call(
-                    ["podman", "system", "migrate"],
+                    [
+                        "systemd-run",
+                        "--user",
+                        "--wait",
+                        "--collect",
+                        "--unit=sdss-podman-migrate",
+                        "podman",
+                        "system",
+                        "migrate",
+                    ],
                     capture_output=True,
                     text=True,
                     check=False,
                 ),
             ],
+        )
+
+    def test_repair_invalid_podman_pause_falls_back_without_systemd_run(self):
+        invalid = mock.Mock(
+            returncode=125,
+            stdout="",
+            stderr='invalid internal status, try resetting the pause process with "podman system migrate"',
+        )
+        repaired = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(runtime.subprocess, "run", side_effect=[invalid, repaired]) as run, (
+            mock.patch.object(runtime.shutil, "which", return_value=None)
+        ):
+            runtime._repair_invalid_podman_pause()
+        self.assertEqual(
+            run.call_args_list[1],
+            mock.call(
+                ["podman", "system", "migrate"],
+                capture_output=True,
+                text=True,
+                check=False,
+            ),
         )
 
     def test_repair_invalid_podman_pause_ignores_other_podman_errors(self):

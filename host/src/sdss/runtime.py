@@ -365,9 +365,17 @@ def _repair_invalid_podman_pause() -> None:
     message = f"{result.stdout}\n{result.stderr}"
     if "invalid internal status" not in message or "podman system migrate" not in message:
         return
-    repaired = subprocess.run(
-        ["podman", "system", "migrate"], capture_output=True, text=True, check=False
-    )
+    command = ["podman", "system", "migrate"]
+    if shutil.which("systemd-run"):
+        command = [
+            "systemd-run",
+            "--user",
+            "--wait",
+            "--collect",
+            "--unit=sdss-podman-migrate",
+            *command,
+        ]
+    repaired = subprocess.run(command, capture_output=True, text=True, check=False)
     if repaired.returncode != 0:
         log.warning(
             "could not repair rootless Podman pause status: %s", repaired.stderr.strip()
