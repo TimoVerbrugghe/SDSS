@@ -286,6 +286,46 @@ class CleanupContainerTests(unittest.TestCase):
         killpg.assert_any_call(1111, signal.SIGTERM)
         killpg.assert_any_call(2222, signal.SIGKILL)
 
+    def test_cleanup_removes_container_before_touching_podman_wrapper(self):
+        """The local podman child must not be signaled before rootfs clients are reaped.
+
+        Verified on hardware: Steam overlay Exit Game sends SIGINT to SDSS, cleanup() used
+        to SIGTERM the tracked `podman run` process before calling remove_container(). With
+        `--rm`, that let conmon start tearing down fuse-overlayfs while sway, Xwayland and
+        sdss_inputd were still demand-paging from it, reproducing the triple SIGBUS even
+        though remove_container() itself had the correct internal ordering.
+        """
+        session = Session(profile=AZAHAR, command=["azahar"])
+        compositor = mock.Mock()
+        compositor.poll.return_value = None
+        compositor.pid = 1111
+        emulator = mock.Mock()
+        emulator.poll.return_value = None
+        emulator.pid = 2222
+        session._processes.extend([compositor, emulator])
+        session._compositor_proc = compositor
+        session._emulator_proc = emulator
+        calls: list[tuple[str, int | None, bool | None]] = []
+
+        def terminate(proc, *, graceful=True):
+            calls.append(("terminate", proc.pid, graceful))
+            proc.poll.return_value = 0
+
+        with mock.patch("sdss.session.runtime.native_sway", return_value=None), mock.patch(
+            "sdss.session.runtime.remove_container",
+            side_effect=lambda: calls.append(("remove_container", None, None)),
+        ), mock.patch.object(Session, "_terminate_process", side_effect=terminate):
+            session.cleanup()
+
+        self.assertEqual(
+            calls,
+            [
+                ("terminate", 2222, False),
+                ("remove_container", None, None),
+                ("terminate", 1111, False),
+            ],
+        )
+
     def test_terminate_process_kills_descendants_outside_process_group(self):
         process = mock.Mock()
         process.pid = 1234

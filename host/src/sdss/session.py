@@ -37,6 +37,7 @@ class Session:
     dry_run: bool = False
     _processes: list[subprocess.Popen] = field(default_factory=list, repr=False)
     _emulator_proc: subprocess.Popen | None = field(default=None, repr=False)
+    _compositor_proc: subprocess.Popen | None = field(default=None, repr=False)
     _pin_keepalive_fd: int | None = field(default=None, repr=False)
     _signal_handlers: dict[int, object] = field(default_factory=dict, repr=False)
     _stopping: bool = field(default=False, repr=False)
@@ -123,8 +124,6 @@ class Session:
                 emulator = self._start_emulator(nested)
                 code = emulator.wait()
                 log.info("emulator exited with %s — tearing down the session", code)
-                if sway_proc.poll() is None:
-                    self._terminate_process(sway_proc)
                 return code
             finally:
                 self._stopping = True
@@ -309,6 +308,7 @@ class Session:
         except OSError as exc:
             raise SessionError(f"could not start compositor {command[0]!r}: {exc}") from exc
         self._processes.append(proc)
+        self._compositor_proc = proc
         return proc
 
     def _await_nested_display(self, env_file: Path) -> dict[str, str]:
@@ -384,20 +384,29 @@ class Session:
         return keepalive_fd, child_fd
 
     def cleanup(self) -> None:
+        compositor_proc = self._compositor_proc
+        uses_native_sway = runtime.native_sway() is not None
         for proc in reversed(self._processes):
             if proc.poll() is None:
+                if proc is compositor_proc and not uses_native_sway:
+                    continue
                 self._terminate_process(proc, graceful=proc is not self._emulator_proc)
         self._processes.clear()
         self._emulator_proc = None
-        runtime.reap_orphaned_helpers()
-        # `podman run` is a child, but conmon, fuse-overlayfs and the nested Xwayland are not.
-        # Asking podman to remove the container reaps those remaining container processes.
-        if not runtime.native_sway():
+        self._compositor_proc = None
+        if uses_native_sway:
+            runtime.reap_orphaned_helpers()
+        else:
+            # Do not terminate the local `podman run` child first. With `--rm`, even that can
+            # make conmon begin container teardown before sway/Xwayland/sdss_inputd are gone.
+            # remove_container() owns that ordering: direct rootfs clients first, then Podman.
             try:
                 runtime.remove_container()
             except OSError as exc:
                 # cleanup() runs from a `finally`; never let teardown replace the real error.
                 log.warning("could not remove compositor container: %s", exc)
+            if compositor_proc is not None and compositor_proc.poll() is None:
+                self._terminate_process(compositor_proc, graceful=False)
         if self._pin_keepalive_fd is not None:
             os.close(self._pin_keepalive_fd)
             self._pin_keepalive_fd = None
