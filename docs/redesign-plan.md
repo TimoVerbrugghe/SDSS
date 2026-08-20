@@ -54,6 +54,27 @@ the hardware evidence for why it destabilizes Steam. This document proposes what
 > The user then changed the validation methodology for further cycles from scripted teardown
 > signals to real Steam-overlay "Exit Game" navigation — see that same section for where that
 > stood when the Steam Machine itself stopped responding to the network.
+>
+> **Third correction, 2026-08-21, after the network outage**: real "Exit Game" testing resumed
+> and reproduced the abort on essentially every cycle, at a much higher rate than any prior
+> occurrence, with the SIGBUS mechanisms above confirmed gone for good. Four independent,
+> verified fixes (compositor-before-emulator kill order; Sunshine tray icon, log level, and
+> libva log volume all quieted) did not stop it. The actual regression: `reap_orphaned_helpers()`
+> — itself a fix from the correction just above, for a *third* SIGBUS mechanism — kills sway
+> directly with an unconditional, immediate SIGKILL, before `remove_container()`'s `podman kill`
+> even runs. sway has therefore had **zero** opportunity for a graceful X11 disconnect from
+> gamescope's per-game Xwayland since that fix landed, silently reintroducing the exact
+> "ungraceful teardown" condition this document's central hypothesis blames for the Steam-side
+> abort. Fixed by giving sway/Xwayland/sdss_inputd a bounded SIGTERM before
+> `reap_orphaned_helpers()`'s existing SIGKILL — safe to attempt now, unlike when graceful TERM
+> was tried and reverted above, because this round's kill-order fix means the emulator's GPU
+> context is still alive when sway receives it (the previous SIGBUS reproduction always had the
+> emulator dead first). Full account, explicitly marked unverified on hardware, in
+> [docs/hardware-test-report.md](hardware-test-report.md#reap_orphaned_helpers-was-silently-back-to-ungraceful-teardown-a-bounded-sigterm-before-sigkill-2026-08-21).
+> If this does not hold up, the next avenue is the persistent-Sunshine idea noted in the
+> "Later relevance" paragraph of [Phase 2's result](#phase-2--build-the-persistent-second-screen-service-contingent-on-phase-1)
+> below.
+
 
 ## The goal, verbatim
 
@@ -318,13 +339,31 @@ above. A scoped, achievable fix for its motivating symptom was implemented and v
 hardware instead — see below.**
 
 **Later relevance (unrelated symptom, same blocker):** a separate investigation into an
-`srt-logger` (Steam Runtime helper) thread-local-storage exhaustion — which aborts and takes
-the whole Steam client down with it via `steam-launcher.service`'s `KillMode=control-group`
-after repeated rapid SDSS launches — considered "keep the compositor/Sunshine alive across
-launches" as a way to cut the subprocess/log-volume churn per launch. That is the exact
-design blocked by Phase 1's two findings above, so it was not re-attempted; see
-`host/src/sdss/stream.py`'s `render_conf()` for the log-volume mitigations (disabled tray
-icon, `min_log_level = warning`) pursued instead within a single launch's own footprint.
+`srt-logger` (Steam Runtime helper) thread-local-storage/allocator exhaustion — which aborts
+and takes the whole Steam client down with it via `steam-launcher.service`'s
+`KillMode=control-group` after repeated rapid SDSS launches — considered "keep the
+compositor/Sunshine alive across launches" as a way to cut the subprocess/log-volume churn
+per launch. That is the exact design blocked by Phase 1's two findings above, so a *full*
+persistent compositor was not re-attempted; see `host/src/sdss/stream.py`'s `launch_command()`
+and `render_conf()` for the log-volume mitigations (disabled tray icon, `min_log_level =
+warning`, `LIBVA_MESSAGING_LEVEL=1`) pursued instead within a single launch's own footprint,
+and [docs/hardware-test-report.md's 2026-08-21 entries](hardware-test-report.md#real-exit-game-testing-resumed-after-the-outage-four-verified-noise-fixes-no-change-to-the-crash-2026-08-21)
+for why those alone were not sufficient and what was fixed instead (a graceful-teardown
+regression in `reap_orphaned_helpers()`, unrelated to Phase 1/2's compositor-persistence
+question). If a future report shows that fix insufficient too, keeping **Sunshine** — not the
+full compositor — alive across launches remains a real, not-yet-attempted alternative worth
+scoping on its own: unlike sway, Sunshine is not directly constrained by gamescope's
+spinner-dismissal requirement (§the central open question above), so it is not obviously
+blocked by the same wlroots reconnect limitation. It is unverified whether Sunshine's own wlr
+capture backend (`src/platform/linux/wlgrab.cpp` upstream) can reconnect its capture target to
+a *new* compositor generation's `HEADLESS-1` without a full process restart — Sunshine does
+have a `capture_e::reinit` recovery path in `src/video.cpp` for a display disappearing, but it
+was designed for ordinary display hot-plug, not "the entire compositor process died and a new
+one exists at a different socket path" (sway does not honor a fixed `WAYLAND_DISPLAY`, per
+Phase 1 finding 3 above, so the new socket path would also need to reach Sunshine somehow).
+Getting this wrong risks a worse regression (second screen entirely broken) than today's
+intermittent crash, so it needs a hardware spike of its own before any implementation attempt,
+matching this document's own Phase 1 methodology rather than a blind implementation.
 
 While investigating Phase 1, hardware testing surfaced a concrete, distinct reliability gap
 that a persistent Sunshine/compositor would have solved as a side effect: **an

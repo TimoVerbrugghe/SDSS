@@ -319,18 +319,27 @@ class ContainerTeardownTests(unittest.TestCase):
             runtime.Path,
             "read_bytes",
             side_effect=[b"/usr/bin/conmon\0-n\0sdss-compositor\0", b"python\0sdss_inputd.py\0"],
-        ), mock.patch.object(runtime, "_await_process_exit") as await_exit, mock.patch.object(
+        ), mock.patch.object(
+            runtime, "_await_process_exit", return_value=set()
+        ) as await_exit, mock.patch.object(
             runtime.os, "kill"
         ) as kill:
             runtime.reap_orphaned_helpers()
-        # sdss_inputd (456) is a rootfs client: killed and waited for before conmon (123),
-        # its supervisor -- conmon's own exit-command can tear down the storage sdss_inputd
-        # is still demand-paging code from.
+        # sdss_inputd (456) is a rootfs client: given a graceful SIGTERM and confirmed gone
+        # (the mocked _await_process_exit reports no survivors) before conmon (123), its
+        # supervisor, gets an unconditional SIGKILL -- conmon's own exit-command can tear
+        # down the storage sdss_inputd is still demand-paging code from.
         self.assertEqual(
             kill.call_args_list,
-            [mock.call(456, runtime.signal.SIGKILL), mock.call(123, runtime.signal.SIGKILL)],
+            [mock.call(456, runtime.signal.SIGTERM), mock.call(123, runtime.signal.SIGKILL)],
         )
-        await_exit.assert_called_once_with([456], timeout=2.0)
+        self.assertEqual(
+            await_exit.call_args_list,
+            [
+                mock.call([456], timeout=runtime.ROOTFS_CLIENT_GRACEFUL_TIMEOUT),
+                mock.call([456], timeout=2.0),
+            ],
+        )
 
     def test_reap_orphaned_helpers_kills_nested_sway(self):
         # sway itself is only ever addressed by container name via `podman kill` today, which
@@ -347,12 +356,56 @@ class ContainerTeardownTests(unittest.TestCase):
             runtime, "own_cgroup", return_value="user.slice/app-steam.scope"
         ), mock.patch.object(
             runtime, "_belongs_to_cgroup", return_value=True
-        ), mock.patch.object(runtime, "_await_process_exit") as await_exit, mock.patch.object(
+        ), mock.patch.object(
+            runtime, "_await_process_exit", return_value=set()
+        ) as await_exit, mock.patch.object(
             runtime.os, "kill"
         ) as kill:
             runtime.reap_orphaned_helpers()
-        kill.assert_called_once_with(123, runtime.signal.SIGKILL)
-        await_exit.assert_called_once_with([123], timeout=2.0)
+        # A graceful SIGTERM, not SIGKILL, is sway's first signal -- see
+        # reap_orphaned_helpers()'s own docstring for why this is safe now that cleanup()
+        # kills the compositor before the emulator.
+        kill.assert_called_once_with(123, runtime.signal.SIGTERM)
+        self.assertEqual(
+            await_exit.call_args_list,
+            [
+                mock.call([123], timeout=runtime.ROOTFS_CLIENT_GRACEFUL_TIMEOUT),
+                mock.call([123], timeout=2.0),
+            ],
+        )
+
+    def test_reap_orphaned_helpers_escalates_to_sigkill_when_sigterm_times_out(self):
+        # sway ignoring SIGTERM (hung, or just slower than the bound) must not leave it
+        # running forever -- the whole point of keeping a bounded wait here is that the
+        # existing SIGKILL guarantee is unchanged, only delayed by at most the graceful
+        # timeout.
+        with mock.patch.object(runtime.os, "listdir", return_value=["123"]), mock.patch.object(
+            runtime.os, "getpid", return_value=999
+        ), mock.patch.object(
+            runtime.Path,
+            "read_bytes",
+            return_value=b"/usr/bin/sway\0-c\0/run/user/1000/sdss/session/sway.conf\0",
+        ), mock.patch.object(
+            runtime, "own_cgroup", return_value="user.slice/app-steam.scope"
+        ), mock.patch.object(
+            runtime, "_belongs_to_cgroup", return_value=True
+        ), mock.patch.object(
+            runtime, "_await_process_exit", side_effect=[{123}, set()]
+        ) as await_exit, mock.patch.object(
+            runtime.os, "kill"
+        ) as kill:
+            runtime.reap_orphaned_helpers()
+        self.assertEqual(
+            kill.call_args_list,
+            [mock.call(123, runtime.signal.SIGTERM), mock.call(123, runtime.signal.SIGKILL)],
+        )
+        self.assertEqual(
+            await_exit.call_args_list,
+            [
+                mock.call([123], timeout=runtime.ROOTFS_CLIENT_GRACEFUL_TIMEOUT),
+                mock.call([123], timeout=2.0),
+            ],
+        )
 
     def test_reap_orphaned_helpers_ignores_sway_outside_launch_scope(self):
         with mock.patch.object(runtime.os, "listdir", return_value=["123"]), mock.patch.object(
@@ -386,12 +439,23 @@ class ContainerTeardownTests(unittest.TestCase):
         ), mock.patch.object(
             runtime,
             "_await_process_exit",
-            side_effect=lambda pids, timeout: calls.append(("wait", tuple(pids))),
+            side_effect=lambda pids, timeout: calls.append(("wait", tuple(pids))) or set(),
         ), mock.patch.object(
-            runtime.os, "kill", side_effect=lambda pid, sig: calls.append(("kill", pid))
+            runtime.os, "kill", side_effect=lambda pid, sig: calls.append(("kill", pid, sig))
         ):
             runtime.reap_orphaned_helpers()
-        self.assertEqual(calls, [("kill", 456), ("wait", (456,)), ("kill", 123)])
+        # sdss_inputd (456) gets a graceful SIGTERM, is confirmed gone (twice: the graceful
+        # wait, then the pre-supervisor confirmation), and only then does conmon (123) --
+        # the supervisor -- get its unconditional SIGKILL.
+        self.assertEqual(
+            calls,
+            [
+                ("kill", 456, runtime.signal.SIGTERM),
+                ("wait", (456,)),
+                ("wait", (456,)),
+                ("kill", 123, runtime.signal.SIGKILL),
+            ],
+        )
 
     def test_await_process_exit_returns_once_pids_are_gone(self):
         # First poll still finds both alive (one sleep), second poll finds both gone: the
@@ -435,18 +499,24 @@ class ContainerTeardownTests(unittest.TestCase):
             "_belongs_to_cgroup",
             side_effect=lambda pid, _parent: pid in (123, 456),
         ), mock.patch.object(
-            runtime, "_await_process_exit"
+            runtime, "_await_process_exit", return_value=set()
         ) as await_exit, mock.patch.object(
             runtime.os, "kill"
         ) as kill:
             runtime.reap_orphaned_helpers()
-        # Xwayland (123, a rootfs client) is killed and waited for before fuse-overlayfs
-        # (456, its storage backend).
+        # Xwayland (123, a rootfs client) is given a graceful SIGTERM and confirmed gone
+        # before fuse-overlayfs (456, its storage backend) gets an unconditional SIGKILL.
         self.assertEqual(
             kill.call_args_list,
-            [mock.call(123, runtime.signal.SIGKILL), mock.call(456, runtime.signal.SIGKILL)],
+            [mock.call(123, runtime.signal.SIGTERM), mock.call(456, runtime.signal.SIGKILL)],
         )
-        await_exit.assert_called_once_with([123], timeout=2.0)
+        self.assertEqual(
+            await_exit.call_args_list,
+            [
+                mock.call([123], timeout=runtime.ROOTFS_CLIENT_GRACEFUL_TIMEOUT),
+                mock.call([123], timeout=2.0),
+            ],
+        )
 
     def test_reap_orphaned_helpers_preserves_graphics_helpers_from_other_scope(self):
         commands = [

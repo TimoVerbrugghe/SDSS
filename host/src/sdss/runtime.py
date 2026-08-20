@@ -26,6 +26,14 @@ IMAGE = os.environ.get("SDSS_COMPOSITOR_IMAGE", "localhost/sdss-compositor:lates
 CONTAINER_NAME = "sdss-compositor"
 PR_SET_PDEATHSIG = 1
 INPUTD_NAME = "sdss_inputd.py"
+
+# Bound on how long reap_orphaned_helpers() waits for sway/Xwayland/sdss_inputd to exit on
+# their own SIGTERM before escalating to SIGKILL. Matches GRACEFUL_STOP_TIMEOUT, the bound
+# used the first time this graceful step was tried and clocked on hardware at "1-3 seconds"
+# for a clean sway exit (see reap_orphaned_helpers()'s own docstring for why it was removed,
+# then reintroduced here) -- not the unrelated, much tighter 2.0s used elsewhere in this
+# function to confirm an already-issued SIGKILL actually landed.
+ROOTFS_CLIENT_GRACEFUL_TIMEOUT = 3.0
 _parent_watch_stop: threading.Event | None = None
 log = logging.getLogger("sdss.runtime")
 
@@ -255,6 +263,29 @@ def reap_orphaned_helpers(name: str = CONTAINER_NAME) -> None:
     timing. Killing the rootfs-dependent processes first and confirming they are actually
     gone -- not just signaled -- before touching conmon/fuse-overlayfs/the pause process
     removes the race instead of narrowing it.
+
+    The rootfs_clients themselves get a bounded SIGTERM before SIGKILL, not SIGKILL
+    immediately. This was tried once before in an earlier shape -- a graceful `podman kill
+    --signal TERM` sent to the whole container -- and reverted after it occasionally (not
+    reliably) crashed sway itself with SIGBUS inside Mesa's libgallium, consistent with a
+    shared GPU buffer becoming invalid mid-teardown (see docs/hardware-test-report.md). That
+    reproduction happened under a since-changed precondition, though: at the time,
+    Session.cleanup() killed the *emulator* first (via immediate SIGKILL) and only then sent
+    the compositor its graceful signal -- so sway's own graceful-shutdown path ran with the
+    emulator's GPU context already dead, exactly the situation most likely to hand it a stale
+    buffer reference. cleanup() now kills the compositor before the emulator specifically to
+    close that gap (see Session.cleanup()'s own docstring), so a graceful signal to sway here
+    now runs while the emulator's GPU context is still alive -- the precondition the original
+    SIGBUS was never actually tested under. This is the only remaining, plausible way to give
+    sway's X11 connection to gamescope's per-game Xwayland an actual protocol disconnect
+    instead of an abrupt severing, which docs/architecture.md's leading hypothesis identifies
+    as the likely trigger for the recurring Steam-side allocator-exhaustion crash (distinct
+    from, and not addressed by, either SIGBUS fix above). The bounded wait keeps the existing
+    SIGKILL backstop exactly as strict as before -- unusually slow shutdowns still get force-
+    killed on the same schedule -- so this can only add a clean-disconnect opportunity on top
+    of the existing guarantee, not remove it. Unverified on hardware as of this change; if a
+    fresh SIGBUS reproduces with this in place, that would mean the shared-GPU-buffer fault
+    can also happen with the emulator still alive, and this should revert to immediate SIGKILL.
     """
     reap_orphaned_appimage_mounts()
     launch_ancestors = set(_ancestor_pids(os.getpid()))
@@ -309,10 +340,40 @@ def reap_orphaned_helpers(name: str = CONTAINER_NAME) -> None:
 
     for pid in rootfs_clients:
         try:
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError) as exc:
-            log.info("reap_orphaned_helpers: pid %s already gone before SIGKILL (%s)", pid, exc)
+            log.info("reap_orphaned_helpers: pid %s already gone before SIGTERM (%s)", pid, exc)
             continue
+    graceful_start = time.monotonic()
+    still_after_term = _await_process_exit(
+        rootfs_clients, timeout=ROOTFS_CLIENT_GRACEFUL_TIMEOUT
+    )
+    graceful_elapsed = time.monotonic() - graceful_start
+    if still_after_term:
+        log.info(
+            "reap_orphaned_helpers: %d/%d rootfs_clients did not exit within %.2fs of "
+            "SIGTERM -- escalating to SIGKILL for %s",
+            len(still_after_term),
+            len(rootfs_clients),
+            graceful_elapsed,
+            sorted(still_after_term),
+        )
+        for pid in still_after_term:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError) as exc:
+                log.info(
+                    "reap_orphaned_helpers: pid %s already gone before SIGKILL (%s)", pid, exc
+                )
+                continue
+    elif rootfs_clients:
+        log.info(
+            "reap_orphaned_helpers: all %d rootfs_clients exited gracefully (SIGTERM) "
+            "within %.2fs -- no SIGKILL needed",
+            len(rootfs_clients),
+            graceful_elapsed,
+        )
+
     wait_start = time.monotonic()
     still_alive = _await_process_exit(rootfs_clients, timeout=2.0)
     wait_elapsed = time.monotonic() - wait_start

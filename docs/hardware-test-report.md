@@ -858,3 +858,147 @@ separate hardware/OS fault, or an unrelated event is not yet known — it
 requires physical access to resolve, and is recorded here rather than left
 undocumented so the next session picks up the actual state rather than an
 assumed-clean one.
+
+### Real "Exit Game" testing resumed after the outage: four verified noise fixes, no change to the crash (2026-08-21)
+
+Both machines came back after a user-initiated reboot. The user then ran
+several real, manual reproduction cycles — Azahar (Animal Crossing), ~15-30s,
+"Exit Game" through the Steam overlay, then Cemu (Wind Waker HD) — exactly
+the sequence documented above, using a purpose-built standalone monitor
+(`sdss-monitor.service` on both hosts, independent of any SSH session, so it
+kept logging across disconnects) rather than a live SSH tail. The crash
+reproduced on **every** cycle: the Deck's second screen came up fine, the
+Steam Machine showed a spinner, then the Steam UI itself crashed and
+restarted. Zero SIGBUS/coredump signatures appeared in any of these
+incidents — the two prior fixes (compositor-reap-before-supervisors,
+emulator/compositor SIGKILL-only) held completely. The abort itself showed
+two slightly different signatures across incidents (`tier0/threadtools.cpp:
+Failed to set thread local value` in some, `tier0/memstd.cpp: OUT OF MEMORY`
+in others) — both are the same underlying "Steam's 32-bit client's own
+address space is exhausted" failure described in §3.1 above, just tripped by
+different allocation call sites.
+
+Four fixes landed in sequence during this round, each independently verified
+against the specific symptom it targeted, none of which stopped the
+recurrence:
+
+1. **`Session.cleanup()`'s kill order reversed again: compositor before the
+   emulator.** Diagnostic logging (added to `reap_orphaned_helpers()` and
+   `remove_container()` for exactly this purpose) proved that with the
+   emulator killed first, `reap_orphaned_helpers()` reliably confirmed
+   sway/Xwayland/sdss_inputd gone in under 100ms every time, yet a SIGBUS
+   coredump was still logged *before* `cleanup()` even reached the line that
+   starts compositor teardown — sway was still alive, and theoretically still
+   able to schedule a composite, for the entire (non-zero by construction)
+   window between "the emulator is dead" and "cleanup() starts touching the
+   compositor." Reversing the order — compositor torn down first, emulator
+   second — closes that window from the other direction. This is a real,
+   distinct fix (confirmed by the diagnostic logging showing exactly where
+   the old order's exposure was), but it did not stop the recurrence on its
+   own; see below for why.
+2. **Sunshine's system tray disabled** (`system_tray = disabled` in the
+   generated `sunshine.conf`). The headless sandbox has no desktop shell, so
+   the tray icon was failing loudly with GTK/DBus critical errors on every
+   single teardown (4+ occurrences per cycle, confirmed via journal). Zero
+   after the fix.
+3. **Sunshine's own log verbosity cut** (`min_log_level = warning`, was
+   `info`). Cut dozens of routine per-launch lines (resolution, codec/vaapi
+   probing, bitrate, interface discovery). Confirmed zero "Info:"-tagged
+   Sunshine lines after the fix.
+4. **libva's own logging suppressed independently**
+   (`--env=LIBVA_MESSAGING_LEVEL=1` on Sunshine's flatpak launch). libva (the
+   VAAPI library Sunshine uses for hardware video encoding) has its own
+   logging entirely separate from Sunshine's `min_log_level` — confirmed by
+   reading libva's own upstream source (`va/va.c`): the env var directly
+   gates `va_infoMessage()`, unrelated to anything Sunshine's own config
+   controls. Left unset it defaults to level 2 ("info") and printed "libva
+   info: ..." roughly 5 times per launch. Level 1 keeps genuine "libva
+   error: ..." messages.
+
+Taken together, fixes 2-4 measurably reduced the log volume
+`steam-launcher.service`'s `srt-logger` helper has to relay per launch (the
+mechanism §3.1-3.4 above documents: `srt-logger` itself eventually aborts
+with the OOM-style tier0 message under enough cumulative subprocess-output
+volume in a short window, and `KillMode=control-group` then kills the whole
+Steam UI alongside it). None of them, individually or combined, stopped the
+recurrence — confirming, yet again, this document's own opening observation
+that a new proximate cause (or in this case, a real but insufficient noise
+reduction) does not equal a fix.
+
+### `reap_orphaned_helpers()` was silently back to ungraceful teardown: a bounded SIGTERM before SIGKILL (2026-08-21)
+
+Rereading this document's and `docs/architecture.md`'s own leading hypothesis
+(§3.4 there: an abrupt, signal-severed compositor teardown, not a clean X11
+protocol disconnect, is the most likely trigger for the Steam-side OOM) against
+the *current* code turned up a regression this document itself never flagged
+as one. `reap_orphaned_helpers()` was extended, in the fix documented above at
+["Reap compositor clients before any Podman teardown command"](#the-emulator-sigkill-fix-was-also-insufficient-the-real-trigger-was-the-compositors-own-graceful-term-2026-08-19-later-still),
+to directly `os.kill(pid, signal.SIGKILL)` every rootfs client (sway,
+Xwayland, sdss_inputd) itself, and `remove_container()` calls it *before*
+issuing any `podman kill` at all. That fix was correct and necessary for the
+SIGBUS mechanism it targeted (fuse-overlayfs/conmon disappearing while those
+processes were still demand-paging code from the container's rootfs), but it
+had a side effect nobody named at the time: sway has had **zero** opportunity
+for a graceful shutdown of any kind since that fix landed, regardless of what
+signal `podman kill` sends afterward, because sway is already dead by then.
+The container-level graceful TERM this document's Phase 0 fix introduced, and
+the later fix that removed it after it occasionally crashed sway with SIGBUS,
+were both arguing about a code path that had already stopped mattering.
+
+The crucial detail in the SIGBUS-on-graceful-TERM reproduction, re-read
+carefully: at the time (["The emulator-SIGKILL fix was also
+insufficient"](#the-emulator-sigkill-fix-was-also-insufficient-the-real-trigger-was-the-compositors-own-graceful-term-2026-08-19-later-still)),
+`Session.cleanup()`'s order was still emulator-first — "the emulator was by
+then already receiving SIGKILL immediately in `cleanup()`" — so the graceful
+TERM to the compositor always landed *after* the emulator's GPU context was
+already gone, which is exactly the situation most likely to hand sway's own
+shutdown path (backtrace was inside Mesa's libgallium) a stale/invalid shared
+GPU buffer reference. This round's fix 1 above reversed that order —
+compositor torn down before the emulator — specifically to close a different
+exposure window, but as a side effect it also removes the precondition the
+SIGBUS reproduction actually needed. A graceful signal to sway now runs while
+the emulator (and its GPU context) is still fully alive.
+
+**Fix:** `reap_orphaned_helpers()`'s rootfs-client loop now sends SIGTERM
+first, waits up to `ROOTFS_CLIENT_GRACEFUL_TIMEOUT` (3.0s, matching the
+"1-3 seconds" a clean sway exit was clocked at when graceful TERM was first
+tried), and only SIGKILLs whatever is still alive after that bound — for all
+three rootfs clients uniformly (Xwayland's default SIGTERM handling is a
+clean shutdown; sdss_inputd's own comment already documented SIGTERM as its
+intended shutdown signal, "sway execs this from its config, so SIGTERM — not
+Ctrl-C — is how it normally dies," yet was previously never actually sent
+one by this function, meaning its own graceful pointer-button-release cleanup
+was being skipped even in the ordinary case). The existing SIGKILL guarantee
+is otherwise untouched — a hang or slow shutdown still gets force-killed on
+the same schedule as before, just up to 3s later. This can only add a
+clean-disconnect opportunity on top of the existing guarantee, not remove it.
+
+290 host tests updated to assert the graceful-then-forced sequence (rootfs
+clients now expect a `SIGTERM` call, confirmed via a mocked
+`_await_process_exit`, before any `SIGKILL`; one new test asserts the
+escalation path fires when the graceful wait times out). Mutation-tested:
+reverting the rootfs-client signal back to unconditional `SIGKILL` makes five
+of these tests fail, confirming they actually assert the new sequence rather
+than merely not contradicting it.
+
+**This is a bet, not a proven fix, and is explicitly unverified on hardware
+as of this writing** — no SSH access to test it was available at the time it
+was written (the user had stepped away and asked for analysis and
+implementation to continue autonomously). The reasoning is the strongest
+available evidence-aligned hypothesis after four independently-verified but
+insufficient fixes this same round, and the change is structured so that if
+the hypothesis is wrong, the worst case is a return to today's known,
+tolerated behavior (an abrupt disconnect, same as pure SIGKILL) rather than a
+new failure mode — but "bounded downside" is not the same as "confirmed
+upside." If a fresh SIGBUS reproduces with this in place, that would mean the
+shared-GPU-buffer fault can also happen with the emulator still alive, and
+`ROOTFS_CLIENT_GRACEFUL_TIMEOUT`'s SIGTERM step should revert to immediate
+SIGKILL, matching the same "occasional crash is worse than a guaranteed
+abrupt disconnect" reasoning used the first time this was tried. If the OOM
+abort still reproduces unchanged despite a confirmed graceful sway exit, that
+would be strong evidence against §3.4's hypothesis entirely, and the next
+avenue is investigating the persistent-Sunshine idea recorded in
+[docs/redesign-plan.md](redesign-plan.md) (keeping Sunshine itself alive
+across launches, unlike the compositor, since it is not subject to the same
+wlroots reconnect limitation) — noted there as a real but higher-risk,
+not-yet-attempted alternative if this bet does not pay off.

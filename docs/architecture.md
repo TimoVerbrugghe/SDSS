@@ -45,6 +45,34 @@ abort. [docs/redesign-plan.md](redesign-plan.md) proposes what to do about it.
 > path a real player does — see that section for where that testing stood when the Steam
 > Machine itself stopped responding to the network. As ever: current best evidence, not a
 > final closure.
+>
+> **Continued, 2026-08-21, after the network outage**: real Steam-overlay "Exit Game" testing
+> (Azahar ~15-30s, exit via the overlay, then Cemu) resumed and the abort reproduced on
+> essentially every cycle — a much higher rate than any prior occurrence in this document,
+> and with sway/Xwayland/sdss_inputd's SIGBUS gone for good this time (confirmed absent
+> across every incident this round). Four independent, verified noise-reduction fixes landed
+> first (compositor killed before the emulator rather than after, closing the window where a
+> live sway could still fault on the emulator's stale GPU buffer; Sunshine's system tray and
+> `min_log_level` quieted; libva's own independent `LIBVA_MESSAGING_LEVEL` logging quieted) —
+> none stopped the recurrence, though the first closed a real, separate SIGBUS bug and the
+> latter three measurably cut the log volume `srt-logger` has to relay. That negative result,
+> plus rereading this document's own §3.4 hypothesis against the *current* code, surfaced the
+> actual regression: `reap_orphaned_helpers()` — added after this document's last update,
+> to fix a *third*, separate SIGBUS mechanism (sway/Xwayland/sdss_inputd faulting when
+> conmon/fuse-overlayfs disappear while they are still demand-paging code from the
+> container's rootfs) — kills sway directly with an unconditional, immediate SIGKILL. Since
+> `remove_container()` calls it before any `podman kill` even runs, sway has had **zero**
+> opportunity for a graceful X11 disconnect since that fix landed, which is exactly the
+> "ungraceful teardown" condition §3.4 names as the likely trigger — silently reintroduced by
+> a fix for an unrelated crash. Fixed by giving sway/Xwayland/sdss_inputd a bounded SIGTERM
+> before `reap_orphaned_helpers()`'s existing SIGKILL, now that the kill order (compositor
+> before emulator, from this update's first fix above) means that SIGTERM runs while the
+> emulator's GPU context is still alive — the precondition the original graceful-TERM SIGBUS
+> (the "later still" update above) was never actually tested under, since at the time the
+> emulator always died first. Full account, including why this is a bet and not a proven
+> fix, in [docs/hardware-test-report.md](hardware-test-report.md#reap_orphaned_helpers-was-silently-back-to-ungraceful-teardown-a-bounded-sigterm-before-sigkill-2026-08-21).
+> **Unverified on hardware as of this writing** — deployed, but the next real reproduction
+> attempt is what will actually test it.
 
 Read this alongside [docs/PLAN.md](PLAN.md) (the original design rationale) and
 [docs/hardware-recon.md](hardware-recon.md) (verified hardware facts). Nothing here
