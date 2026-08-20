@@ -198,30 +198,27 @@ def remove_container(name: str = CONTAINER_NAME) -> bool:
     improvement over SIGKILL. Going straight to SIGKILL removes that crash mode entirely.
 
     Going straight to SIGKILL was *also* not the whole story: the exact same triple coredump
-    reproduced a third time with this function unchanged from the above fix. The remaining
-    cause was ordering, not signal choice — `podman rm --force` (or Podman's own `--rm`
-    auto-cleanup once the killed container's main process exits) tears down the fuse-overlayfs
-    rootfs that sway, Xwayland and sdss_inputd all still demand-page their own code and shared
-    libraries from, and this function used to call `reap_orphaned_helpers()` (which is what
-    actually kills those two client processes, since `--pid=host` keeps them out of Podman's
-    own view of "the container") *after* `rm --force` rather than before. Whichever of the two
-    groups `os.listdir("/proc")` happened to reach last in that unordered pass decided whether
-    the race was won or lost. `reap_orphaned_helpers()` now kills and *waits for* sway,
-    Xwayland and sdss_inputd before it touches conmon or fuse-overlayfs at all, so calling it
-    here before `rm --force` (rather than after) removes the race instead of shuffling it.
+    reproduced again with this function unchanged from the above fix. The remaining cause was
+    ordering, not signal choice — any Podman teardown command can race, because `podman kill`
+    hits the container entrypoint through conmon and `podman rm --force` (or Podman's own
+    `--rm` auto-cleanup once the killed entrypoint exits) tears down the fuse-overlayfs rootfs
+    that sway, Xwayland and sdss_inputd all still demand-page their own code and shared
+    libraries from. `reap_orphaned_helpers()` is what actually kills those clients directly,
+    since `--pid=host` keeps Xwayland/sdss_inputd out of Podman's own view of "the
+    container", so it must run before *any* Podman kill/remove path can make conmon or
+    fuse-overlayfs disappear underneath them.
     """
     if not podman_available():
         return False
-    # The compositor uses --pid=host, so sway is not necessarily in podman's client process
-    # group. Kill the container first; otherwise `rm --force` can hang or leave conmon behind.
+    # Must run before `podman kill` and `rm --force`: it kills sway/Xwayland/sdss_inputd and
+    # confirms they are actually gone before Podman can remove the rootfs their code is still
+    # demand-paged from.
+    reap_orphaned_helpers(name)
     subprocess.run(
         ["podman", "kill", "--signal", "KILL", name],
         capture_output=True,
         check=False,
     )
-    # Must run before `rm --force`: it kills sway/Xwayland/sdss_inputd and confirms they are
-    # actually gone before anything removes the rootfs their code is still demand-paged from.
-    reap_orphaned_helpers(name)
     result = subprocess.run(
         ["podman", "rm", "--force", "--ignore", name],
         capture_output=True,

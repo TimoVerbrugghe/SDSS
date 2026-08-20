@@ -291,14 +291,12 @@ class ContainerTeardownTests(unittest.TestCase):
             runtime.remove_container()
         reap.assert_called_once_with(runtime.CONTAINER_NAME)
 
-    def test_remove_container_reaps_before_removing_storage(self):
-        # A fresh, real crash reproduced with reap_orphaned_helpers() called *after*
-        # `podman rm --force`: whichever of sway/Xwayland/sdss_inputd (killed by
-        # reap_orphaned_helpers) or conmon/fuse-overlayfs (torn down by `rm --force`) actually
-        # finished last decided whether the race was won or lost. reap_orphaned_helpers()
-        # itself now kills-and-waits-for the rootfs-dependent processes before touching
-        # conmon/fuse-overlayfs, but that only helps if it also runs before `rm --force`
-        # removes the storage those processes depend on, not after.
+    def test_remove_container_reaps_before_podman_teardown(self):
+        # A fresh, real crash reproduced with direct reaping after `podman kill`: the
+        # container has --rm, so killing the entrypoint through conmon can already trigger
+        # cleanup/storage teardown before `podman rm --force` is reached. Directly kill and
+        # wait for sway/Xwayland/sdss_inputd before any Podman kill/remove path can take the
+        # fuse-overlayfs rootfs away from code they may still be demand-paging.
         calls: list[str] = []
         with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
             runtime.subprocess, "run", side_effect=lambda *a, **k: calls.append("subprocess.run")
@@ -307,8 +305,8 @@ class ContainerTeardownTests(unittest.TestCase):
             runtime, "reap_orphaned_helpers", side_effect=lambda *a, **k: calls.append("reap")
         ):
             runtime.remove_container()
-        # ["podman kill", reap_orphaned_helpers, "podman rm --force"]
-        self.assertEqual(calls, ["subprocess.run", "reap", "subprocess.run"])
+        # [reap_orphaned_helpers, "podman kill", "podman rm --force"]
+        self.assertEqual(calls, ["reap", "subprocess.run", "subprocess.run"])
 
     def test_reap_orphaned_helpers_kills_named_processes(self):
         with mock.patch.object(runtime.os, "listdir", return_value=["123", "456"]), mock.patch.object(
