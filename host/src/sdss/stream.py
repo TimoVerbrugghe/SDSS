@@ -101,6 +101,15 @@ def launch_command(spec: SunshineSpec, wayland_display: str, runtime_dir: str) -
         *launch.flatpak_socket_args(wayland_display),
         f"--env=XDG_RUNTIME_DIR={runtime_dir}",
         f"--filesystem={spec.config_dir}",
+        # libva (VA-API hardware video encoding) has its own logging entirely separate
+        # from Sunshine's own min_log_level -- it reads this env var directly (see
+        # va_MessagingInit() in libva's va.c) and, left unset, defaults to level 2
+        # ("info"), printing "libva info: ..." for every driver probe/open on every
+        # single launch. Verified on hardware: a substantial, steady contributor to the
+        # subprocess output Steam's own log-capture pipeline (srt-logger) has to relay
+        # alongside everything else SDSS's session produces. Level 1 keeps genuine
+        # "libva error: ..." messages if something actually breaks.
+        "--env=LIBVA_MESSAGING_LEVEL=1",
         "--device=all",
         FLATPAK_ID,
         str(spec.config_dir / "sunshine.conf"),

@@ -75,6 +75,17 @@ class TestLaunchCommand(unittest.TestCase):
     def test_uinput_access_for_touch_injection(self):
         self.assertIn("--device=all", self.command())
 
+    def test_libva_info_logging_is_suppressed(self):
+        """libva has its own logging, entirely separate from Sunshine's min_log_level.
+
+        Verified on hardware: left unset, libva defaults to level 2 ("info") and prints
+        "libva info: ..." for every driver probe/open on every single launch -- a
+        substantial, steady contributor to the subprocess output Steam's own log-capture
+        pipeline (srt-logger) has to relay. Level 1 keeps genuine "libva error: ..."
+        messages if something actually breaks.
+        """
+        self.assertIn("--env=LIBVA_MESSAGING_LEVEL=1", self.command())
+
 
 if __name__ == "__main__":
     unittest.main()
