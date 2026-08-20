@@ -317,6 +317,15 @@ Answer the open question in isolation, without touching the shipped session life
 above. A scoped, achievable fix for its motivating symptom was implemented and verified on
 hardware instead — see below.**
 
+**Later relevance (unrelated symptom, same blocker):** a separate investigation into an
+`srt-logger` (Steam Runtime helper) thread-local-storage exhaustion — which aborts and takes
+the whole Steam client down with it via `steam-launcher.service`'s `KillMode=control-group`
+after repeated rapid SDSS launches — considered "keep the compositor/Sunshine alive across
+launches" as a way to cut the subprocess/log-volume churn per launch. That is the exact
+design blocked by Phase 1's two findings above, so it was not re-attempted; see
+`host/src/sdss/stream.py`'s `render_conf()` for the log-volume mitigations (disabled tray
+icon, `min_log_level = warning`) pursued instead within a single launch's own footprint.
+
 While investigating Phase 1, hardware testing surfaced a concrete, distinct reliability gap
 that a persistent Sunshine/compositor would have solved as a side effect: **an
 already-connected Deck stream goes black and does not recover on its own when the Steam

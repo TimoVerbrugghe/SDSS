@@ -39,7 +39,13 @@ def render_conf(spec: SunshineSpec) -> str:
         "capture": "wlr",
         "output_name": spec.output,
         "stream_audio": "disabled",
-        "min_log_level": "info",
+        # Every "info"-level line (resolution, codec/vaapi details, bitrate, interface
+        # discovery -- dozens of lines per launch) is stdout that gets relayed through
+        # Steam's own log-capture pipeline (srt-logger) alongside everything else SDSS's
+        # session produces, on top of every other process SDSS launches. "warning" still
+        # surfaces anything Sunshine considers an actual problem (warning/error/fatal);
+        # only the routine per-launch diagnostic chatter is cut.
+        "min_log_level": "warning",
         "origin_web_ui_allowed": "lan",
         # There is no desktop shell in this headless bwrap sandbox for a tray icon to
         # attach to. Left at its "enabled" default, Sunshine still tries to create one on

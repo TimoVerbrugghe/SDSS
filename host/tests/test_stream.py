@@ -38,6 +38,17 @@ class TestSunshineConfig(unittest.TestCase):
         """
         self.assertIn("system_tray = disabled", stream.render_conf(self.spec))
 
+    def test_log_level_suppresses_routine_info_noise(self):
+        """Cut Sunshine's own per-launch "info" chatter, not just the tray icon's.
+
+        Verified on hardware: dozens of "Info:" lines per launch (resolution, codec/
+        vaapi details, bitrate, interface discovery) are stdout relayed through Steam's
+        own log-capture pipeline (srt-logger) alongside everything else SDSS's session
+        produces. "warning" still surfaces anything Sunshine considers an actual
+        problem; only the routine diagnostic noise is cut.
+        """
+        self.assertIn("min_log_level = warning", stream.render_conf(self.spec))
+
     def test_single_app_is_exposed(self):
         apps = json.loads(stream.render_apps())
         self.assertEqual([app["name"] for app in apps["apps"]], [stream.APP_NAME])
