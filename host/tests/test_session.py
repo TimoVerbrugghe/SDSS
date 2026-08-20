@@ -320,23 +320,30 @@ class CleanupContainerTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("terminate", 2222, False),
                 ("remove_container", None, None),
                 ("terminate", 1111, False),
+                ("terminate", 2222, False),
             ],
         )
 
-    def test_cleanup_kills_compositor_before_sunshine_or_anything_else(self):
-        """The compositor must die immediately after the emulator, not after Sunshine.
+    def test_cleanup_kills_compositor_before_the_emulator(self):
+        """The compositor must be dead *before* the emulator, not after.
 
         Verified on hardware, 100%-reproducible: launch a needs_x11 profile, run ~20s,
         exit via the Steam overlay. sway/Xwayland crash with SIGBUS every time (signal 7,
-        confirmed via systemd-coredump's own log line), even though the emulator already
-        gets SIGKILL immediately. The exposure is how long the compositor stays alive
-        *after* the emulator disappears -- with Sunshine's own graceful shutdown sitting
-        between them, that window is wider than it needs to be. Assert the order
-        directly: emulator, then compositor, then Sunshine/anything else -- not emulator,
-        Sunshine, compositor, which is what shipped before this test existed.
+        confirmed via systemd-coredump's own log line). Diagnostic logging added to
+        runtime.reap_orphaned_helpers() proved this crash is not caused by SDSS's own
+        teardown being too slow: it reliably classifies and confirms sway/Xwayland/
+        sdss_inputd gone in well under 100ms -- but the SIGBUS is already logged
+        *before* cleanup() even reaches the code that starts compositor teardown, i.e.
+        while the compositor is still alive and cleanup() has only killed the emulator
+        so far. Killing the emulator first can never close that window, no matter how
+        fast the following code runs, because the window exists by construction the
+        instant the emulator dies while the compositor is still up. Reversing the order
+        -- compositor dead first, so there is no live Xwayland left to fault on a stale
+        buffer when the emulator's connection vanishes -- is untested but the first
+        ordering that actually targets the window the evidence points to. Assert the
+        order directly: compositor, then emulator, then Sunshine/anything else.
         """
         session = Session(profile=AZAHAR, command=["azahar"])
         compositor = mock.Mock()
@@ -368,9 +375,9 @@ class CleanupContainerTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("terminate", 2222, False),
                 ("remove_container", None, None),
                 ("terminate", 1111, False),
+                ("terminate", 2222, False),
                 ("terminate", 3333, True),
             ],
         )

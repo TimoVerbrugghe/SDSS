@@ -386,7 +386,7 @@ class Session:
         return keepalive_fd, child_fd
 
     def cleanup(self) -> None:
-        """Tear the session down: emulator, then compositor, then everything else.
+        """Tear the session down: compositor, then emulator, then everything else.
 
         Verified on hardware, 100%-reproducible: launch a needs_x11 profile (Cemu or
         Azahar), let it run ~20s, exit via the Steam overlay. sway and Xwayland crash
@@ -395,30 +395,33 @@ class Session:
         not show up as a listed coredump; Steam's own minidump generator also fails on
         it).
 
-        The ordering below (compositor torn down immediately after the emulator, before
-        Sunshine) was a first hypothesis: that Sunshine's own shutdown, running between
-        "emulator dead" and "compositor dead", was stretching the exposure window. That
-        hypothesis was falsified on a second hardware reproduction with this exact
-        ordering already in place — sway/Xwayland crashed with SIGBUS again, at the same
-        point in Azahar's teardown, with Sunshine now killed strictly *after* the
-        compositor. The ordering itself is still reasonable (it cannot make things
-        worse) and is kept, but it is not the fix. The debug logging added to
-        runtime.reap_orphaned_helpers()/remove_container() is what should tell us next
-        time whether the direct-SIGKILL-and-confirm path is actually completing before
-        Podman's own teardown commands run, which is the remaining open question.
+        Two prior orderings were tried and both falsified by direct hardware evidence
+        with diagnostic logging in place (see runtime.reap_orphaned_helpers()'s own log
+        lines): killing the compositor immediately after the emulator, before Sunshine,
+        made no difference — the crash still happened. That logging then showed exactly
+        why: reap_orphaned_helpers() reliably classifies sway/Xwayland/sdss_inputd and
+        confirms them gone in well under 100ms every time, but the SIGBUS coredump is
+        already logged *before* cleanup() even reaches the line that starts compositor
+        teardown. sway/Xwayland are still alive, still theoretically able to schedule a
+        frame composite, in the entire window between "the emulator is dead" and
+        "cleanup() gets around to touching the compositor" — a window that exists no
+        matter how fast the code in between runs, because it is non-zero by construction
+        with the emulator killed first.
+
+        This ordering closes that window from the other direction: kill sway/Xwayland/
+        sdss_inputd *before* the emulator, so there is no live compositor process left to
+        fault on a stale GPU/SHM buffer reference when the emulator's client connection
+        vanishes. This is a new, not-yet-tried hypothesis, not a confirmed fix — the
+        emulator itself may now hit an X11 IO error when its Xwayland connection
+        disappears out from under it while still running, but that is an ordinary,
+        well-defined X11 client failure mode (an orderly client-side exit, not a
+        SIGBUS), and Steam already tracks/removes the game process cleanly regardless of
+        what killed it or in what order.
         """
         cleanup_start = time.monotonic()
         compositor_proc = self._compositor_proc
         emulator_proc = self._emulator_proc
         uses_native_sway = runtime.native_sway() is not None
-
-        if emulator_proc is not None and emulator_proc.poll() is None:
-            log.info("cleanup: terminating emulator pid=%s", emulator_proc.pid)
-            self._terminate_process(emulator_proc, graceful=False)
-        log.info(
-            "cleanup: emulator down at +%.2fs, starting compositor teardown",
-            time.monotonic() - cleanup_start,
-        )
 
         if uses_native_sway:
             if compositor_proc is not None and compositor_proc.poll() is None:
@@ -436,11 +439,17 @@ class Session:
             if compositor_proc is not None and compositor_proc.poll() is None:
                 self._terminate_process(compositor_proc, graceful=False)
         log.info(
-            "cleanup: compositor teardown done at +%.2fs", time.monotonic() - cleanup_start
+            "cleanup: compositor teardown done at +%.2fs, terminating emulator",
+            time.monotonic() - cleanup_start,
         )
 
+        if emulator_proc is not None and emulator_proc.poll() is None:
+            log.info("cleanup: terminating emulator pid=%s", emulator_proc.pid)
+            self._terminate_process(emulator_proc, graceful=False)
+        log.info("cleanup: emulator down at +%.2fs", time.monotonic() - cleanup_start)
+
         # Everything else (currently just Sunshine) gets its ordinary graceful shutdown
-        # only now — after the emulator/compositor pair that must die back-to-back.
+        # only now — after the compositor/emulator pair that must die back-to-back.
         for proc in reversed(self._processes):
             if proc is emulator_proc or proc is compositor_proc:
                 continue
