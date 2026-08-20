@@ -41,6 +41,16 @@ def render_conf(spec: SunshineSpec) -> str:
         "stream_audio": "disabled",
         "min_log_level": "info",
         "origin_web_ui_allowed": "lan",
+        # There is no desktop shell in this headless bwrap sandbox for a tray icon to
+        # attach to. Left at its "enabled" default, Sunshine still tries to create one on
+        # every single launch, and its GTK/DBus teardown fails loudly on every single
+        # session exit -- verified on hardware: "GLib-GIO-CRITICAL: Error while sending
+        # AddMatch()/GetNameOwner() message: The connection is closed", a
+        # Gtk-CRITICAL assertion failure, and a libayatana-appindicator-WARNING, on
+        # every single teardown, all relayed through Steam's own log-capture pipeline
+        # (srt-logger) alongside everything else SDSS's session produces. Disabling it
+        # is strictly correct for this setup regardless of any other effect.
+        "system_tray": "disabled",
         "file_apps": str(spec.config_dir / "apps.json"),
         "log_path": str(spec.config_dir / "sunshine.log"),
         "credentials_file": str(spec.config_dir / "credentials.json"),

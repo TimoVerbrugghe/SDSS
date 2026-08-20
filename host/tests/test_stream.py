@@ -28,6 +28,16 @@ class TestSunshineConfig(unittest.TestCase):
         self.assertEqual(stream.DEFAULT_PORT, 47989)
         self.assertIn("port = 47989", stream.render_conf(self.spec))
 
+    def test_system_tray_is_disabled(self):
+        """No desktop shell exists in this headless sandbox for a tray icon to attach to.
+
+        Verified on hardware: left at Sunshine's "enabled" default, every single session
+        teardown logged GLib-GIO-CRITICAL/Gtk-CRITICAL/libayatana-appindicator-WARNING
+        failures from Sunshine's tray icon trying (and failing) to tear itself down,
+        relayed through Steam's own log-capture pipeline alongside everything else.
+        """
+        self.assertIn("system_tray = disabled", stream.render_conf(self.spec))
+
     def test_single_app_is_exposed(self):
         apps = json.loads(stream.render_apps())
         self.assertEqual([app["name"] for app in apps["apps"]], [stream.APP_NAME])
