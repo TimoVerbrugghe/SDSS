@@ -245,16 +245,18 @@ class CleanupContainerTests(unittest.TestCase):
         killpg.assert_called_once_with(1234, signal.SIGTERM)
         process.wait.assert_called_once_with(timeout=5)
 
-    def test_cleanup_sends_sigkill_immediately_to_the_emulator(self):
-        """Azahar does not shut down reliably on SIGTERM.
+    def test_cleanup_sends_sigterm_first_to_the_emulator(self):
+        """The emulator now gets a graceful SIGTERM, not an immediate SIGKILL.
 
-        Verified on hardware: it usually just ignores SIGTERM for the full 5s timeout
-        (harmless), but on the occasions it reacted within milliseconds instead, sway,
-        Xwayland and sdss_inputd crashed with SIGBUS moments later — a triple coredump,
-        immediately followed by the classic Steam allocator abort in the next session. A
-        repeated hardware test that let SIGTERM go fully unanswered (5s timeout, then the
-        SIGKILL escalation) produced a clean teardown every time. The emulator must never
-        get a chance to react to SIGTERM at all; SIGKILL is the only path confirmed safe.
+        Reversed from an earlier hardware-driven hypothesis: an immediate SIGKILL to
+        the emulator was implicated in a reproducible sway/Xwayland SIGBUS (it denies
+        the emulator any chance to release its GPU/X11 resources first). A later,
+        distinct hardware finding then confirmed that killing the compositor before the
+        emulator instead makes the *emulator* (Azahar) SIGABRT when its Xwayland
+        connection disappears while it's still alive. A graceful SIGTERM to the
+        emulator, awaited before the compositor is touched at all, is the one
+        combination not yet falsified — see cleanup()'s own docstring for the full
+        history.
         """
         session = Session(profile=AZAHAR, command=["azahar"])
         emulator = mock.Mock()
@@ -266,10 +268,10 @@ class CleanupContainerTests(unittest.TestCase):
             "sdss.session.runtime.native_sway", return_value="/usr/bin/sway"
         ):
             session.cleanup()
-        killpg.assert_called_once_with(4321, signal.SIGKILL)
+        killpg.assert_any_call(4321, signal.SIGTERM)
 
-    def test_cleanup_still_sends_sigterm_first_to_the_compositor(self):
-        """Only the emulator skips straight to SIGKILL; sway keeps its graceful exit."""
+    def test_cleanup_sends_sigterm_to_both_emulator_and_compositor(self):
+        """Both the emulator and sway now get a graceful SIGTERM."""
         session = Session(profile=AZAHAR, command=["azahar"])
         sway_proc = mock.Mock()
         sway_proc.poll.return_value = None
@@ -284,7 +286,7 @@ class CleanupContainerTests(unittest.TestCase):
         ):
             session.cleanup()
         killpg.assert_any_call(1111, signal.SIGTERM)
-        killpg.assert_any_call(2222, signal.SIGKILL)
+        killpg.assert_any_call(2222, signal.SIGTERM)
 
     def test_cleanup_removes_container_before_touching_podman_wrapper(self):
         """The local podman child must not be signaled before rootfs clients are reaped.
@@ -293,7 +295,8 @@ class CleanupContainerTests(unittest.TestCase):
         to SIGTERM the tracked `podman run` process before calling remove_container(). With
         `--rm`, that let conmon start tearing down fuse-overlayfs while sway, Xwayland and
         sdss_inputd were still demand-paging from it, reproducing the triple SIGBUS even
-        though remove_container() itself had the correct internal ordering.
+        though remove_container() itself had the correct internal ordering. The emulator is
+        now terminated (gracefully) before any of this, per cleanup()'s current ordering.
         """
         session = Session(profile=AZAHAR, command=["azahar"])
         compositor = mock.Mock()
@@ -320,30 +323,27 @@ class CleanupContainerTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
+                ("terminate", 2222, True),
                 ("remove_container", None, None),
                 ("terminate", 1111, False),
-                ("terminate", 2222, False),
             ],
         )
 
-    def test_cleanup_kills_compositor_before_the_emulator(self):
-        """The compositor must be dead *before* the emulator, not after.
+    def test_cleanup_kills_emulator_before_the_compositor(self):
+        """The emulator must be dead *before* the compositor is torn down.
 
-        Verified on hardware, 100%-reproducible: launch a needs_x11 profile, run ~20s,
-        exit via the Steam overlay. sway/Xwayland crash with SIGBUS every time (signal 7,
-        confirmed via systemd-coredump's own log line). Diagnostic logging added to
-        runtime.reap_orphaned_helpers() proved this crash is not caused by SDSS's own
-        teardown being too slow: it reliably classifies and confirms sway/Xwayland/
-        sdss_inputd gone in well under 100ms -- but the SIGBUS is already logged
-        *before* cleanup() even reaches the code that starts compositor teardown, i.e.
-        while the compositor is still alive and cleanup() has only killed the emulator
-        so far. Killing the emulator first can never close that window, no matter how
-        fast the following code runs, because the window exists by construction the
-        instant the emulator dies while the compositor is still up. Reversing the order
-        -- compositor dead first, so there is no live Xwayland left to fault on a stale
-        buffer when the emulator's connection vanishes -- is untested but the first
-        ordering that actually targets the window the evidence points to. Assert the
-        order directly: compositor, then emulator, then Sunshine/anything else.
+        Verified on hardware, 100%-reproducible: killing the compositor while the
+        emulator is still alive makes the emulator itself (Azahar) SIGABRT when its
+        Xwayland connection disappears out from under it — confirmed via coredump
+        (signal 6, "X11 connection broke") at the exact moment reap_orphaned_helpers()
+        kills Xwayland. That crashed exit is also what stalls Steam's own game-process
+        reaper for tens of seconds afterward (the "long delay exiting a game" symptom).
+        An earlier ordering (emulator killed first, but with an *immediate* SIGKILL)
+        was tried and separately falsified: it does not give the emulator any chance to
+        release its GPU/X11 resources first, and was implicated in a sway/Xwayland
+        SIGBUS. The combination here — emulator first, but with a graceful SIGTERM the
+        code waits out — is the one not yet falsified. Assert the order directly:
+        emulator (graceful), then compositor, then Sunshine/anything else.
         """
         session = Session(profile=AZAHAR, command=["azahar"])
         compositor = mock.Mock()
@@ -375,9 +375,9 @@ class CleanupContainerTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
+                ("terminate", 2222, True),
                 ("remove_container", None, None),
                 ("terminate", 1111, False),
-                ("terminate", 2222, False),
                 ("terminate", 3333, True),
             ],
         )

@@ -168,20 +168,15 @@ class Session:
     def _terminate_process(proc: subprocess.Popen, *, graceful: bool = True) -> None:
         """Stop a launched process and the wrappers it may have spawned.
 
-        ``graceful=False`` skips SIGTERM and sends SIGKILL immediately. The emulator
-        needs this: Azahar does not shut down reliably on SIGTERM. Usually it just
-        ignores it for the full 5s timeout below (harmless — the SIGKILL escalation
-        handles that), but verified on hardware that it occasionally reacts within
-        milliseconds instead, and that fast reaction correlates with sway, Xwayland and
-        sdss_inputd then crashing with SIGBUS moments later.
+        ``graceful=False`` skips SIGTERM and sends SIGKILL immediately.
 
-        SIGKILL to the emulator does *not* eliminate that crash on its own, though —
-        verified on hardware again later (a fresh, 100%-reproducible test: launch, wait
-        ~20s, exit via the Steam overlay): sway/Xwayland still crash with SIGBUS even
-        though the emulator already gets SIGKILL immediately here. The remaining exposure
-        is *how long Xwayland stays alive after* the emulator (its GPU-rendering client)
-        disappears abruptly — see cleanup()'s ordering, which now tears the compositor
-        down immediately after the emulator instead of after Sunshine's own shutdown.
+        The emulator is now stopped with ``graceful=True`` (see cleanup()'s docstring
+        for the full history of why): an immediate SIGKILL denies it any chance to
+        release its GPU/X11 resources before the compositor is touched, which was
+        directly implicated in a reproducible sway/Xwayland SIGBUS. SIGTERM gives the
+        emulator its own 5s window to exit cleanly through its normal shutdown path;
+        the SIGKILL escalation below still guarantees the same worst-case bound as
+        before if it doesn't.
         """
         first_signal = signal.SIGTERM if graceful else signal.SIGKILL
         descendants = Session._descendant_pids(proc.pid)
@@ -386,41 +381,50 @@ class Session:
         return keepalive_fd, child_fd
 
     def cleanup(self) -> None:
-        """Tear the session down: compositor, then emulator, then everything else.
+        """Tear the session down: emulator (graceful), then compositor, then everything else.
 
-        Verified on hardware, 100%-reproducible: launch a needs_x11 profile (Cemu or
-        Azahar), let it run ~20s, exit via the Steam overlay. sway and Xwayland crash
-        with SIGBUS every time — signal 7, confirmed via systemd-coredump's own log line
-        (though the dump itself never becomes readable through coredumpctl, so this does
-        not show up as a listed coredump; Steam's own minidump generator also fails on
-        it).
+        Three orderings/signal combinations have now been tried on real hardware, and
+        each falsified in a different way, all captured with diagnostic logging in
+        place (see runtime.reap_orphaned_helpers()'s own log lines and
+        docs/hardware-test-report.md):
 
-        Two prior orderings were tried and both falsified by direct hardware evidence
-        with diagnostic logging in place (see runtime.reap_orphaned_helpers()'s own log
-        lines): killing the compositor immediately after the emulator, before Sunshine,
-        made no difference — the crash still happened. That logging then showed exactly
-        why: reap_orphaned_helpers() reliably classifies sway/Xwayland/sdss_inputd and
-        confirms them gone in well under 100ms every time, but the SIGBUS coredump is
-        already logged *before* cleanup() even reaches the line that starts compositor
-        teardown. sway/Xwayland are still alive, still theoretically able to schedule a
-        frame composite, in the entire window between "the emulator is dead" and
-        "cleanup() gets around to touching the compositor" — a window that exists no
-        matter how fast the code in between runs, because it is non-zero by construction
-        with the emulator killed first.
+        1. Emulator killed first with an *immediate* SIGKILL, then the compositor.
+           sway/Xwayland crashed with SIGBUS (signal 7) on the emulator's now-stale
+           GPU/SHM buffer — an abrupt SIGKILL gives the emulator no chance to release
+           its GPU context before sway/Xwayland go looking at it again.
+        2. Compositor killed first (sway/Xwayland/sdss_inputd), then the emulator.
+           This does stop the sway SIGBUS, but pushes the crash onto the *emulator*
+           instead: killing Xwayland out from under a still-running X11 client (Azahar)
+           makes it hit "X11 connection broke" and abort with SIGABRT instead of exiting
+           cleanly. Confirmed via coredump (signal 6, `terminate called without an
+           active exception`) at the exact moment reap_orphaned_helpers() kills
+           Xwayland. That crashed (not clean) emulator exit is also what makes Steam's
+           own game-process reaper stall for tens of seconds afterward — the "long
+           delay exiting a game" symptom is a direct side effect of this, not a
+           separate bug.
 
-        This ordering closes that window from the other direction: kill sway/Xwayland/
-        sdss_inputd *before* the emulator, so there is no live compositor process left to
-        fault on a stale GPU/SHM buffer reference when the emulator's client connection
-        vanishes. This is a new, not-yet-tried hypothesis, not a confirmed fix — the
-        emulator itself may now hit an X11 IO error when its Xwayland connection
-        disappears out from under it while still running, but that is an ordinary,
-        well-defined X11 client failure mode (an orderly client-side exit, not a
-        SIGBUS), and Steam already tracks/removes the game process cleanly regardless of
-        what killed it or in what order.
+        This ordering is the one combination not yet tried: send the emulator a real
+        SIGTERM and *wait for it to exit on its own* (the same graceful-then-SIGKILL
+        path used elsewhere, capped at 5s) before touching the compositor at all. A
+        clean SIGTERM gives the emulator the chance to release its X11/GPU resources
+        through its own shutdown path instead of either being killed abruptly (case 1)
+        or having its connection yanked out (case 2). Only once the emulator is
+        confirmed gone does the compositor get torn down, at which point there is no
+        longer a live X11 client depending on it. Unverified on hardware as of this
+        change — if a fresh SIGBUS or SIGABRT reproduces with this in place, that would
+        mean a graceful emulator exit does not reliably release the resource in time
+        either, and the underlying fix needs to move to the compositor's own shutdown
+        path instead of the ordering.
         """
         cleanup_start = time.monotonic()
         compositor_proc = self._compositor_proc
         emulator_proc = self._emulator_proc
+
+        if emulator_proc is not None and emulator_proc.poll() is None:
+            log.info("cleanup: terminating emulator pid=%s (graceful)", emulator_proc.pid)
+            self._terminate_process(emulator_proc, graceful=True)
+        log.info("cleanup: emulator down at +%.2fs", time.monotonic() - cleanup_start)
+
         uses_native_sway = runtime.native_sway() is not None
 
         if uses_native_sway:
@@ -439,17 +443,12 @@ class Session:
             if compositor_proc is not None and compositor_proc.poll() is None:
                 self._terminate_process(compositor_proc, graceful=False)
         log.info(
-            "cleanup: compositor teardown done at +%.2fs, terminating emulator",
+            "cleanup: compositor teardown done at +%.2fs",
             time.monotonic() - cleanup_start,
         )
 
-        if emulator_proc is not None and emulator_proc.poll() is None:
-            log.info("cleanup: terminating emulator pid=%s", emulator_proc.pid)
-            self._terminate_process(emulator_proc, graceful=False)
-        log.info("cleanup: emulator down at +%.2fs", time.monotonic() - cleanup_start)
-
         # Everything else (currently just Sunshine) gets its ordinary graceful shutdown
-        # only now — after the compositor/emulator pair that must die back-to-back.
+        # only now — after the emulator/compositor pair that must die back-to-back.
         for proc in reversed(self._processes):
             if proc is emulator_proc or proc is compositor_proc:
                 continue
