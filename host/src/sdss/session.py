@@ -6,6 +6,7 @@ import contextlib
 import fcntl
 import logging
 import os
+import resource
 import signal
 import subprocess
 import time
@@ -19,6 +20,26 @@ from .profiles import Profile
 log = logging.getLogger("sdss.session")
 
 ENV_DUMP_TIMEOUT = 15.0
+
+
+def _disable_coredumps() -> None:
+    """`preexec_fn` that sets RLIMIT_CORE=0 in the about-to-exec child.
+
+    Every reproducible SIGBUS/SIGABRT cascade seen during teardown (sway, Xwayland,
+    sdss_inputd crashing together, or the emulator itself aborting on a severed X11
+    connection) produces a `systemd-coredump` invocation per crashing process: a full
+    stack-trace dump, a minidump, and a DrKonqi handoff attempt, all within about a
+    second — real, bursty journal volume relayed through Steam's own srt-logger
+    alongside everything else SDSS's session produces. This does not fix the
+    underlying crash (that investigation continues separately); it only stops each
+    crash from also generating a disproportionate burst of log writes on top of
+    itself, which is the more direct, testable lever on whether that log burst is
+    what actually pushes Steam's own log pipeline over the edge.
+    """
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ValueError, OSError):
+        pass
 
 
 class SessionError(Exception):
@@ -275,7 +296,9 @@ class Session:
             "launching emulator on %s", x11_display if self.profile.needs_x11 else wayland_display
         )
         try:
-            proc = subprocess.Popen(command, env=env, start_new_session=True)
+            proc = subprocess.Popen(
+                command, env=env, start_new_session=True, preexec_fn=_disable_coredumps
+            )
         except OSError as exc:
             raise SessionError(f"could not launch emulator {command[0]!r}: {exc}") from exc
         self._processes.append(proc)
@@ -301,7 +324,9 @@ class Session:
         # remove first is the only thing that reliably clears that state.
         runtime.remove_container()
         try:
-            proc = subprocess.Popen(command, env=env, start_new_session=True)
+            proc = subprocess.Popen(
+                command, env=env, start_new_session=True, preexec_fn=_disable_coredumps
+            )
         except OSError as exc:
             raise SessionError(f"could not start compositor {command[0]!r}: {exc}") from exc
         self._processes.append(proc)

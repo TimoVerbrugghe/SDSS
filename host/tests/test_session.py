@@ -12,6 +12,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from sdss import runtime
+from sdss import session as session_module
 from sdss.profiles import AZAHAR, CEMU
 from sdss.session import Session, SessionError, SessionInterrupted
 
@@ -482,6 +483,27 @@ class CleanupContainerTests(unittest.TestCase):
         self.assertNotIn("LD_PRELOAD", helper_env)
         self.assertNotIn("SDSS_EMULATOR_LD_PRELOAD", helper_env)
 
+    def test_start_sway_disables_coredumps_in_the_child(self):
+        """Sway execs Xwayland and sdss-inputd; RLIMIT_CORE=0 here covers both via
+        inheritance, so every process in the crash cascade stops generating a
+        systemd-coredump/minidump/DrKonqi journal burst on top of itself."""
+        session = Session(profile=AZAHAR, command=["azahar"])
+        process = mock.MagicMock()
+        with mock.patch(
+            "sdss.session.runtime.parent_display", return_value=("x11", ":1")
+        ), mock.patch(
+            "sdss.session.runtime.compositor_command", return_value=["podman", "run"]
+        ), mock.patch(
+            "sdss.session.runtime.remove_container"
+        ), mock.patch(
+            "sdss.session.runtime.prepare_x11_bridge"
+        ), mock.patch(
+            "sdss.session.subprocess.Popen", return_value=process
+        ) as popen:
+            session._start_sway(Path("/tmp/sway.conf"))
+
+        self.assertIs(popen.call_args.kwargs["preexec_fn"], session_module._disable_coredumps)
+
 
 class SessionLockTests(unittest.TestCase):
     def setUp(self):
@@ -590,6 +612,13 @@ class EmulatorLaunchBackendTests(unittest.TestCase):
         # in runtime.py address the reasons it was previously disabled.
         self.assertEqual(env["LD_PRELOAD"], "/steam/gameoverlayrenderer.so")
         self.assertNotIn("SDSS_EMULATOR_LD_PRELOAD", env)
+
+    def test_emulator_disables_coredumps(self):
+        session = Session(profile=AZAHAR, command=["azahar", "game.cci"])
+        process = mock.Mock()
+        with mock.patch("sdss.session.subprocess.Popen", return_value=process) as popen:
+            session._start_emulator({"WAYLAND_DISPLAY": "wayland-1", "DISPLAY": ":2"})
+        self.assertIs(popen.call_args.kwargs["preexec_fn"], session_module._disable_coredumps)
 
     def test_cemu_keeps_steam_overlay(self):
         session = Session(profile=CEMU, command=["cemu", "game.wua"])
