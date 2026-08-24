@@ -435,3 +435,110 @@ the sockets into a user-owned `$XDG_RUNTIME_DIR/sdss-x11` (sticky bit applied *a
   in-place wrapper plus a `.sdss-real` shadow and are honoured; melonDS is **bypassed**
   because EmuDeck's `melonds.sh` hardcodes `/usr/bin/flatpak run`.
 - SSH's first connection attempt sometimes fails with "Permission denied"; retry after ~3 s.
+
+### Steam UI OOM crash on emulator switch — investigation, 2026-08-24/25 (unresolved)
+
+A recurring, hard-to-reproduce-on-demand bug: switching between/exiting emulators
+(Azahar ↔ Cemu) with SDSS active eventually crashes the Steam Machine's Steam UI (a
+spinner, then a full Steam client restart). This is distinct from the older,
+already-fixed leaks documented above (Cemu Vulkan-layer segfault spam,
+overlay-through-Xwayland leak) — same fatal signature
+(`tier0/memstd.cpp: OUT OF MEMORY` → `Fatal assert; application exiting` →
+`cannot allocate memory for thread-local data: ABORT`), different root cause, not yet
+fixed.
+
+**Instrumentation technique that actually worked**: `nohup`/`setsid` background samplers
+do not reliably survive either an SSH disconnect or Steam's own crash/restart (which
+changes the PID being tracked). The only approach that survived both: a self-relaunching
+bash loop that re-`pgrep`s for `ubuntu12_32/steam -srt-logger-opened` each time it dies,
+deployed as a transient systemd unit — `systemd-run --user --unit=<name> <script>` —
+which keeps running across SSH disconnects and Steam restarts. Tear down with
+`systemctl --user stop <name>` before deploying a replacement.
+
+**What was conclusively ruled out**, each via a controlled hardware experiment (not just log
+correlation):
+- **Not the crash-cascade/coredump volume.** A prior fix (`RLIMIT_CORE=0` via `preexec_fn`
+  on the compositor and emulator `Popen` calls, still in `session.py` as a real, independent
+  improvement) eliminates coredumps from the sway/Xwayland teardown crash cascade, but the
+  Steam UI still crashes with zero coredumps generated in the failing window.
+- **Not Sunshine, not `wlgrab`, not `HEADLESS-1`.** Direct memory sampling proved Steam's
+  own 32-bit client process (`ubuntu12_32/steam -srt-logger-opened ...`) is what leaks —
+  linear, ~56 MB/s, 100% anonymous/private-dirty pages (`smaps_rollup`), new small
+  `rw-p`/guard/`rw-p` VMA triples appearing every ~2s at monotonically decreasing addresses
+  (never reused) — climbing from ~236 MB to the 32-bit ~3-4 GB address-space ceiling in
+  roughly 55-65 seconds, then a fatal `tier0` OOM abort and a fresh Steam PID.
+  `wlgrab` (the string Steam's console log relays) turned out to be a string inside
+  **Sunshine's own binary** (`strings` on the Flatpak's `files/bin/sunshine`), not Steam's —
+  it is Sunshine's wlroots screencapture backend logging retries, relayed through Steam's
+  own log-capture pipe (`srt-logger`) like every other subprocess SDSS launches, not
+  evidence of anything inside Steam itself. Confirmed directly: launching Azahar with the
+  `_start_sunshine()` call skipped entirely (Sunshine never started at all — no
+  `HEADLESS-1` capture attempt possible) reproduces the identical leak, same rate, same
+  crash. Game Recording was also independently confirmed off in Steam settings throughout
+  all testing, and Remote Play was confirmed off/never enabled.
+- **Not excessive log volume.** The already-documented Cemu-Vulkan-layer-segfault OOM (see
+  `DISABLE_GAMESCOPE_WSI` in `launch.py`) hit the same `tier0/memstd.cpp` signature via
+  genuinely massive stack-trace log spam relayed through `srt-logger`. This is a different
+  mechanism: the console log during the leak window is essentially quiet (no line repeats
+  more than a handful of times), and Steam's open-fd count (sampled via `/proc/<pid>/fd`
+  each time it changed) stayed flat at ~155-172 the entire time RSS climbed from 236 MB to
+  over 3 GB — ruling out "too many open log handles/lines" as this leak's mechanism.
+- **Not touch/pointer input volume.** With the touch bridge active but the Deck screen
+  completely untouched after launch, Steam's RSS stayed essentially flat (~5 MB total
+  drift over 7 minutes and several emulator relaunches) — no continuous climb. Conversely,
+  deliberately dragging/touching heavily for ~20-30s after launch also did **not** trigger
+  or accelerate a crash (RSS moved by only ~1-2 MB during a heavy-touch window). This rules
+  out wlroots' X11 backend's broadcast XInput2 motion-event registration (see below) as the
+  proportional trigger, even though it remains a structurally unusual thing that backend
+  does.
+
+**What was conclusively confirmed** as the necessary trigger, via a controlled A/B on the
+exact same session shape:
+- Patching `runtime.parent_display()` to unconditionally return `("wayland", ...)` (i.e.
+  forcing `WLR_BACKENDS=wayland,headless`, so the nested compositor never touches Steam's
+  per-game Xwayland at all) made the leak disappear completely across repeated launches —
+  Steam's RSS stayed flat (~250-256 MB) for the full test. Restoring the normal
+  `x11,headless` backend (the documented default whenever Steam hands SDSS a `DISPLAY`)
+  reproduces the leak reliably again. **The X11-backend connection into gamescope's
+  per-game Xwayland is necessary for the leak; the Wayland-backend connection is not
+  sufficient to trigger it.**
+- However, the Wayland-backend build is **not usable as-is**: a `gamescopectl screenshot`
+  taken while Azahar was running under the forced-Wayland build showed only Steam's
+  spinner — the emulator's window, rendered as a plain client on the shared `gamescope-0`
+  Wayland socket, is invisible to gamescope's own game-window compositing, not just to its
+  spinner-dismissal heuristic. So the TV picture itself, not just spinner-clearing, depends
+  on the X11-backend/per-game-Xwayland connection; there is no "render on Wayland, use a
+  lightweight proxy purely for readiness" shortcut — the real picture has to go through
+  that Xwayland one way or another.
+- gamescope's own source (`ValveSoftware/gamescope:src/steamcompmgr.cpp`) was read in full:
+  its readiness/spinner logic is purely event-driven (`add_win`/`map_win` on
+  `CreateNotify`/`MapNotify`, `damage_win`'s "first damage from a window with a resolved
+  `STEAM_GAME` appID" heuristic triggering a focus-atom recompute that the closed-source
+  Steam client reads) and its two `XQueryTree` call sites free their buffers immediately
+  and run only on new-window events, never in a continuous loop — gamescope's own C++ side
+  is not the leak. wlroots' X11 backend
+  (`wlroots/wlroots:backend/x11/{backend,output}.c`) uses DRI3/Present/XFixes/XInput2/
+  XRender at connection time, does one `xcb_present_pixmap` + `xcb_flush` per rendered
+  frame, and registers **broadcast** XInput2 events (`XCB_INPUT_DEVICE_ALL_MASTER`) on its
+  own window — but contains **no RandR usage at all**, so it cannot be causing any kind of
+  screen/CRTC-geometry-change storm. No wlroots GitLab issue or gamescope GitHub issue
+  matching this exact scenario (a second X11 client, i.e. our nested compositor, causing a
+  leak in a third, unrelated client's — Steam's — own process) was found in either
+  tracker.
+- The leak is **not reliably reproducible on demand**: several clean back-to-back
+  Azahar/Cemu launches in a row can run fine, then a later one (with no obvious
+  difference in usage pattern) crashes — consistent with a timing/ordering race at
+  session-startup rather than something proportional to elapsed time, input volume, or
+  log volume once running.
+
+**Current state: root cause NOT yet identified.** The bug is real, reproduces on both
+hardware devices, and is scoped specifically to "SDSS's nested `sway` connects its
+`wlr_x11_backend` to Steam's per-game Xwayland" — but *why* that specific kind of X11
+client triggers a leak inside Steam's own separate, closed-source client process, and why
+it is racy rather than deterministic, is unresolved. Candidate next steps for a future
+session: capture Steam's own X11 traffic on that Xwayland (e.g. `xtrace`/`Xephyr` shim, or
+`WLR_XWAYLAND_DEBUG`-style logging) during both a clean and a crashing launch to diff what
+Steam's client actually does differently; or instrument the exact moment (which frame /
+which X event) RSS growth begins relative to sway's own startup sequence, to narrow the
+race window. Do not re-attempt the previously-tried fixes (kill-ordering, coredump
+suppression) for this bug — they are confirmed unrelated.
