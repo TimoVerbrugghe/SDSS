@@ -9,6 +9,7 @@ import os
 import resource
 import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,11 @@ from .profiles import Profile
 log = logging.getLogger("sdss.session")
 
 ENV_DUMP_TIMEOUT = 15.0
+KILL_REAP_TIMEOUT = 10.0
+CLEANUP_DEADLINE = 45.0
+COMPOSITOR_RENDERER_ENV = "SDSS_COMPOSITOR_RENDERER"
+DISABLE_STEAM_OVERLAY_ENV = "SDSS_DISABLE_STEAM_OVERLAY"
+DISABLE_SUNSHINE_ENV = "SDSS_DISABLE_SUNSHINE"
 
 
 def _disable_coredumps() -> None:
@@ -141,7 +147,10 @@ class Session:
                 artifacts = self.write_artifacts()
                 sway_proc = self._start_sway(artifacts["sway_config"])
                 nested = self._await_nested_display(artifacts["sway_env"])
-                self._start_sunshine(nested["WAYLAND_DISPLAY"])
+                if os.environ.get(DISABLE_SUNSHINE_ENV) == "1":
+                    log.warning("%s=1 — skipping Sunshine (diagnostic)", DISABLE_SUNSHINE_ENV)
+                else:
+                    self._start_sunshine(nested["WAYLAND_DISPLAY"])
                 emulator = self._start_emulator(nested)
                 code = emulator.wait()
                 log.info("emulator exited with %s — tearing down the session", code)
@@ -150,7 +159,7 @@ class Session:
                 self._stopping = True
                 runtime.disarm_parent_death_watch()
                 try:
-                    self.cleanup()
+                    self._cleanup_with_deadline()
                 finally:
                     self._restore_signal_handlers()
 
@@ -200,7 +209,11 @@ class Session:
         before if it doesn't.
         """
         first_signal = signal.SIGTERM if graceful else signal.SIGKILL
+        # /proc/<pid>/status can block on a task in uninterruptible sleep, so this scan is
+        # itself a candidate for a hung teardown; log around it to pin that down.
+        log.info("terminate: scanning descendants of %s", proc.pid)
         descendants = Session._descendant_pids(proc.pid)
+        log.info("terminate: %s has %d descendant(s)", proc.pid, len(descendants))
         for pid in descendants:
             try:
                 os.kill(pid, first_signal)
@@ -227,7 +240,18 @@ class Session:
                     os.kill(pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     continue
-            proc.wait()
+            try:
+                proc.wait(timeout=KILL_REAP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                # A SIGKILLed process that still has not been reaped is stuck in
+                # uninterruptible sleep (Cemu's GPU teardown does this). Blocking here
+                # holds Steam's reaper open forever, so Steam's "exiting game" never
+                # completes; give up the wait and let cleanup continue.
+                log.warning(
+                    "process group %s still alive %.0fs after SIGKILL — continuing teardown",
+                    proc.pid,
+                    KILL_REAP_TIMEOUT,
+                )
         else:
             # Flatpak and container runtimes can move their init process into a
             # separate process group; do not leave it holding Steam's reaper.
@@ -290,7 +314,8 @@ class Session:
             runtime_dir,
             x11_display=x11_display,
             prefer_x11=self.profile.needs_x11,
-            steam_overlay=self.profile.steam_overlay,
+            steam_overlay=self.profile.steam_overlay
+            and os.environ.get(DISABLE_STEAM_OVERLAY_ENV) != "1",
         )
         log.info(
             "launching emulator on %s", x11_display if self.profile.needs_x11 else wayland_display
@@ -310,6 +335,8 @@ class Session:
         env = launch.helper_env(
             {**os.environ, **environment(backend, parent), **self.profile.extra_env}
         )
+        if renderer := os.environ.get(COMPOSITOR_RENDERER_ENV):
+            env["WLR_RENDERER"] = renderer
         try:
             command = runtime.compositor_command(config, paths.runtime_dir().parent)
         except RuntimeError as exc:
@@ -405,6 +432,69 @@ class Session:
         child_fd = os.open(path, os.O_RDONLY)
         return keepalive_fd, child_fd
 
+    @staticmethod
+    def _clear_x11_residue(parent_display: str) -> None:
+        """Clean up X11 resources left on a shared Xwayland after compositor teardown.
+
+        When SDSS's nested compositor attaches to gamescope's per-game Xwayland (e.g. :1),
+        it creates windows and sets properties on that server's root window. These persist
+        after the compositor dies because the server is long-lived and shared across game
+        launches. On the next game's launch (a different appid), steamcompmgr's base-layer
+        tracking (GAMESCOPECTRL_BASELAYER_WINDOW property) collides with stale state,
+        causing the Steam client to OOM and restart. Clear that property explicitly.
+        """
+        if not parent_display:
+            return
+        try:
+            # Delete GAMESCOPECTRL_BASELAYER_WINDOW from the root window so the next
+            # session starts with a clean slate. Use xprop's -remove if available, else
+            # set it to 0 as a fallback.
+            subprocess.run(
+                ["sh", "-c", f"DISPLAY={parent_display} xprop -root -remove GAMESCOPECTRL_BASELAYER_WINDOW 2>/dev/null || DISPLAY={parent_display} xprop -root -f GAMESCOPECTRL_BASELAYER_WINDOW 32c -set GAMESCOPECTRL_BASELAYER_WINDOW 0"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+            log.info("cleared X11 residue on %s", parent_display)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            log.warning("could not clear X11 residue on %s: %s", parent_display, exc)
+
+    def _cleanup_with_deadline(self) -> None:
+        """Run cleanup(), but never let it hold Steam's reaper open indefinitely.
+
+        Every individual teardown step is bounded, but this is the backstop for a step
+        that blocks in a way no timeout covers (an unreapable process in uninterruptible
+        sleep, a wedged Podman client, a helper stuck on a kernel resource). SDSS runs as
+        a child of Steam's `reaper`; while this process lives, Steam still considers the
+        game running. A session that never finishes tearing down leaves Steam holding a
+        stale game, and the *next* launch then drives the 32-bit Steam client into a
+        runaway allocation and an OOM restart -- observed on hardware as "launching any
+        game after an SDSS exit crashes the Steam UI", including emulators SDSS never
+        touched. Exiting late-but-always is strictly better than blocking forever.
+        """
+        done = threading.Event()
+        error: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                self.cleanup()
+            except BaseException as exc:  # surfaced below on the main thread
+                error.append(exc)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=run, name="sdss-cleanup", daemon=True)
+        worker.start()
+        if not done.wait(CLEANUP_DEADLINE):
+            log.error(
+                "cleanup did not finish within %.0fs — abandoning it so Steam's reaper "
+                "is released; the session may leave stray processes behind",
+                CLEANUP_DEADLINE,
+            )
+            return
+        if error:
+            raise error[0]
+
     def cleanup(self) -> None:
         """Tear the session down: emulator (graceful), then compositor, then everything else.
 
@@ -471,6 +561,13 @@ class Session:
             "cleanup: compositor teardown done at +%.2fs",
             time.monotonic() - cleanup_start,
         )
+
+        # Clear X11 residue on the parent display (if using X11 backend).
+        # This prevents steamcompmgr's base-layer tracking from colliding with stale state
+        # when the next game launches.
+        if not uses_native_sway:
+            _, parent = runtime.parent_display()
+            self._clear_x11_residue(parent)
 
         # Everything else (currently just Sunshine) gets its ordinary graceful shutdown
         # only now — after the emulator/compositor pair that must die back-to-back.

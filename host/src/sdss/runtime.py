@@ -34,6 +34,8 @@ INPUTD_NAME = "sdss_inputd.py"
 # then reintroduced here) -- not the unrelated, much tighter 2.0s used elsewhere in this
 # function to confirm an already-issued SIGKILL actually landed.
 ROOTFS_CLIENT_GRACEFUL_TIMEOUT = 3.0
+PODMAN_TEARDOWN_TIMEOUT = 15.0
+PODMAN_MIGRATE_TIMEOUT = 30.0
 _parent_watch_stop: threading.Event | None = None
 log = logging.getLogger("sdss.runtime")
 
@@ -173,6 +175,29 @@ def podman_available() -> bool:
     return shutil.which("podman") is not None
 
 
+def _run_bounded(
+    command: list[str], timeout: float, *, text: bool = False
+) -> subprocess.CompletedProcess | None:
+    """Run a teardown command that must never block cleanup indefinitely.
+
+    Podman's client can hang for minutes when its rootless state is wedged. SDSS runs
+    as a child of Steam's reaper, so any unbounded wait here keeps the finished game
+    registered with Steam; the next launch then races a session Steam still believes
+    is running, which is what drives the Steam client into its runaway-allocation
+    crash. Returning None means "gave up" — callers continue teardown regardless.
+    """
+    try:
+        return subprocess.run(
+            command, capture_output=True, check=False, timeout=timeout, text=text
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("%s did not finish within %.0fs — continuing teardown", command[0], timeout)
+        return None
+    except OSError as exc:
+        log.warning("could not run %s: %s", command[0], exc)
+        return None
+
+
 def image_present() -> bool:
     if not podman_available():
         return False
@@ -224,20 +249,15 @@ def remove_container(name: str = CONTAINER_NAME) -> bool:
     log.info("remove_container(%s): calling reap_orphaned_helpers", name)
     reap_orphaned_helpers(name)
     log.info("remove_container(%s): calling podman kill", name)
-    subprocess.run(
-        ["podman", "kill", "--signal", "KILL", name],
-        capture_output=True,
-        check=False,
-    )
+    _run_bounded(["podman", "kill", "--signal", "KILL", name], PODMAN_TEARDOWN_TIMEOUT)
     log.info("remove_container(%s): calling podman rm", name)
-    result = subprocess.run(
-        ["podman", "rm", "--force", "--ignore", name],
-        capture_output=True,
-        check=False,
+    result = _run_bounded(
+        ["podman", "rm", "--force", "--ignore", name], PODMAN_TEARDOWN_TIMEOUT
     )
     _repair_invalid_podman_pause()
-    log.info("remove_container(%s): done, rm returncode=%s", name, result.returncode)
-    return result.returncode == 0
+    returncode = result.returncode if result is not None else None
+    log.info("remove_container(%s): done, rm returncode=%s", name, returncode)
+    return returncode == 0
 
 
 def reap_orphaned_helpers(name: str = CONTAINER_NAME) -> None:
@@ -456,10 +476,8 @@ def _podman_pause_pid() -> int | None:
 
 
 def _repair_invalid_podman_pause() -> None:
-    result = subprocess.run(
-        ["podman", "ps", "-a"], capture_output=True, text=True, check=False
-    )
-    if result.returncode == 0:
+    result = _run_bounded(["podman", "ps", "-a"], PODMAN_TEARDOWN_TIMEOUT, text=True)
+    if result is None or result.returncode == 0:
         return
     message = f"{result.stdout}\n{result.stderr}"
     if "invalid internal status" not in message or "podman system migrate" not in message:
@@ -474,10 +492,11 @@ def _repair_invalid_podman_pause() -> None:
             "--unit=sdss-podman-migrate",
             *command,
         ]
-    repaired = subprocess.run(command, capture_output=True, text=True, check=False)
-    if repaired.returncode != 0:
+    repaired = _run_bounded(command, PODMAN_MIGRATE_TIMEOUT, text=True)
+    if repaired is not None and repaired.returncode != 0:
         log.warning(
-            "could not repair rootless Podman pause status: %s", repaired.stderr.strip()
+            "could not repair rootless Podman pause status: %s",
+            repaired.stderr.strip(),
         )
 
 
@@ -688,6 +707,7 @@ def compositor_command(config: Path, runtime_dir: Path, home: Path | None = None
         "--env=WLR_WL_OUTPUTS",
         "--env=WLR_HEADLESS_OUTPUTS",
         "--env=WLR_NO_HARDWARE_CURSORS",
+        "--env=WLR_RENDERER",
         IMAGE,
         "-c",
         str(config),

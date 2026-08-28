@@ -77,6 +77,18 @@ class CompositorCommandTests(unittest.TestCase):
             )
         self.assertNotIn("--ipc=host", command)
 
+    def test_container_passes_compositor_renderer_override(self):
+        with mock.patch.object(runtime, "native_sway", return_value=None), mock.patch.object(
+            runtime, "podman_available", return_value=True
+        ), mock.patch.object(runtime, "own_cgroup", return_value=None):
+            command = runtime.compositor_command(
+                Path("/run/user/1000/sdss/session/sway.conf"),
+                Path("/run/user/1000"),
+                home=Path("/home/deck"),
+            )
+
+        self.assertIn("--env=WLR_RENDERER", command)
+
 
 class ParentLifecycleTests(unittest.TestCase):
     def test_parent_death_signal_is_registered_with_prctl(self):
@@ -270,6 +282,27 @@ class ContainerTeardownTests(unittest.TestCase):
         self.assertIn("--ignore", argv)
         self.assertIn(runtime.CONTAINER_NAME, argv)
         self.assertEqual(run.call_args_list[2][0][0], ["podman", "ps", "-a"])
+
+    def test_remove_container_bounds_every_podman_call(self):
+        """A wedged Podman client must not stall teardown: SDSS is a child of Steam's
+        reaper, so an unbounded call keeps the finished game registered with Steam."""
+        with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime.subprocess, "run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=0)
+            runtime.remove_container()
+
+        self.assertTrue(run.call_args_list)
+        for call in run.call_args_list:
+            self.assertIsNotNone(call.kwargs.get("timeout"), call[0][0])
+
+    def test_remove_container_survives_podman_timeout(self):
+        with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime.subprocess,
+            "run",
+            side_effect=runtime.subprocess.TimeoutExpired(cmd="podman", timeout=15),
+        ):
+            self.assertFalse(runtime.remove_container())
 
     def test_remove_container_is_a_noop_without_podman(self):
         with mock.patch.object(runtime, "podman_available", return_value=False), mock.patch.object(
@@ -601,26 +634,26 @@ class ContainerTeardownTests(unittest.TestCase):
         ):
             runtime._repair_invalid_podman_pause()
         self.assertEqual(
-            run.call_args_list,
+            [call[0][0] for call in run.call_args_list],
             [
-                mock.call(["podman", "ps", "-a"], capture_output=True, text=True, check=False),
-                mock.call(
-                    [
-                        "systemd-run",
-                        "--user",
-                        "--wait",
-                        "--collect",
-                        "--unit=sdss-podman-migrate",
-                        "podman",
-                        "system",
-                        "migrate",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                ),
+                ["podman", "ps", "-a"],
+                [
+                    "systemd-run",
+                    "--user",
+                    "--wait",
+                    "--collect",
+                    "--unit=sdss-podman-migrate",
+                    "podman",
+                    "system",
+                    "migrate",
+                ],
             ],
         )
+        for call in run.call_args_list:
+            self.assertTrue(call.kwargs["capture_output"])
+            self.assertTrue(call.kwargs["text"])
+            self.assertFalse(call.kwargs["check"])
+            self.assertIsNotNone(call.kwargs.get("timeout"))
 
     def test_repair_invalid_podman_pause_falls_back_without_systemd_run(self):
         invalid = mock.Mock(
@@ -633,22 +666,20 @@ class ContainerTeardownTests(unittest.TestCase):
             mock.patch.object(runtime.shutil, "which", return_value=None)
         ):
             runtime._repair_invalid_podman_pause()
-        self.assertEqual(
-            run.call_args_list[1],
-            mock.call(
-                ["podman", "system", "migrate"],
-                capture_output=True,
-                text=True,
-                check=False,
-            ),
-        )
+        self.assertEqual(run.call_args_list[1][0][0], ["podman", "system", "migrate"])
+        self.assertTrue(run.call_args_list[1].kwargs["text"])
+        self.assertIsNotNone(run.call_args_list[1].kwargs.get("timeout"))
 
     def test_repair_invalid_podman_pause_ignores_other_podman_errors(self):
         other = mock.Mock(returncode=125, stdout="", stderr="cannot connect")
         with mock.patch.object(runtime.subprocess, "run", return_value=other) as run:
             runtime._repair_invalid_podman_pause()
         run.assert_called_once_with(
-            ["podman", "ps", "-a"], capture_output=True, text=True, check=False
+            ["podman", "ps", "-a"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=runtime.PODMAN_TEARDOWN_TIMEOUT,
         )
 
     def test_reap_orphaned_helpers_unmounts_sdss_appimage_mounts(self):

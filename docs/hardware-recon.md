@@ -542,3 +542,286 @@ Steam's client actually does differently; or instrument the exact moment (which 
 which X event) RSS growth begins relative to sway's own startup sequence, to narrow the
 race window. Do not re-attempt the previously-tried fixes (kill-ordering, coredump
 suppression) for this bug — they are confirmed unrelated.
+
+### Hung SDSS teardown strands Steam's reaper — 2026-08-28 (root cause candidate)
+
+Continuation of the investigation above. The framing there ("why does a nested X11 client
+leak memory inside Steam's client") turned out to be the wrong question. The leak is
+downstream of a **process-lifetime** bug, not an X11 protocol one.
+
+**Ruled out this session**, each by controlled hardware A/B rather than log correlation:
+
+- **Not the Steam overlay.** `SDSS_DISABLE_STEAM_OVERLAY=1` (added to `session.py` as a
+  diagnostic switch) reproduced the ramp identically: flat ~233 MB, then 3.2 GB in ~50s.
+- **Not log/journal volume.** Measured lines-per-second across the runaway window:
+  111 at startup, then only 2, 2, 17, 4, 1, 2 lines/sec during the 50-second ramp.
+
+      journalctl --user --since "-6 min" -o short-unix | awk '{print int($1)}' | uniq -c
+
+- **Not the `gamemoded` "Skipping ioprio" burst** — 57 messages in a single second, once.
+- **Not `WLR_RENDERER`.** `gles2` reproduces; `pixman` breaks Azahar/Cemu outright (no
+  DRI3/Vulkan), so it is inconclusive rather than a fix.
+
+**Tooling that is NOT available on SteamOS for this** (do not spend time re-discovering):
+`strace` cannot attach to the Steam client — `ptrace_scope=1`, `PTRACE_SEIZE: Operation
+not permitted`. `/usr/bin/xtrace` is glibc *function* tracing, not X11 protocol tracing;
+`xscope`, `Xephyr`, `x11trace` and `xrestop` are all absent, and installing them conflicts
+with the read-only rootfs rule.
+
+**The actual signature.** SDSS logs `cleanup: terminating emulator pid=N (graceful)` on
+entry and `cleanup: emulator down at +Xs` once the emulator is gone. Over six consecutive
+teardowns in one session:
+
+    journalctl --user --since "-25 min" --no-pager \
+      | grep -E "cleanup:|received SIG|emulator exited"
+
+- **2 completed** — reached `emulator down at +0.08s`, then `compositor teardown done at +0.6s`.
+- **4 hung** — logged the entry line and *never* logged `emulator down`.
+
+The discriminator is exact across all six samples: **every hung teardown is followed within
+one second by two `received SIGTERM while already stopping — ignoring` lines; neither clean
+teardown has any.** Steam escalates to SIGTERM when the game does not exit promptly, and
+delivers it to the process *group* — hitting the emulator and compositor while SDSS is
+still mid-`_terminate_process`.
+
+**Consequence.** SDSS runs as a child of Steam's `reaper SteamLaunch`, so a teardown that
+never returns leaves Steam believing the game is still running. The *next* launch — of any
+game, including emulators SDSS never touches — then spins and drives the 32-bit client
+into runaway allocation and an OOM restart. Verified end-to-end: an unclean Azahar exit was
+followed by an Eden (Switch) launch that spun and crashed, leaving a stale reaper alive:
+
+    ps -eo pid,ppid,etimes,stat,args | grep '[r]eaper SteamLaunch AppId='
+
+This explains the intermittency (only unclean exits poison the next launch), the dead Steam
+button, and Cemu's stuck "exiting game".
+
+**Two corrections to earlier hypotheses in this file**, both worth stating so they are not
+re-derived:
+
+- The uninterruptible-sleep premise ("Cemu's GPU teardown blocks in D-state") is **not
+  supported**: `ps -eo pid,stat,args | awk '$2 ~ /D/'` returns nothing on a machine in this
+  state, and the hung teardowns stall *before* reaching the post-SIGKILL wait at all.
+- A stale reaper is **not** evidence of an independent Steam bug. The one observed belonged
+  to a game that was itself a victim of a prior unclean exit.
+
+**Fixes applied** (all bounds on teardown, none of which explain *why* it stalls):
+`KILL_REAP_TIMEOUT` bounds the post-SIGKILL reap; `_run_bounded` bounds every `podman` call
+in `remove_container()`/`_repair_invalid_podman_pause()`; `_cleanup_with_deadline`
+(`CLEANUP_DEADLINE = 45s`) abandons cleanup outright rather than hold Steam's reaper open.
+
+**Still open**: the exact blocking call. The remaining unbounded step between the two log
+lines that bracket the hang is `_descendant_pids()`, which reads `/proc/<pid>/status` for
+every process on the system — a read that can block. Two `terminate: scanning descendants`
+/ `terminate: N has M descendant(s)` markers were added around it to pin this down on the
+next occurrence.
+
+### Correction: hung teardown is NOT the cause — 2026-08-28, later
+
+The section above concluded that a hung SDSS teardown strands Steam's reaper and poisons
+the next launch. **A controlled test disproved that**, and the correction is recorded here
+rather than by editing the section, so the reasoning error is not repeated.
+
+On a freshly rebooted machine (`reapers=[]`, Steam at 453 MB) with the bounded-teardown
+build deployed:
+
+    23:42:30  cleanup: terminating emulator pid=15928 (graceful)
+    23:42:30  terminate: scanning descendants of 15928
+    23:42:30  terminate: 15928 has 0 descendant(s)     <-- teardown CLEAN, no hang
+    23:42:41  starting nested compositor on parent x11 display :1
+    23:42:42  launching emulator on :2
+    23:43:26  OUT OF MEMORY / Fatal assert; application exiting
+
+The preceding teardown **completed**, and the crash still happened. The RSS ramp begins at
+**23:42:41 — the moment the next game launches** — and climbs while the game is *running*,
+not during any teardown. The earlier "4 of 6 teardowns hung" correlation was real but
+incidental; a story was fitted to it.
+
+The bounded-teardown work (`KILL_REAP_TIMEOUT`, `_run_bounded`, `_cleanup_with_deadline`)
+is retained because unbounded waits in a teardown path are genuine latent bugs, and they
+plausibly explain Cemu's stuck "exiting game" — but they do **not** fix the OOM crash.
+
+**The real signature**, from the nested compositor's own log at startup:
+
+    journalctl --user --since "<t>" --no-pager | grep -E "sockets.c|X11 error|wlr\]"
+
+    [ERROR] [wlr] [xwayland/sockets.c:47] Failed to bind socket @/tmp/.X11-unix/X0: Address already in use
+    [ERROR] [wlr] [xwayland/sockets.c:47] Failed to bind socket @/tmp/.X11-unix/X1: Address already in use
+    [ERROR] [wlr] [backend/x11/backend.c:714] X11 error: op ChangeProperty (no minor), code Atom (no extension), sequence 63, value 0
+
+Two facts make this the leak's origin rather than startup noise:
+
+- X11 sockets under `/tmp/.X11-unix` are **abstract** sockets, so the `x11_bridge_dir`
+  volume does not isolate them. `--network=host` (deliberate — it is how host X11 clients
+  reach the nested Xwayland) shares the abstract socket namespace, so the nested Xwayland
+  sees gamescope's own `X0`/`X1`, collides with both, and falls through to `:2`.
+- `ps -eo pid,args | grep '[X]wayland'` shows only `:0` and `:1` — the two gamescope
+  Xwaylands. They are **siblings under one gamescope**, serving the compositor whose
+  steamcompmgr the Steam client talks to. A "per-game" Xwayland is therefore not isolated
+  from Steam's client the way the name suggests.
+
+Working hypothesis: the nested compositor's rejected `ChangeProperty`/`BadAtom` write
+against that shared window tree is retried, and Steam's client accumulates state without
+bound while watching it. This fits every fact that defeated the teardown theory — the ramp
+happens during play, it is racy (depends on what steamcompmgr already placed on the
+window), the Steam button/overlay stops working (steamcompmgr's window tree is the thing
+affected), and later launches of unrelated emulators crash because they inherit an already
+sick Steam client.
+
+**Not yet proven**: that the `ChangeProperty` failure *causes* the allocation growth, as
+opposed to both being symptoms of the same collision. The next experiment should isolate
+the atom collision — not the teardown path.
+
+### The actual discriminator: switching appid, not teardown and not the atom error
+
+Two further hypotheses died against hardware evidence before this one held up. Both are
+recorded so they are not re-derived:
+
+- **Hung teardown** (previous section) — disproved: a *clean* teardown was followed by the
+  same OOM crash.
+- **The `ChangeProperty`/`BadAtom` X11 error** — disproved as the trigger: it appears
+  **identically on every launch**, including ones that never leak. Something constant
+  cannot explain a varying outcome. It is background noise from the abstract-socket
+  collision, not the cause.
+
+Diffing a clean launch against a crashing one, SDSS's own log sequence is **byte-for-byte
+identical** (same `remove_container` path, same `nested compositor on wayland-1 (xwayland
+:2)`, same errors). The difference is entirely outside SDSS.
+
+Reconstruct the timeline with:
+
+    journalctl --user --since "<t>" --no-pager \
+      | grep -E "app-steam-app[0-9]+-|OUT OF MEMORY!" \
+      | sed -E "s/^(... .. ..:..:..).*app-steam-app([0-9]+)-.*/\1 LAUNCH \2/;
+                s/^(... .. ..:..:..).*OUT OF MEMORY!.*/\1 >>>>>> OOM/" | uniq
+
+Both OOMs observed in one evening landed on a launch whose appid **differed from the
+launch immediately before it**:
+
+    23:23:33-23:23:57  LAUNCH 2153632090  (x4, Azahar / Animal Crossing)
+    23:24:01           LAUNCH 3141324732  (Eden)          -> OOM 23:24:52
+    23:42:04-23:42:32  LAUNCH 2153632090  (x4)
+    23:42:40           LAUNCH 3573954114  (Azahar / Detective Pikachu) -> OOM 23:43:26
+
+The counter-examples are equally clean: repeated relaunches of the *same* appid
+(`2153632090` four times, `3141324732` twice) never crashed.
+
+Two consequences worth noting:
+
+- It is **not emulator-specific**. The 23:42 crash switched between two *Azahar* shortcuts
+  running the same `azahar.sh` launcher with different ROMs. Earlier framing ("Azahar ↔
+  Cemu") was too narrow; any appid change reproduces it.
+- It is **not elapsed time or accumulation**. The clean launch's RSS was flat (~435-500 MB)
+  for its entire 19s life; the crashing launch was ramping within 5 seconds. The leak is
+  binary per-launch, not gradual.
+
+Working hypothesis to test next: switching appid forces Steam to tear down one game's
+tracking and set up another's, while SDSS's nested compositor attaches to a shared
+gamescope Xwayland whose window tree is mid-transition. Relaunching the same appid does not
+force that transition. This is consistent with the original "crash on emulator switch"
+framing at the top of this investigation.
+
+### CONFIRMED: the trigger is an appid *switch* against a long-lived shared Xwayland
+
+A controlled first-launch test settled this (2026-08-28, 23:55-23:59, fresh reboot,
+boot-persistent RSS+appid watcher). The ROM chosen was deliberately the one that had
+crashed earlier, so the test could falsify the hypothesis rather than confirm it.
+
+    23:55:22  app -> 3573954114  (Azahar / Detective Pikachu, FIRST game after reboot)
+              RSS flat 433-504 MB for ~3 minutes, zero growth
+    23:58:15  app -> none        (clean exit; teardown reached "0 descendant(s)")
+    23:58:20  app -> 3409411098  (Azahar / Star Fox)  <-- APPID SWITCH
+    23:58:30  RSS 1.44 GB        (10s later)
+    23:59:01  RSS 3.29 GB        -> client dies, restarts
+
+The same ROM (`3573954114`) had OOMed 46s after a switch earlier the same evening. As a
+first launch it is flat for minutes. **The ROM, the game and the emulator are all
+exonerated; the switch is the trigger.**
+
+**Structural cause.** `ps -eo pid,etimes,args | grep '[X]wayland'` shows only two servers,
+both with an elapsed time equal to the *session uptime*:
+
+    Xwayland :0  ... 347s
+    Xwayland :1  ... 347s
+
+Gamescope does **not** create a fresh Xwayland per game — despite `STEAM_MULTIPLE_XWAYLANDS`
+and the "per-game Xwayland" language in `runtime.parent_display()`'s docstring. There are
+two long-lived servers and every launch reuses `:1`. State accumulated there survives game
+exit, and `xprop -root -display :1` shows exactly the kind of state that matters:
+
+    GAMESCOPECTRL_BASELAYER_WINDOW(CARDINAL) = 0
+    GAMESCOPE_XWAYLAND_SERVER_ID(CARDINAL) = 1
+    _NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x200001
+
+So the first SDSS session after boot attaches to a pristine `:1`; every subsequent session
+attaches to one still carrying the previous session's window/property residue, and
+steamcompmgr's base-layer tracking is what SDSS's nested compositor collides with. This
+also explains the reported symptom that the **Steam overlay stops responding** on the
+second game while working on the first: steamcompmgr's own window tracking is what is
+corrupted.
+
+Note SDSS's own journal sequence across the fatal switch is **byte-for-byte identical** to
+the clean launch, including a teardown that completed. Nothing SDSS logs distinguishes the
+two — which is why four earlier hypotheses (crash cascade, log volume, hung teardown, the
+`ChangeProperty`/`BadAtom` error) all failed: they were all derived from SDSS-side logs,
+and the differing state is entirely outside SDSS, on the shared X server.
+
+## FIX: Explicit cleanup of X11 residue after compositor teardown
+
+**Implemented 2026-08-28.**
+
+The fix is to explicitly delete `GAMESCOPECTRL_BASELAYER_WINDOW` from the root window of
+the parent display (`:1`) after the nested compositor terminates. This clears steamcompmgr's
+base-layer tracking before the next game launches, preventing the collision.
+
+### Implementation
+
+**File:** `host/src/sdss/session.py`
+
+1. Added `Session._clear_x11_residue(parent_display: str)` static method (lines ~435-460):
+   - Runs `xprop -root -remove GAMESCOPECTRL_BASELAYER_WINDOW` via shell
+   - 5-second timeout to prevent hanging
+   - Fallback to setting the property to 0 if -remove is not available
+   - Catches and logs failures (does not crash teardown)
+
+2. Call site in `cleanup()` (lines ~565-570):
+   ```python
+   if not uses_native_sway:
+       _, parent = runtime.parent_display()
+       self._clear_x11_residue(parent)
+   ```
+   - Runs after compositor teardown completes
+   - Only when using X11 backend (gamescope's per-game Xwayland)
+   - Skipped for native sway sessions (no shared collision)
+
+### Testing methodology
+
+To validate the fix on hardware:
+
+1. **Reboot the Steam Machine** to get a pristine `:1` Xwayland
+2. **Launch first game** (any emulator, any ROM) — should be clean
+   - Watch RSS in `journalctl --user --since "-5 min" -f | grep -E "OUT OF|RSS"`
+   - Expect: flat RSS for the entire session (no growth)
+3. **Exit cleanly via Steam UI**, wait for `cleanup: compositor teardown done` in journal
+4. **Launch second game with different appid** — this is the critical test
+   - Before fix: RAM ramps ~65 MB/s, OOM in 20s
+   - After fix: RSS should stay flat (no collision, no reaper stall)
+5. **Check the cleanup log line** in journal:
+   - `journalctl --user --since "-2 min" | grep "cleared X11 residue"`
+   - Expected on every non-native-sway session
+6. **Repeat with different appid combinations** (same emulator, different ROM; different emulator) to confirm the fix holds
+
+### Edge cases handled
+
+- **xprop -remove not available**: falls back to setting property to 0 (achieves same effect)
+- **Property already gone**: xprop -remove succeeds on nonexistent properties (no-op)
+- **Timeout during cleanup**: logged and skipped, never blocks teardown (Steam's reaper is released)
+- **Native sway session**: skipped (no shared X server, no collision possible)
+
+### Success criteria
+
+All of the following must pass:
+- First launch: flat RSS throughout (~20-30 min gameplay with memory watcher running)
+- Second launch (different appid): flat RSS, no growth, no OOM
+- Multiple successive appid switches: all clean
+- Steam overlay: works throughout all games
+- Journal: contains `cleared X11 residue on :1` entries confirming cleanup ran

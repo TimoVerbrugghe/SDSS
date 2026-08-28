@@ -2,8 +2,11 @@ import contextlib
 import fcntl
 import os
 import signal
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -394,6 +397,69 @@ class CleanupContainerTests(unittest.TestCase):
         kill.assert_any_call(5678, signal.SIGTERM)
         kill.assert_any_call(5678, signal.SIGKILL)
 
+    def test_run_tears_down_through_the_cleanup_deadline(self):
+        """run()'s finally must use the bounded wrapper, not cleanup() directly — a
+        cleanup that blocks forever keeps Steam's reaper open and wedges the next launch."""
+        session = Session(profile=AZAHAR, command=["azahar", "game.cci"])
+        emulator = mock.Mock()
+        emulator.wait.return_value = 0
+        emulator.poll.return_value = 0
+
+        with mock.patch.object(Session, "_cleanup_with_deadline") as bounded, \
+                mock.patch.object(Session, "cleanup") as raw, \
+                mock.patch.object(Session, "write_artifacts", return_value={
+                    "sway_config": "cfg", "sway_env": "env"}), \
+                mock.patch.object(Session, "_start_sway"), \
+                mock.patch.object(Session, "_await_nested_display", return_value={
+                    "WAYLAND_DISPLAY": "wayland-1", "DISPLAY": ":2"}), \
+                mock.patch.object(Session, "_start_sunshine"), \
+                mock.patch.object(Session, "_start_emulator", return_value=emulator), \
+                mock.patch.object(session_module.runtime, "arm_parent_death_signal"), \
+                mock.patch.object(session_module.runtime, "disarm_parent_death_watch"), \
+                mock.patch.object(Session, "_install_signal_handlers"), \
+                mock.patch.object(Session, "_restore_signal_handlers"), \
+                mock.patch.object(Session, "_session_lock"):
+            session.run()
+
+        bounded.assert_called_once_with()
+        raw.assert_not_called()
+
+    def test_cleanup_deadline_returns_even_if_cleanup_never_finishes(self):
+        """A teardown step that blocks forever must not keep SDSS alive: Steam would keep
+        the finished game registered, and the next launch then OOM-crashes the client."""
+        session = Session(profile=AZAHAR, command=["azahar", "game.cci"])
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        with mock.patch.object(Session, "cleanup", side_effect=lambda: release.wait(30)), \
+                mock.patch.object(session_module, "CLEANUP_DEADLINE", 0.2):
+            start = time.monotonic()
+            session._cleanup_with_deadline()
+            elapsed = time.monotonic() - start
+
+        self.assertLess(elapsed, 5)
+
+    def test_cleanup_deadline_propagates_real_errors(self):
+        session = Session(profile=AZAHAR, command=["azahar", "game.cci"])
+        with mock.patch.object(Session, "cleanup", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                session._cleanup_with_deadline()
+
+    def test_terminate_process_gives_up_when_sigkill_is_not_reaped(self):
+        """An unreapable process (Cemu in uninterruptible GPU teardown) must not block
+        cleanup forever — that holds Steam's reaper open and wedges 'exiting game'."""
+        process = mock.Mock()
+        process.pid = 1234
+        process.wait.side_effect = subprocess.TimeoutExpired(cmd="emulator", timeout=5)
+        with mock.patch.object(Session, "_descendant_pids", return_value=[5678]), mock.patch(
+            "sdss.session.os.kill"
+        ), mock.patch("sdss.session.os.killpg"):
+            Session._terminate_process(process)
+
+        # Every wait() must be bounded; an unbounded wait() would hang here forever.
+        for call in process.wait.call_args_list:
+            self.assertIsNotNone(call.kwargs.get("timeout"))
+
     def test_terminate_process_graceful_false_never_sends_sigterm(self):
         """graceful=False must not give the target any chance to react to SIGTERM."""
         process = mock.Mock()
@@ -482,6 +548,25 @@ class CleanupContainerTests(unittest.TestCase):
         helper_env = popen.call_args.kwargs["env"]
         self.assertNotIn("LD_PRELOAD", helper_env)
         self.assertNotIn("SDSS_EMULATOR_LD_PRELOAD", helper_env)
+
+    def test_start_sway_accepts_compositor_only_renderer_override(self):
+        session = Session(profile=AZAHAR, command=["azahar"])
+        process = mock.MagicMock()
+        with mock.patch.dict(os.environ, {"SDSS_COMPOSITOR_RENDERER": "pixman"}), mock.patch(
+            "sdss.session.runtime.parent_display", return_value=("x11", ":1")
+        ), mock.patch(
+            "sdss.session.runtime.compositor_command", return_value=["podman", "run"]
+        ), mock.patch(
+            "sdss.session.runtime.remove_container"
+        ), mock.patch(
+            "sdss.session.runtime.prepare_x11_bridge"
+        ), mock.patch(
+            "sdss.session.subprocess.Popen", return_value=process
+        ) as popen:
+            session._start_sway(Path("/tmp/sway.conf"))
+
+        helper_env = popen.call_args.kwargs["env"]
+        self.assertEqual(helper_env["WLR_RENDERER"], "pixman")
 
     def test_start_sway_disables_coredumps_in_the_child(self):
         """Sway execs Xwayland and sdss-inputd; RLIMIT_CORE=0 here covers both via
@@ -633,6 +718,21 @@ class EmulatorLaunchBackendTests(unittest.TestCase):
             popen.call_args.kwargs["env"]["LD_PRELOAD"],
             "/steam/gameoverlayrenderer.so",
         )
+
+    def test_emulator_overlay_can_be_disabled_for_diagnostics(self):
+        session = Session(profile=CEMU, command=["cemu", "game.wua"])
+        process = mock.Mock()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "SDSS_EMULATOR_LD_PRELOAD": "/steam/gameoverlayrenderer.so",
+                "SDSS_DISABLE_STEAM_OVERLAY": "1",
+            },
+            clear=True,
+        ), mock.patch("sdss.session.subprocess.Popen", return_value=process) as popen:
+            session._start_emulator({"WAYLAND_DISPLAY": "wayland-1", "DISPLAY": ":2"})
+
+        self.assertNotIn("LD_PRELOAD", popen.call_args.kwargs["env"])
 
 
 class AwaitNestedDisplayTests(unittest.TestCase):
