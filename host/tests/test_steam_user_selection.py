@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import sys
 import tempfile
 import unittest
@@ -53,8 +54,13 @@ class SteamUserSelectionTest(unittest.TestCase):
             newer = root / "userdata/222/config"
             older.mkdir(parents=True)
             newer.mkdir(parents=True)
-            older.touch()
-            newer.touch()
+            # Set the mtimes explicitly rather than relying on two touch() calls
+            # landing in different ticks. On a filesystem with coarse mtime
+            # granularity both land in the same tick, the sort key ties, and the
+            # stable sort then just preserves iterdir() order -- so the assertion
+            # below passed or failed depending on directory iteration order.
+            os.utime(older, (1_000_000, 1_000_000))
+            os.utime(newer, (2_000_000, 2_000_000))
 
             configs = shortcut.user_config_dirs(root)
 
