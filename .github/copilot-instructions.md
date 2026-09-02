@@ -218,3 +218,37 @@ Note for Macs: `sys.pycache_prefix` may be preset system-wide to
 `__pycache__` and can produce failures that contradict the source. Run `python3 -B` when a
 result stops making sense. Local `python3` is often 3.9 while the project targets 3.11+;
 CI is the authority.
+
+## Current investigation handoff
+
+The August 2026 hardware-investigation changes are merged to `main`, but the intermittent
+Steam crash is not considered fully explained. A follow-up session must read
+`docs/hardware-recon.md` before proposing another experiment.
+
+Established findings:
+
+- The valid Game Mode path is Steam shortcut -> SDSS -> nested sway -> Sunshine/WLR capture ->
+  Moonlight -> Deck. A direct `sdss-connect` invocation is not an equivalent end-to-end test.
+- Sunshine's automatic gamepad probe creates and destroys multiple uinput pads on every startup.
+  With a connected Moonlight client, Steam Input re-enumerates those devices and the 32-bit Steam
+  client can exhaust its address space. Production config pins `gamepad = xone`; do not disable
+  the controller entirely.
+- The X11 backend into Steam's per-game Xwayland is a necessary observed trigger in failing runs,
+  but the exact remaining intermittent failure mechanism is still open.
+- The gamescope app-ID/cgroup mismatch is real but not causal by itself: it occurred on successful
+  launches too. X11 root-property cleanup was also tested and disproved.
+- Killing Steam-managed process trees can strand Steam's running-game bookkeeping. Stop through
+  Steam, or restart the user gamescope session before treating a later launch as evidence.
+
+Follow-up rules:
+
+1. Keep the Steam-launched process intact while collecting logs, and identify which layer is being
+   tested: Steam bookkeeping, compositor, emulator, Sunshine, Moonlight, or touch input.
+2. Treat first-launch success and later-launch failure as separate observations. A new hypothesis
+   must account for the timing/intermittency rather than assuming a deterministic failure.
+3. Record verified commands and results in `docs/hardware-recon.md`; do not create a competing
+   hardware narrative in another document.
+4. Never commit real device addresses, Steam IDs, credentials, or raw SSH output. Redact them to
+   `<steam-machine>`, `<deck>`, and `<steam-id>`.
+5. Before changing teardown or capture code, inspect the lifecycle in
+   `host/src/sdss/session.py` and `host/src/sdss/runtime.py`, and run the targeted host tests.
