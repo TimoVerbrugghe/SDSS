@@ -114,7 +114,7 @@ function Content() {
           disabled={busy}
           onClick={() => void apply(restore)}
         >
-          Restore emulator configs
+          Disable SDSS and restore configs
         </ButtonItem>
       </PanelSectionRow>
     </PanelSection>

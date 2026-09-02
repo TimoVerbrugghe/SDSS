@@ -48,6 +48,16 @@ class TestXmlEdits(unittest.TestCase):
         with self.assertRaises(patch.PatchError):
             patch.apply_edits(CEMU_XML, XML, (Edit(key="nope", value="1"),))
 
+    def test_optional_missing_tag_is_ignored(self):
+        self.assertEqual(
+            patch.apply_edits(
+                CEMU_XML,
+                XML,
+                (Edit(key="controllerProfile", value="Deck", required=False),),
+            ),
+            CEMU_XML,
+        )
+
 
 class TestIniEdits(unittest.TestCase):
     def test_replaces_existing_key_in_section(self):
@@ -209,6 +219,113 @@ class TestJournal(unittest.TestCase):
             journal.restore()
         # The live file must be left alone when the restore is refused.
         self.assertEqual(config.read_text(), "[S]\nk=2\n")
+
+    def test_restore_snapshots_preserves_unrelated_user_changes(self):
+        config = self.root / "qt-config.ini"
+        config.write_text(AZAHAR_INI)
+        journal = patch.Journal(self.root / "journal", "session")
+        patch.patch_file(
+            config,
+            INI,
+            (
+                Edit(section="Layout", key="layout_option", value="4"),
+                Edit(section="Layout", key="secondary_display_layout", value="2"),
+            ),
+            journal,
+        )
+        config.write_text(config.read_text().replace("theme=default", "theme=dark"))
+
+        journal.restore_snapshots()
+        restored = config.read_text()
+        self.assertIn("layout_option=5", restored)
+        self.assertNotIn("layout_option=4", restored)
+        self.assertNotIn("secondary_display_layout=2", restored)
+        self.assertIn("theme=dark", restored)
+
+    def test_repeated_patch_keeps_the_first_key_snapshots(self):
+        config = self.root / "qt-config.ini"
+        config.write_text(AZAHAR_INI)
+        journal = patch.Journal(self.root / "journal", "enabled-azahar")
+        edits = (Edit(section="Layout", key="layout_option", value="4"),)
+
+        patch.patch_file(config, INI, edits, journal)
+        patch.patch_file(config, INI, edits, journal)
+        journal.restore_snapshots()
+
+        self.assertIn("layout_option=5", config.read_text())
+
+    def test_later_version_can_add_a_managed_key_without_losing_old_snapshots(self):
+        config = self.root / "qt-config.ini"
+        config.write_text(AZAHAR_INI)
+        journal = patch.Journal(self.root / "journal", "enabled-azahar")
+        patch.patch_file(
+            config,
+            INI,
+            (Edit(section="Layout", key="layout_option", value="4"),),
+            journal,
+        )
+        patch.patch_file(
+            config,
+            INI,
+            (
+                Edit(section="Layout", key="layout_option", value="4"),
+                Edit(section="Layout", key="secondary_display_layout", value="2"),
+            ),
+            journal,
+        )
+
+        journal.restore_snapshots()
+        restored = config.read_text()
+        self.assertIn("layout_option=5", restored)
+        self.assertNotIn("secondary_display_layout", restored)
+
+    def test_selective_restore_removes_a_section_created_by_sdss(self):
+        config = self.root / "melon.toml"
+        config.write_text(MELONDS_TOML)
+        original = config.read_bytes()
+        journal = patch.Journal(self.root / "journal", "enabled-melonds")
+        patch.patch_file(
+            config,
+            TOML,
+            (
+                Edit(section="Instance0.Window1", key="Enabled", value="true"),
+                Edit(section="Instance0.Window1", key="ScreenSizing", value="5"),
+            ),
+            journal,
+        )
+
+        journal.restore_snapshots()
+        self.assertEqual(config.read_bytes(), original)
+
+    def test_restore_snapshots_falls_back_for_legacy_journal(self):
+        config = self.root / "legacy.ini"
+        config.write_text("[S]\nk=1\n")
+        journal = patch.Journal(self.root / "journal", "session")
+        journal.record(config)
+        config.write_text("[S]\nk=2\n")
+
+        journal.restore_snapshots()
+        self.assertEqual(config.read_text(), "[S]\nk=1\n")
+
+    def test_write_file_if_absent_is_removed_by_selective_restore(self):
+        created = self.root / "profiles/Deck.txt"
+        journal = patch.Journal(self.root / "journal", "enabled-cemu")
+        self.assertTrue(patch.write_file_if_absent(created, "default\n", journal))
+        self.assertEqual(created.read_text(), "default\n")
+
+        journal.restore_snapshots()
+        self.assertFalse(created.exists())
+
+    def test_write_file_if_absent_never_overwrites_existing_file(self):
+        existing = self.root / "profiles/Deck.txt"
+        existing.parent.mkdir()
+        existing.write_text("mine\n")
+        journal = patch.Journal(self.root / "journal", "enabled-cemu")
+
+        self.assertFalse(patch.write_file_if_absent(existing, "default\n", journal))
+        existing.write_text("mine, edited later\n")
+        journal.restore_snapshots()
+        self.assertEqual(existing.read_text(), "mine, edited later\n")
 
 
 if __name__ == "__main__":

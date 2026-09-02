@@ -8,17 +8,78 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .patch import INI, TOML, XML, Edit
 
 
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9 _.-]+$")
+
+
+def _cemu_gamepad_profile_name() -> str:
+    name = os.environ.get("SDSS_CEMU_GAMEPAD_PROFILE", "").strip()
+    if name and (not _PROFILE_NAME_RE.fullmatch(name) or name in (".", "..")):
+        raise ValueError(
+            f"SDSS_CEMU_GAMEPAD_PROFILE={name!r} is not a safe controller profile filename"
+        )
+    return name
+
+
+def _cemu_edits() -> tuple[Edit, ...]:
+    edits: list[Edit] = [Edit(key="open_pad", value="true")]
+    gamepad_profile = _cemu_gamepad_profile_name()
+    if gamepad_profile:
+        edits.append(Edit(key="controllerProfile", value=gamepad_profile, required=False))
+        edits.append(Edit(key="controller_profile", value=gamepad_profile, required=False))
+    return tuple(edits)
+
+
+_CEMU_GAMEPAD_PROFILE_TEMPLATE = """[General]
+emulate = Wii U GamePad
+api = SDL
+controller = 0
+
+[Controller]
+rumble = 0
+leftRange = 1
+rightRange = 1
+leftDeadzone = 0.15
+rightDeadzone = 0.15
+buttonThreshold = 0.5
+"""
+
+
+def _cemu_files() -> tuple[FileTarget, ...]:
+    gamepad_profile = _cemu_gamepad_profile_name()
+    if not gamepad_profile:
+        return ()
+    return (
+        FileTarget(
+            path=f"~/.config/Cemu/controllerProfiles/{gamepad_profile}.txt",
+            content=_CEMU_GAMEPAD_PROFILE_TEMPLATE,
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class ConfigTarget:
     path: str
     format: str
-    edits: tuple[Edit, ...]
+    edits: tuple[Edit, ...] | Callable[[], tuple[Edit, ...]]
+
+    def resolve(self) -> Path:
+        return Path(os.path.expanduser(self.path))
+
+    def resolved_edits(self) -> tuple[Edit, ...]:
+        return self.edits() if callable(self.edits) else self.edits
+
+
+@dataclass(frozen=True)
+class FileTarget:
+    path: str
+    content: str
 
     def resolve(self) -> Path:
         return Path(os.path.expanduser(self.path))
@@ -60,18 +121,24 @@ class Profile:
     detect: tuple[str, ...]
     second_window: WindowMatch
     configs: tuple[ConfigTarget, ...] = ()
+    files: tuple[FileTarget, ...] | Callable[[], tuple[FileTarget, ...]] = ()
     second_size: tuple[int, int] = (1280, 800)
     notes: str = ""
     verified: bool = False
-    # Cemu's AppImage GTK build cannot talk Wayland, so it needs the nested Xwayland.
+    # Profiles use nested Xwayland when their toolkit cannot safely use nested Wayland.
     needs_x11: bool = False
     extra_env: dict[str, str] = field(default_factory=dict)
+    launch_args: tuple[str, ...] = ()
+    steam_overlay: bool = True
     # Path EmuDeck's own launcher script execs. SDSS never edits that script — it swaps
     # this file for a wrapper (see hooks.py) so `sdss run` still wraps a normal Steam launch.
     launcher_path: str | None = None
     # Command used when the launcher path is an export or other indirection rather than the
     # emulator command itself.
     launcher_command: tuple[str, ...] | None = None
+
+    def resolved_files(self) -> tuple[FileTarget, ...]:
+        return self.files() if callable(self.files) else self.files
 
 
 CEMU = Profile(
@@ -83,9 +150,10 @@ CEMU = Profile(
         ConfigTarget(
             path="~/.config/Cemu/settings.xml",
             format=XML,
-            edits=(Edit(key="open_pad", value="true"),),
+            edits=_cemu_edits,
         ),
     ),
+    files=_cemu_files,
     # Verified on hardware: "GamePad View - FPS: 60.10", class Cemu.
     second_window=WindowMatch(app_id=("Cemu",), title_regex="^GamePad View"),
     second_size=(854, 480),
@@ -113,18 +181,35 @@ AZAHAR = Profile(
                 # SecondaryDisplayLayout::BottomScreenOnly == 2
                 Edit(section="Layout", key="secondary_display_layout", value="2"),
                 Edit(section="Layout", key="secondary_display_layout\\default", value="false"),
+                # Steam's Vulkan overlay leaks hundreds of MiB per second when Azahar
+                # presents through nested Xwayland. OpenGL keeps the overlay functional.
+                Edit(section="Renderer", key="graphics_api", value="1"),
+                Edit(section="Renderer", key="graphics_api\\default", value="false"),
             ),
         ),
     ),
     # Verified on hardware: "Azahar 2126.0 | <game> | Secondary Window".
     second_window=WindowMatch(
-        app_id=("org.azahar_emu.Azahar",), title_regex="Secondary Window$"
+        app_id=("org.azahar_emu.Azahar", "Azahar"), title_regex="Secondary Window$"
     ),
     second_size=(320, 240),
     verified=True,
+    needs_x11=True,
+    launch_args=("-f",),
     launcher_path="~/Applications/azahar.AppImage",
     notes="Qt writes a `key\\default` marker next to every setting; it must be false or "
-    "Azahar restores its own default on launch.",
+    "Azahar restores its own default on launch. Steam launches use nested Xwayland because "
+    "the native-Wayland path has produced fatal protocol errors and prevents reliable Steam "
+    "overlay handling. SDSS temporarily selects OpenGL because Steam's Vulkan overlay leaks "
+    "memory continuously on nested Xwayland. steam_overlay was disabled entirely for a "
+    "period after that fix still left occasional Steam crashes; the actual cause turned out "
+    "to be an unrelated ungraceful compositor teardown (see docs/architecture.md), now fixed, "
+    "and re-enabling it live on hardware surfaced a *different* failure instead: invoking the "
+    "(deliberately absent) overlay left Steam's client waiting on a handshake with no game-side "
+    "client to answer it, which stalled and crashed Steam on its own internal deadlock "
+    "watchdog a couple of minutes later. steam_overlay is back to its True default so the "
+    "overlay works normally; if the Vulkan leak resurfaces even with the OpenGL override in "
+    "place, disabling it again is the fallback, not this handshake-stall failure mode.",
 )
 
 MELONDS = Profile(

@@ -1,4 +1,7 @@
+import os
 import sys
+import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -55,6 +58,644 @@ class CompositorCommandTests(unittest.TestCase):
         # cgroupfs manager must be selected — and as a global flag, before "run".
         self.assertIn("--cgroup-manager=cgroupfs", command)
         self.assertLess(command.index("--cgroup-manager=cgroupfs"), command.index("run"))
+
+    def test_container_does_not_share_the_host_ipc_namespace(self):
+        # Every other namespace-sharing flag on this podman run has a comment tying it to a
+        # specific, verified hardware bug (spinner dismissal, the X11 bridge). --ipc=host had
+        # none, and unlike those, it puts sway/the nested Xwayland into the same SysV/POSIX
+        # IPC namespace Steam's own client (and its overlay IPC) lives in — the broadest,
+        # least-justified grant of shared kernel state SDSS was making. Verified on hardware
+        # (docs/redesign-plan.md, Phase 0) that Cemu/Azahar still render, the second screen
+        # still streams, and audio still reaches the TV without it.
+        with mock.patch.object(runtime, "native_sway", return_value=None), mock.patch.object(
+            runtime, "podman_available", return_value=True
+        ), mock.patch.object(runtime, "own_cgroup", return_value=None):
+            command = runtime.compositor_command(
+                Path("/run/user/1000/sdss/session/sway.conf"),
+                Path("/run/user/1000"),
+                home=Path("/home/deck"),
+            )
+        self.assertNotIn("--ipc=host", command)
+
+    def test_container_passes_compositor_renderer_override(self):
+        with mock.patch.object(runtime, "native_sway", return_value=None), mock.patch.object(
+            runtime, "podman_available", return_value=True
+        ), mock.patch.object(runtime, "own_cgroup", return_value=None):
+            command = runtime.compositor_command(
+                Path("/run/user/1000/sdss/session/sway.conf"),
+                Path("/run/user/1000"),
+                home=Path("/home/deck"),
+            )
+
+        self.assertIn("--env=WLR_RENDERER", command)
+
+
+class ParentLifecycleTests(unittest.TestCase):
+    def test_parent_death_signal_is_registered_with_prctl(self):
+        libc = mock.Mock()
+        libc.prctl.return_value = 0
+        with mock.patch.object(runtime.sys, "platform", "linux"), mock.patch.object(
+            runtime.ctypes, "CDLL", return_value=libc
+        ), mock.patch.object(runtime.os, "getppid", return_value=1234), mock.patch.object(
+            runtime, "_arm_parent_lineage_watch"
+        ):
+            runtime.arm_parent_death_signal()
+        libc.prctl.assert_called_once_with(
+            runtime.PR_SET_PDEATHSIG, runtime.signal.SIGTERM, 0, 0, 0
+        )
+
+    def test_parent_watch_tracks_reaper_and_steam_client(self):
+        parents = {1234: 2000, 2000: 3000, 3000: 1632, 1632: 1}
+        names = {2000: "reaper", 3000: "steam", 1632: "systemd"}
+        with mock.patch.object(
+            runtime, "_parent_pid", side_effect=lambda pid: parents.get(pid)
+        ), mock.patch.object(
+            runtime, "_process_name", side_effect=lambda pid: names.get(pid)
+        ):
+            watched = runtime._watched_parent_pids(1234)
+        self.assertEqual(watched, (2000, 3000))
+
+    def test_parent_watch_falls_back_to_reaper_off_steam(self):
+        parents = {1234: 2000, 2000: 1632, 1632: 1}
+        with mock.patch.object(
+            runtime, "_parent_pid", side_effect=lambda pid: parents.get(pid)
+        ), mock.patch.object(runtime, "_process_name", return_value=None):
+            watched = runtime._watched_parent_pids(1234)
+        self.assertEqual(watched, (2000,))
+
+    def test_watch_thread_survives_disarm_racing_its_own_wait(self):
+        """Regression: the watch loop re-read the *module-global* `_parent_watch_stop` on
+        every iteration. disarm_parent_death_watch() reassigns that global to None (after
+        signalling the event it still held a reference to) -- if that happened between one
+        iteration's wait() returning and the loop's next while-check re-reading the global,
+        the thread crashed with "AttributeError: 'NoneType' object has no attribute
+        'is_set'". Verified on hardware during a real teardown. The fix binds the loop to a
+        local reference captured once at thread start, immune to the global being reassigned
+        later. This test forces disarm to fire in exactly that window, deterministically,
+        rather than hoping to hit the real race by timing.
+        """
+
+        class RacingEvent(threading.Event):
+            def wait(self, timeout=None):
+                runtime.disarm_parent_death_watch()
+                return super().wait(timeout)
+
+        created_threads: list[threading.Thread] = []
+        real_thread_cls = threading.Thread
+
+        class CapturingThread(real_thread_cls):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                created_threads.append(self)
+
+        captured: list[object] = []
+        original_hook = threading.excepthook
+        threading.excepthook = captured.append
+        try:
+            with mock.patch.object(runtime.threading, "Event", RacingEvent), mock.patch.object(
+                runtime.threading, "Thread", CapturingThread
+            ), mock.patch.object(runtime, "_watched_parent_pids", return_value=(os.getpid(),)):
+                runtime._arm_parent_lineage_watch(1234)
+            self.assertEqual(len(created_threads), 1)
+            thread = created_threads[0]
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive(), "watch thread should have stopped cleanly")
+            self.assertEqual(captured, [], "watch thread must not raise on disarm")
+        finally:
+            threading.excepthook = original_hook
+            runtime._parent_watch_stop = None
+
+
+class X11BridgeTests(unittest.TestCase):
+    def test_bridge_dir_is_ours_and_links_back_to_the_host_sockets(self):
+        # The host's /tmp/.X11-unix is root-owned. Under --userns=keep-id host uid 0 maps
+        # to nobody, so wlroots rejects it ("not owned by root or us"), Xwayland never
+        # starts, DISPLAY comes back empty and needs_x11 profiles get a black screen.
+        # Verified on hardware. The bridge is a directory we own, with the host's sockets
+        # symlinked to their path under the second mount so they still resolve outward.
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_dir = Path(tmp) / "run"
+            host_x11 = Path(tmp) / "host-x11"
+            host_x11.mkdir()
+            (host_x11 / "X0").touch()
+            (host_x11 / "X1").touch()
+            (host_x11 / "not-a-socket").touch()
+            with mock.patch.object(runtime, "HOST_X11_DIR", host_x11):
+                bridge = runtime.prepare_x11_bridge(runtime_dir)
+
+            self.assertNotEqual(bridge, host_x11)
+            self.assertEqual(sorted(p.name for p in bridge.iterdir()), ["X0", "X1"])
+            self.assertEqual(
+                os.readlink(bridge / "X0"),
+                str(runtime.CONTAINER_HOST_X11_DIR / "X0"),
+            )
+
+            # Re-running must not accumulate or trip over the previous links.
+            with mock.patch.object(runtime, "HOST_X11_DIR", host_x11):
+                runtime.prepare_x11_bridge(runtime_dir)
+            self.assertEqual(sorted(p.name for p in bridge.iterdir()), ["X0", "X1"])
+
+    def test_command_mounts_the_bridge_over_the_x11_dir(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            runtime, "native_sway", return_value=None
+        ), mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime, "own_cgroup", return_value=None
+        ):
+            command = runtime.compositor_command(
+                Path("/run/user/1000/sdss/session/sway.conf"),
+                Path(tmp),
+                home=Path("/home/deck"),
+            )
+        # The straight passthrough is what broke Xwayland; it must not come back.
+        self.assertNotIn("--volume=/tmp/.X11-unix:/tmp/.X11-unix", command)
+        self.assertIn(f"--volume={tmp}/sdss/x11:/tmp/.X11-unix", command)
+        # ...and the real directory still has to be reachable for the symlinks to resolve.
+        self.assertIn(
+            f"--volume={runtime.HOST_X11_DIR}:{runtime.CONTAINER_HOST_X11_DIR}", command
+        )
+
+
+class ContainerTeardownTests(unittest.TestCase):
+    """Steam refuses the next launch while anything survives in its per-game cgroup scope.
+
+    Verified on hardware: after a session, conmon, fuse-overlayfs and the nested Xwayland
+    were still in app-steam-app<id>-<pid>.scope and Steam reported "Game already running".
+    Terminating the `podman run` child does not reap them -- they are not its children.
+    """
+
+    def test_container_is_named_so_teardown_can_reach_it(self):
+        with mock.patch.object(runtime, "native_sway", return_value=None), mock.patch.object(
+            runtime, "podman_available", return_value=True
+        ), mock.patch.object(runtime, "own_cgroup", return_value=None):
+            command = runtime.compositor_command(
+                Path("/run/user/1000/sdss/session/sway.conf"),
+                Path("/run/user/1000"),
+                home=Path("/home/deck"),
+            )
+        self.assertIn(f"--name={runtime.CONTAINER_NAME}", command)
+        # A crashed session leaves the container behind and podman refuses to reuse a name.
+        self.assertIn("--replace", command)
+
+    def test_remove_container_sends_sigkill_immediately(self):
+        # Verified on hardware: sending the container --signal TERM first, on the theory
+        # that it lets sway close its X11 connection to gamescope's per-game Xwayland
+        # cleanly, occasionally (not reliably) crashes sway itself with SIGBUS instead,
+        # taking Xwayland and sdss_inputd down with it. A crash is just as abrupt a
+        # disconnect as SIGKILL from the other side's perspective, so the graceful attempt
+        # bought nothing reliable at the cost of an occasional hard crash. Go straight to
+        # SIGKILL.
+        with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime.subprocess, "run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=0)
+            self.assertTrue(runtime.remove_container())
+        self.assertEqual(run.call_count, 3)
+
+        kill_argv = run.call_args_list[0][0][0]
+        self.assertEqual(kill_argv[:2], ["podman", "kill"])
+        self.assertIn("--signal", kill_argv)
+        self.assertIn("KILL", kill_argv)
+        self.assertNotIn("TERM", kill_argv)
+        self.assertIn(runtime.CONTAINER_NAME, kill_argv)
+
+        rm_argv = run.call_args_list[1][0][0]
+        self.assertEqual(rm_argv[:2], ["podman", "rm"])
+        self.assertEqual(run.call_args_list[2][0][0], ["podman", "ps", "-a"])
+
+    def test_remove_container_force_removes_by_name(self):
+        with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime.subprocess, "run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=0)
+            self.assertTrue(runtime.remove_container())
+        self.assertEqual(run.call_count, 3)
+        kill_argv = run.call_args_list[0][0][0]
+        self.assertEqual(kill_argv[:2], ["podman", "kill"])
+        self.assertIn("--signal", kill_argv)
+        self.assertIn("KILL", kill_argv)
+        self.assertIn(runtime.CONTAINER_NAME, kill_argv)
+        self.assertNotIn("--ignore", kill_argv)
+        argv = run.call_args_list[1][0][0]
+        self.assertEqual(argv[:2], ["podman", "rm"])
+        self.assertIn("--force", argv)
+        # Removing an already-gone container must not be reported as a failure.
+        self.assertIn("--ignore", argv)
+        self.assertIn(runtime.CONTAINER_NAME, argv)
+        self.assertEqual(run.call_args_list[2][0][0], ["podman", "ps", "-a"])
+
+    def test_remove_container_bounds_every_podman_call(self):
+        """A wedged Podman client must not stall teardown: SDSS is a child of Steam's
+        reaper, so an unbounded call keeps the finished game registered with Steam."""
+        with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime.subprocess, "run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=0)
+            runtime.remove_container()
+
+        self.assertTrue(run.call_args_list)
+        for call in run.call_args_list:
+            self.assertIsNotNone(call.kwargs.get("timeout"), call[0][0])
+
+    def test_remove_container_survives_podman_timeout(self):
+        with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime.subprocess,
+            "run",
+            side_effect=runtime.subprocess.TimeoutExpired(cmd="podman", timeout=15),
+        ):
+            self.assertFalse(runtime.remove_container())
+
+    def test_remove_container_is_a_noop_without_podman(self):
+        with mock.patch.object(runtime, "podman_available", return_value=False), mock.patch.object(
+            runtime.subprocess, "run"
+        ) as run:
+            self.assertFalse(runtime.remove_container())
+        run.assert_not_called()
+
+    def test_remove_container_reports_failure(self):
+        with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime.subprocess, "run"
+        ) as run:
+            run.return_value = mock.Mock(returncode=1)
+            self.assertFalse(runtime.remove_container())
+
+    def test_remove_container_reaps_orphaned_helpers(self):
+        with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime.subprocess, "run"
+        ) as run, mock.patch.object(runtime, "reap_orphaned_helpers") as reap:
+            run.return_value = mock.Mock(returncode=0)
+            runtime.remove_container()
+        reap.assert_called_once_with(runtime.CONTAINER_NAME)
+
+    def test_remove_container_reaps_before_podman_teardown(self):
+        # A fresh, real crash reproduced with direct reaping after `podman kill`: the
+        # container has --rm, so killing the entrypoint through conmon can already trigger
+        # cleanup/storage teardown before `podman rm --force` is reached. Directly kill and
+        # wait for sway/Xwayland/sdss_inputd before any Podman kill/remove path can take the
+        # fuse-overlayfs rootfs away from code they may still be demand-paging.
+        calls: list[str] = []
+        with mock.patch.object(runtime, "podman_available", return_value=True), mock.patch.object(
+            runtime.subprocess, "run", side_effect=lambda *a, **k: calls.append("subprocess.run")
+            or mock.Mock(returncode=0),
+        ), mock.patch.object(
+            runtime, "reap_orphaned_helpers", side_effect=lambda *a, **k: calls.append("reap")
+        ):
+            runtime.remove_container()
+        # [reap_orphaned_helpers, "podman kill", "podman rm --force", "podman ps -a"]
+        self.assertEqual(
+            calls, ["reap", "subprocess.run", "subprocess.run", "subprocess.run"]
+        )
+
+    def test_reap_orphaned_helpers_kills_named_processes(self):
+        with mock.patch.object(runtime.os, "listdir", return_value=["123", "456"]), mock.patch.object(
+            runtime.os, "getpid", return_value=999
+        ), mock.patch.object(
+            runtime.Path,
+            "read_bytes",
+            side_effect=[b"/usr/bin/conmon\0-n\0sdss-compositor\0", b"python\0sdss_inputd.py\0"],
+        ), mock.patch.object(
+            runtime, "_await_process_exit", return_value=set()
+        ) as await_exit, mock.patch.object(
+            runtime.os, "kill"
+        ) as kill:
+            runtime.reap_orphaned_helpers()
+        # sdss_inputd (456) is a rootfs client: given a graceful SIGTERM and confirmed gone
+        # (the mocked _await_process_exit reports no survivors) before conmon (123), its
+        # supervisor, gets an unconditional SIGKILL -- conmon's own exit-command can tear
+        # down the storage sdss_inputd is still demand-paging code from.
+        self.assertEqual(
+            kill.call_args_list,
+            [mock.call(456, runtime.signal.SIGTERM), mock.call(123, runtime.signal.SIGKILL)],
+        )
+        self.assertEqual(
+            await_exit.call_args_list,
+            [
+                mock.call([456], timeout=runtime.ROOTFS_CLIENT_GRACEFUL_TIMEOUT),
+                mock.call([456], timeout=2.0),
+            ],
+        )
+
+    def test_reap_orphaned_helpers_kills_nested_sway(self):
+        # sway itself is only ever addressed by container name via `podman kill` today, which
+        # depends on conmon still being alive to relay the signal. reap_orphaned_helpers()
+        # finds it directly too, by its session-specific sway.conf path, so it is killed (and
+        # waited for) as a rootfs client exactly like Xwayland and sdss_inputd.
+        with mock.patch.object(runtime.os, "listdir", return_value=["123"]), mock.patch.object(
+            runtime.os, "getpid", return_value=999
+        ), mock.patch.object(
+            runtime.Path,
+            "read_bytes",
+            return_value=b"/usr/bin/sway\0-c\0/run/user/1000/sdss/session/sway.conf\0",
+        ), mock.patch.object(
+            runtime, "own_cgroup", return_value="user.slice/app-steam.scope"
+        ), mock.patch.object(
+            runtime, "_belongs_to_cgroup", return_value=True
+        ), mock.patch.object(
+            runtime, "_await_process_exit", return_value=set()
+        ) as await_exit, mock.patch.object(
+            runtime.os, "kill"
+        ) as kill:
+            runtime.reap_orphaned_helpers()
+        # A graceful SIGTERM, not SIGKILL, is sway's first signal -- see
+        # reap_orphaned_helpers()'s own docstring for why this is safe now that cleanup()
+        # kills the compositor before the emulator.
+        kill.assert_called_once_with(123, runtime.signal.SIGTERM)
+        self.assertEqual(
+            await_exit.call_args_list,
+            [
+                mock.call([123], timeout=runtime.ROOTFS_CLIENT_GRACEFUL_TIMEOUT),
+                mock.call([123], timeout=2.0),
+            ],
+        )
+
+    def test_reap_orphaned_helpers_escalates_to_sigkill_when_sigterm_times_out(self):
+        # sway ignoring SIGTERM (hung, or just slower than the bound) must not leave it
+        # running forever -- the whole point of keeping a bounded wait here is that the
+        # existing SIGKILL guarantee is unchanged, only delayed by at most the graceful
+        # timeout.
+        with mock.patch.object(runtime.os, "listdir", return_value=["123"]), mock.patch.object(
+            runtime.os, "getpid", return_value=999
+        ), mock.patch.object(
+            runtime.Path,
+            "read_bytes",
+            return_value=b"/usr/bin/sway\0-c\0/run/user/1000/sdss/session/sway.conf\0",
+        ), mock.patch.object(
+            runtime, "own_cgroup", return_value="user.slice/app-steam.scope"
+        ), mock.patch.object(
+            runtime, "_belongs_to_cgroup", return_value=True
+        ), mock.patch.object(
+            runtime, "_await_process_exit", side_effect=[{123}, set()]
+        ) as await_exit, mock.patch.object(
+            runtime.os, "kill"
+        ) as kill:
+            runtime.reap_orphaned_helpers()
+        self.assertEqual(
+            kill.call_args_list,
+            [mock.call(123, runtime.signal.SIGTERM), mock.call(123, runtime.signal.SIGKILL)],
+        )
+        self.assertEqual(
+            await_exit.call_args_list,
+            [
+                mock.call([123], timeout=runtime.ROOTFS_CLIENT_GRACEFUL_TIMEOUT),
+                mock.call([123], timeout=2.0),
+            ],
+        )
+
+    def test_reap_orphaned_helpers_ignores_sway_outside_launch_scope(self):
+        with mock.patch.object(runtime.os, "listdir", return_value=["123"]), mock.patch.object(
+            runtime.os, "getpid", return_value=999
+        ), mock.patch.object(
+            runtime.Path,
+            "read_bytes",
+            return_value=b"/usr/bin/sway\0-c\0/run/user/1000/sdss/session/sway.conf\0",
+        ), mock.patch.object(
+            runtime, "own_cgroup", return_value="user.slice/app-steam.scope"
+        ), mock.patch.object(
+            runtime, "_belongs_to_cgroup", return_value=False
+        ), mock.patch.object(runtime.os, "kill") as kill:
+            runtime.reap_orphaned_helpers()
+        kill.assert_not_called()
+
+    def test_reap_orphaned_helpers_kills_rootfs_clients_before_supervisors(self):
+        # The actual bug: killing conmon/fuse-overlayfs while sway/Xwayland/sdss_inputd are
+        # still executing code demand-paged from the rootfs those two back raises SIGBUS in
+        # the still-running client instead of letting it exit cleanly. Assert the ordering
+        # directly, across both os.kill and the wait, rather than just the final call list.
+        calls: list[tuple] = []
+        commands = [
+            b"/usr/bin/conmon\0-n\0sdss-compositor\0",  # supervisor
+            b"python\0sdss_inputd.py\0",  # rootfs client
+        ]
+        with mock.patch.object(runtime.os, "listdir", return_value=["123", "456"]), mock.patch.object(
+            runtime.os, "getpid", return_value=999
+        ), mock.patch.object(
+            runtime.Path, "read_bytes", side_effect=commands
+        ), mock.patch.object(
+            runtime,
+            "_await_process_exit",
+            side_effect=lambda pids, timeout: calls.append(("wait", tuple(pids))) or set(),
+        ), mock.patch.object(
+            runtime.os, "kill", side_effect=lambda pid, sig: calls.append(("kill", pid, sig))
+        ):
+            runtime.reap_orphaned_helpers()
+        # sdss_inputd (456) gets a graceful SIGTERM, is confirmed gone (twice: the graceful
+        # wait, then the pre-supervisor confirmation), and only then does conmon (123) --
+        # the supervisor -- get its unconditional SIGKILL.
+        self.assertEqual(
+            calls,
+            [
+                ("kill", 456, runtime.signal.SIGTERM),
+                ("wait", (456,)),
+                ("wait", (456,)),
+                ("kill", 123, runtime.signal.SIGKILL),
+            ],
+        )
+
+    def test_await_process_exit_returns_once_pids_are_gone(self):
+        # First poll still finds both alive (one sleep), second poll finds both gone: the
+        # `while remaining and ...` loop must exit right there without polling the clock
+        # again, since `remaining` alone is already false.
+        with mock.patch.object(
+            runtime.Path, "exists", side_effect=[True, True, False, False]
+        ), mock.patch.object(runtime.time, "sleep") as sleep, mock.patch.object(
+            runtime.time, "monotonic", side_effect=[0.0, 0.1, 0.2]
+        ):
+            runtime._await_process_exit([123, 456], timeout=2.0)
+        self.assertEqual(sleep.call_count, 1)
+
+    def test_await_process_exit_gives_up_after_timeout(self):
+        with mock.patch.object(runtime.Path, "exists", return_value=True), mock.patch.object(
+            runtime.time, "sleep"
+        ), mock.patch.object(
+            runtime.time, "monotonic", side_effect=[0.0, 0.1, 0.2, 5.0]
+        ):
+            # Must return instead of looping forever when a PID refuses to die.
+            runtime._await_process_exit([123], timeout=2.0)
+
+    def test_await_process_exit_is_a_noop_for_no_pids(self):
+        with mock.patch.object(runtime.time, "sleep") as sleep:
+            runtime._await_process_exit([], timeout=2.0)
+        sleep.assert_not_called()
+
+    def test_reap_orphaned_helpers_kills_stale_nested_graphics_helpers(self):
+        commands = [
+            b"/usr/bin/Xwayland\0:2\0-rootless\0-wm\041\0",
+            b"/usr/bin/fuse-overlayfs\0upperdir=/home/deck/.local/share/containers/storage/overlay/abc/merged\0",
+            b"/usr/bin/Xwayland\0:1\0-rootless\0",
+            b"/usr/bin/fuse-overlayfs\0upperdir=/tmp/other-container\0",
+        ]
+        with mock.patch.object(runtime.os, "listdir", return_value=["123", "456", "789", "999"]), mock.patch.object(
+            runtime.os, "getpid", return_value=1000
+        ), mock.patch.object(runtime.Path, "read_bytes", side_effect=commands), mock.patch.object(
+            runtime, "own_cgroup", return_value="user.slice/app-steam.scope"
+        ), mock.patch.object(
+            runtime,
+            "_belongs_to_cgroup",
+            side_effect=lambda pid, _parent: pid in (123, 456),
+        ), mock.patch.object(
+            runtime, "_await_process_exit", return_value=set()
+        ) as await_exit, mock.patch.object(
+            runtime.os, "kill"
+        ) as kill:
+            runtime.reap_orphaned_helpers()
+        # Xwayland (123, a rootfs client) is given a graceful SIGTERM and confirmed gone
+        # before fuse-overlayfs (456, its storage backend) gets an unconditional SIGKILL.
+        self.assertEqual(
+            kill.call_args_list,
+            [mock.call(123, runtime.signal.SIGTERM), mock.call(456, runtime.signal.SIGKILL)],
+        )
+        self.assertEqual(
+            await_exit.call_args_list,
+            [
+                mock.call([123], timeout=runtime.ROOTFS_CLIENT_GRACEFUL_TIMEOUT),
+                mock.call([123], timeout=2.0),
+            ],
+        )
+
+    def test_reap_orphaned_helpers_preserves_graphics_helpers_from_other_scope(self):
+        commands = [
+            b"/usr/bin/Xwayland\0:3\0-rootless\0-wm\041\0",
+            b"/usr/bin/fuse-overlayfs\0upperdir=/home/deck/.local/share/containers/storage/overlay/other/merged\0",
+        ]
+        with mock.patch.object(
+            runtime.os, "listdir", return_value=["123", "456"]
+        ), mock.patch.object(
+            runtime.os, "getpid", return_value=1000
+        ), mock.patch.object(
+            runtime.Path, "read_bytes", side_effect=commands
+        ), mock.patch.object(
+            runtime, "own_cgroup", return_value="user.slice/app-steam.scope"
+        ), mock.patch.object(
+            runtime, "_belongs_to_cgroup", return_value=False
+        ), mock.patch.object(runtime.os, "kill") as kill:
+            runtime.reap_orphaned_helpers()
+        kill.assert_not_called()
+
+    def test_reap_orphaned_helpers_kills_launch_owned_podman_pause(self):
+        with mock.patch.object(runtime, "reap_orphaned_appimage_mounts"), mock.patch.object(
+            runtime, "_ancestor_pids", return_value=(2000, 3000)
+        ), mock.patch.object(
+            runtime.os, "listdir", return_value=["123"]
+        ), mock.patch.object(
+            runtime.os, "getpid", return_value=1000
+        ), mock.patch.object(
+            runtime.Path, "read_bytes", return_value=b"catatonit\0-P\0"
+        ), mock.patch.object(
+            runtime, "_parent_pid", return_value=2000
+        ), mock.patch.object(
+            runtime, "_podman_pause_pid", return_value=123
+        ), mock.patch.object(runtime.os, "kill") as kill:
+            runtime.reap_orphaned_helpers()
+        kill.assert_called_once_with(123, runtime.signal.SIGKILL)
+
+    def test_reap_orphaned_helpers_preserves_unrelated_podman_pause(self):
+        with mock.patch.object(runtime, "reap_orphaned_appimage_mounts"), mock.patch.object(
+            runtime, "_ancestor_pids", return_value=(2000, 3000)
+        ), mock.patch.object(
+            runtime.os, "listdir", return_value=["123"]
+        ), mock.patch.object(
+            runtime.os, "getpid", return_value=1000
+        ), mock.patch.object(
+            runtime.Path, "read_bytes", return_value=b"catatonit\0-P\0"
+        ), mock.patch.object(
+            runtime, "_parent_pid", return_value=4000
+        ), mock.patch.object(runtime, "_podman_pause_pid") as pause_pid, mock.patch.object(
+            runtime.os, "kill"
+        ) as kill:
+            runtime.reap_orphaned_helpers()
+        pause_pid.assert_not_called()
+        kill.assert_not_called()
+
+    def test_reap_orphaned_helpers_preserves_other_launch_catatonit(self):
+        with mock.patch.object(runtime, "reap_orphaned_appimage_mounts"), mock.patch.object(
+            runtime, "_ancestor_pids", return_value=(2000, 3000)
+        ), mock.patch.object(
+            runtime.os, "listdir", return_value=["123"]
+        ), mock.patch.object(
+            runtime.os, "getpid", return_value=1000
+        ), mock.patch.object(
+            runtime.Path, "read_bytes", return_value=b"catatonit\0-P\0"
+        ), mock.patch.object(
+            runtime, "_parent_pid", return_value=2000
+        ), mock.patch.object(
+            runtime, "_podman_pause_pid", return_value=456
+        ), mock.patch.object(runtime.os, "kill") as kill:
+            runtime.reap_orphaned_helpers()
+        kill.assert_not_called()
+
+    def test_repair_invalid_podman_pause_runs_only_for_pause_status_error(self):
+        invalid = mock.Mock(
+            returncode=125,
+            stdout="",
+            stderr='invalid internal status, try resetting the pause process with "podman system migrate"',
+        )
+        repaired = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(runtime.subprocess, "run", side_effect=[invalid, repaired]) as run, (
+            mock.patch.object(runtime.shutil, "which", return_value="/usr/bin/systemd-run")
+        ):
+            runtime._repair_invalid_podman_pause()
+        self.assertEqual(
+            [call[0][0] for call in run.call_args_list],
+            [
+                ["podman", "ps", "-a"],
+                [
+                    "systemd-run",
+                    "--user",
+                    "--wait",
+                    "--collect",
+                    "--unit=sdss-podman-migrate",
+                    "podman",
+                    "system",
+                    "migrate",
+                ],
+            ],
+        )
+        for call in run.call_args_list:
+            self.assertTrue(call.kwargs["capture_output"])
+            self.assertTrue(call.kwargs["text"])
+            self.assertFalse(call.kwargs["check"])
+            self.assertIsNotNone(call.kwargs.get("timeout"))
+
+    def test_repair_invalid_podman_pause_falls_back_without_systemd_run(self):
+        invalid = mock.Mock(
+            returncode=125,
+            stdout="",
+            stderr='invalid internal status, try resetting the pause process with "podman system migrate"',
+        )
+        repaired = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(runtime.subprocess, "run", side_effect=[invalid, repaired]) as run, (
+            mock.patch.object(runtime.shutil, "which", return_value=None)
+        ):
+            runtime._repair_invalid_podman_pause()
+        self.assertEqual(run.call_args_list[1][0][0], ["podman", "system", "migrate"])
+        self.assertTrue(run.call_args_list[1].kwargs["text"])
+        self.assertIsNotNone(run.call_args_list[1].kwargs.get("timeout"))
+
+    def test_repair_invalid_podman_pause_ignores_other_podman_errors(self):
+        other = mock.Mock(returncode=125, stdout="", stderr="cannot connect")
+        with mock.patch.object(runtime.subprocess, "run", return_value=other) as run:
+            runtime._repair_invalid_podman_pause()
+        run.assert_called_once_with(
+            ["podman", "ps", "-a"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=runtime.PODMAN_TEARDOWN_TIMEOUT,
+        )
+
+    def test_reap_orphaned_helpers_unmounts_sdss_appimage_mounts(self):
+        mountinfo = (
+            "42 35 0:99 / /tmp/.mount_Cemu.ABC rw,nosuid - fuseblk "
+            "/home/deck/Cemu.AppImage.sdss-real rw\n"
+        )
+        with mock.patch.object(runtime.Path, "read_text", return_value=mountinfo), mock.patch.object(
+            runtime.shutil, "which", return_value="/usr/bin/fusermount3"
+        ), mock.patch.object(runtime.subprocess, "run") as run:
+            runtime.reap_orphaned_appimage_mounts()
+        run.assert_called_once_with(
+            ["/usr/bin/fusermount3", "-u", "-z", "/tmp/.mount_Cemu.ABC"],
+            capture_output=True,
+            check=False,
+        )
 
 
 class OuterGamescopeResolutionTests(unittest.TestCase):

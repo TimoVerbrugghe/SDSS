@@ -25,8 +25,10 @@ Do not break these without updating `docs/PLAN.md` first:
    `zwlr_virtual_pointer_manager_v1` bound to `HEADLESS-1`.
 4. The SteamOS rootfs is **read-only and stays that way**. No `pacman`, no
    `steamos-readonly disable`. Everything lives under `$HOME`.
-5. Emulator config edits always go through the journal in `host/src/sdss/patch.py`, so a
-   restore is byte-identical. Never write a config without a backup.
+5. Emulator config edits always go through the journal in `host/src/sdss/patch.py`.
+   Enabled profiles own only their declared keys: disabling selectively restores those keys
+   while preserving unrelated edits. Every journal also retains a checksum-verified full
+   backup for recovery. Never write an emulator config without that journal.
 
 ## Conventions
 
@@ -81,6 +83,115 @@ paste real command output and the LAN IPs, hostnames and Steam IDs come with it.
 
 The gamescope session's Wayland socket is `gamescope-0` and `XDG_RUNTIME_DIR=/run/user/1000`.
 An SSH shell has no session env — source `/run/user/1000/gamescope-environment` first.
+
+### Launching Steam shortcuts over SSH
+
+In **Steam Game Mode**, every end-to-end test must start from the Deck's generated
+Steam shortcut (`Second Screen`) in the Steam UI. Do not launch
+`sdss-connect` directly over SSH and call that an end-to-end test: it bypasses
+Steam's game scope and is only valid for pairing or isolated Moonlight
+diagnostics. An SSH-triggered Steam URL is the automation equivalent of
+selecting the shortcut, but it must be sent to the already-running Steam client
+with the live gamescope environment sourced.
+
+Before testing on the Deck, verify that Game Mode is actually active:
+
+```
+ps -eo args | grep '[s]team .*-steamdeck.*-gamepadui'
+loginctl show-session "$(loginctl list-sessions --no-legend | awk '$3=="deck" {print $1; exit}')" -p Type -p State
+```
+
+The expected session type is `wayland`, and Steam must include both
+`-steamdeck` and `-gamepadui`. Never use `nohup`, `setsid`, or a direct
+`sdss-connect <host>` launch to simulate the Game Mode shortcut.
+
+Launch non-Steam shortcuts with the **64-bit gameid**, not the signed 32-bit appid, and
+source the live gamescope environment first:
+
+```
+export XDG_RUNTIME_DIR=/run/user/1000
+set -a; source /run/user/1000/gamescope-environment; set +a
+/home/deck/.local/share/Steam/steam.sh "steam://rungameid/<64-bit-gameid>"
+```
+
+The known-good SDSS launch path is this exact command; bare `steam <url>` or a launch
+without the sourced environment silently does nothing. Current shortcut IDs include:
+Azahar `13816419520748716032`, Cemu Wind Waker HD `15768959151553642496`, and the
+Deck Second Screen shortcut `13044482501723029504`.
+
+After launching, verify that Steam owns the process before judging the test:
+
+```
+ps -eo pid,ppid,args | grep -E '[r]eaper SteamLaunch AppId=|[m]oonlight stream'
+grep -E 'AppID 13044482501723029504' \
+  ~/.local/share/Steam/logs/gameprocess_log.txt | tail
+```
+
+The Moonlight process should descend from Steam's `reaper SteamLaunch` process.
+If the Deck shows no image, keep the Steam-launched session intact while
+collecting Steam/Moonlight logs; do not replace it with a direct `sdss-connect`
+launch, because that changes the test being diagnosed.
+
+For a screenshot of the Steam Machine's outer display, use Gamescope's control
+tool. Source the live environment first:
+
+```
+export XDG_RUNTIME_DIR=/run/user/1000
+set -a; source /run/user/1000/gamescope-environment; set +a
+/usr/bin/gamescopectl screenshot /home/deck/sdss-debug/steam-machine.png
+```
+
+This captures the Steam Machine display (including a spinner or visible
+emulator), not the streamed `HEADLESS-1` screen.
+
+Do not kill Steam-managed game process trees with `pkill` during teardown testing. It
+can leave Steam's game state wedged while the Steam client remains alive, making later
+URLs appear broken. Stop the emulator through Steam when possible. If Steam is wedged,
+restart the user gamescope session, wait for the client to return, source the newly
+generated environment file, and only then retry the URL.
+
+### Deploying to a device
+
+**Never `scp` individual changed files onto an installed release.** This has produced two
+separate multi-hour debugging sessions, both of which looked like emulator bugs and were
+not. The installed tree under `~/.local/share/sdss/release/` was built from *some* commit,
+and that commit is usually not the branch you are on — it may contain modules your branch
+does not have and lack attributes your branch's modules now require. Copying three files
+into it yields a package that imports cleanly and then dies at runtime, deep inside a
+Steam-launched process where the traceback is invisible. The symptom that finally exposed
+it was `AttributeError: 'Profile' object has no attribute 'second_size'` — a stale
+`profiles.py` under a freshly copied `session.py`.
+
+So: **deploy the whole `host/src/sdss/` package**, then verify before launching anything.
+
+```
+scp host/src/sdss/*.py deck@<host>:~/.local/share/sdss/release/host/src/sdss/
+ssh deck@<host> 'find ~/.local/share/sdss/release -name __pycache__ -type d -exec rm -rf {} +
+  cd ~/.local/share/sdss/release/host/src && python3 -c "import sdss.cli"'
+```
+
+Note that `*.py` only overwrites; it never deletes. If the installed release has modules
+your branch removed, they survive and may still be imported. Compare the two file lists
+(`ls ... | xargs -n1 basename`) whenever the deployed version is of unknown provenance —
+`~/.local/share/sdss/release/VERSION` tells you which release it came from, not which
+branch. When the lists differ, re-run the installer instead of patching by hand.
+
+Clearing `__pycache__` is not optional: SteamOS keeps writing it, and a stale `.pyc` will
+happily shadow a file you just replaced.
+
+### Finding out why a Steam-launched run failed
+
+SDSS writes no log of its own, and an emulator started through Steam has its stderr
+swallowed. When a launch "just crashes", the traceback is in the **journal**, attributed to
+Steam rather than to SDSS:
+
+```
+journalctl --user --since "-6 min" | grep -iE "sdss|Traceback|Error|signal|Fatal"
+```
+
+Reach for that before reading Steam's own logs or hypothesising about the emulator. Every
+"the emulator crashes" report in this project so far has turned out to be an SDSS-side
+exception visible in exactly this way.
 
 ## Style
 

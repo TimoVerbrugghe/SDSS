@@ -6,6 +6,7 @@ It captures only sway's headless output and never streams audio — sound stays 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,8 @@ FLATPAK_ID = "dev.lizardbyte.app.Sunshine"
 # Moonlight's CLI takes only a host, with no way to address a custom port, so SDSS owns the
 # default port on the Steam Machine rather than running alongside another Sunshine.
 DEFAULT_PORT = 47989
+SUNSHINE_ENCODER_ENV = "SDSS_SUNSHINE_ENCODER"
+_ENCODERS = frozenset({"software", "vaapi"})
 
 
 @dataclass(frozen=True)
@@ -25,11 +28,16 @@ class SunshineSpec:
     port: int = DEFAULT_PORT
     name: str = "SDSS Second Screen"
     output: str = HEADLESS_OUTPUT
+    encoder: str | None = None
 
 
 def default_spec() -> SunshineSpec:
     """The one Sunshine config location every caller shares."""
-    return SunshineSpec(config_dir=paths.config_dir() / "sunshine")
+    encoder = os.environ.get(SUNSHINE_ENCODER_ENV)
+    if encoder is not None and encoder not in _ENCODERS:
+        supported = ", ".join(sorted(_ENCODERS))
+        raise ValueError(f"{SUNSHINE_ENCODER_ENV} must be one of: {supported}")
+    return SunshineSpec(config_dir=paths.config_dir() / "sunshine", encoder=encoder)
 
 
 def render_conf(spec: SunshineSpec) -> str:
@@ -39,13 +47,48 @@ def render_conf(spec: SunshineSpec) -> str:
         "capture": "wlr",
         "output_name": spec.output,
         "stream_audio": "disabled",
-        "min_log_level": "info",
+        # Every "info"-level line (resolution, codec/vaapi details, bitrate, interface
+        # discovery -- dozens of lines per launch) is stdout that gets relayed through
+        # Steam's own log-capture pipeline (srt-logger) alongside everything else SDSS's
+        # session produces, on top of every other process SDSS launches. "warning" still
+        # surfaces anything Sunshine considers an actual problem (warning/error/fatal);
+        # only the routine per-launch diagnostic chatter is cut.
+        "min_log_level": "warning",
+        # Left at its "auto" default, Sunshine probes gamepad support on every startup by
+        # actually instantiating one virtual pad per candidate type through uinput
+        # ("Sunshine Nintendo (virtual) pad", "Sunshine X-Box One (virtual) pad") and
+        # tearing them down again. SDSS restarts Sunshine for every game launch, so that
+        # probe repeats every launch, and Steam Input re-enumerates every input device on
+        # each hotplug -- verified on hardware, the input index climbed from input34 to
+        # input123 across twelve launches, and the 32-bit Steam client went from ~280 MB
+        # to ~2.9 GB in 40s and died on a 65-byte allocation in tier0/memstd.cpp, which is
+        # address-space exhaustion in a 32-bit process rather than a true system OOM.
+        # Naming the type outright skips the probe entirely: only the single pad an
+        # actually-connected client needs is created, so the Deck keeps full button,
+        # trigger and stick input. "xone" is chosen over "x360" because it is what this
+        # build's own auto-selection resolves to for an Xbox-type client ("will be Xbox One
+        # controller (default)"), so pinning it changes only *when* the pad is created, not
+        # which one -- and unlike the Xbox 360 pad it carries analogue triggers and the
+        # guide button, both of which the Deck has.
+        "gamepad": "xone",
         "origin_web_ui_allowed": "lan",
+        # There is no desktop shell in this headless bwrap sandbox for a tray icon to
+        # attach to. Left at its "enabled" default, Sunshine still tries to create one on
+        # every single launch, and its GTK/DBus teardown fails loudly on every single
+        # session exit -- verified on hardware: "GLib-GIO-CRITICAL: Error while sending
+        # AddMatch()/GetNameOwner() message: The connection is closed", a
+        # Gtk-CRITICAL assertion failure, and a libayatana-appindicator-WARNING, on
+        # every single teardown, all relayed through Steam's own log-capture pipeline
+        # (srt-logger) alongside everything else SDSS's session produces. Disabling it
+        # is strictly correct for this setup regardless of any other effect.
+        "system_tray": "disabled",
         "file_apps": str(spec.config_dir / "apps.json"),
         "log_path": str(spec.config_dir / "sunshine.log"),
         "credentials_file": str(spec.config_dir / "credentials.json"),
         "file_state": str(spec.config_dir / "state.json"),
     }
+    if spec.encoder is not None:
+        settings["encoder"] = spec.encoder
     return "".join(f"{key} = {value}\n" for key, value in settings.items())
 
 
@@ -85,6 +128,15 @@ def launch_command(spec: SunshineSpec, wayland_display: str, runtime_dir: str) -
         *launch.flatpak_socket_args(wayland_display),
         f"--env=XDG_RUNTIME_DIR={runtime_dir}",
         f"--filesystem={spec.config_dir}",
+        # libva (VA-API hardware video encoding) has its own logging entirely separate
+        # from Sunshine's own min_log_level -- it reads this env var directly (see
+        # va_MessagingInit() in libva's va.c) and, left unset, defaults to level 2
+        # ("info"), printing "libva info: ..." for every driver probe/open on every
+        # single launch. Verified on hardware: a substantial, steady contributor to the
+        # subprocess output Steam's own log-capture pipeline (srt-logger) has to relay
+        # alongside everything else SDSS's session produces. Level 1 keeps genuine
+        # "libva error: ..." messages if something actually breaks.
+        "--env=LIBVA_MESSAGING_LEVEL=1",
         "--device=all",
         FLATPAK_ID,
         str(spec.config_dir / "sunshine.conf"),

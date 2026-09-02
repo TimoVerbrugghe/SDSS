@@ -47,12 +47,79 @@ if ! grep -qx "$APP_NAME" <<<"$apps"; then
     exit 1
 fi
 
-# `exec` bypasses shell functions, so the flatpak has to be spelled out here.
+# Do NOT `exec` here. Flatpak's own sandbox helper reparents the real moonlight
+# process (and its bwrap wrapper) to the user's systemd, detached from whatever
+# spawned `flatpak run` -- so when Steam's reaper sends SIGTERM to this script's
+# PID, killing that PID (or even exec'ing straight into flatpak and killing the
+# result) never reaches the actual streaming process. Steam's `steam://closeapp`
+# / `steam://stopgame` then reports success while `bwrap`+`moonlight` keep running
+# forever, which is exactly the "artifact left behind after a Steam stop" failure
+# mode this project treats as a hard bug. Instead: launch in the background, trap
+# the signals Steam's reaper actually sends, and on any of them explicitly ask
+# Flatpak to kill this specific app instance before this script exits.
 # Touch reliability depends primarily on the Steam Input layout for this shortcut:
 # add the Always-On command `System -> Touchscreen Native Support`.
 # Keep `--no-touchscreen-trackpad` as a Moonlight-side guardrail to avoid trackpad
 # emulation paths on clients that default touchscreen to trackpad behavior.
-exec flatpak run "$MOONLIGHT_ID" stream "$host" "$APP_NAME" \
-    --resolution "$RESOLUTION" --fps "$FPS" \
-    --display-mode fullscreen --no-vsync \
-    --no-touchscreen-trackpad "$@"
+STOPPING=0
+cleanup() {
+    STOPPING=1
+    # Idempotent: harmless if moonlight already exited on its own.
+    flatpak kill "$MOONLIGHT_ID" 2>/dev/null || true
+}
+trap cleanup EXIT TERM INT HUP
+
+# The host tears down and rebuilds its whole Sunshine + compositor session on every game
+# launch/exit (verified on hardware, docs/architecture.md) rather than keeping one running
+# for as long as SDSS is enabled. Moonlight does not treat that as a dropped connection to
+# retry: verified on hardware that it stays running, reports normal-looking CPU usage
+# briefly then goes idle, and just keeps showing the last frame from the vanished session
+# indefinitely -- it does not reconnect on its own even once the host's next session is up.
+# CPU ticks are the signal used to notice this because it needs no protocol-level access to
+# Moonlight: a stream that is actually decoding/rendering 60 fps burns non-trivial, continuous
+# CPU; one stuck on a stale frame burns close to none. A stall this script itself caused by
+# asking Flatpak to stop (STOPPING=1) is not a hang to recover from.
+STALL_CHECK_INTERVAL=5
+STALL_GRACE_SECONDS=15
+MIN_CPU_TICKS_PER_CHECK=2
+
+cpu_ticks_of() {
+    awk '{print $14+$15}' "/proc/$1/stat" 2>/dev/null || echo ""
+}
+
+run_stream_once() {
+    flatpak run "$MOONLIGHT_ID" stream "$host" "$APP_NAME" \
+        --resolution "$RESOLUTION" --fps "$FPS" \
+        --display-mode fullscreen --no-vsync \
+        --no-touchscreen-trackpad "$@" &
+    local wrapper_pid=$! moonlight_pid="" stalled_for=0 last_ticks="" ticks
+    while kill -0 "$wrapper_pid" 2>/dev/null; do
+        sleep "$STALL_CHECK_INTERVAL"
+        [ "$STOPPING" = 1 ] && break
+        if [ -z "$moonlight_pid" ] || ! kill -0 "$moonlight_pid" 2>/dev/null; then
+            # `pgrep` exits 1 when nothing matches yet (moonlight still starting up); under
+            # `pipefail` that would otherwise propagate through `| head -1` and trip `-e`.
+            moonlight_pid=$(pgrep -x moonlight | head -1) || true
+        fi
+        [ -z "$moonlight_pid" ] && continue
+        ticks=$(cpu_ticks_of "$moonlight_pid")
+        [ -z "$ticks" ] && continue
+        if [ -n "$last_ticks" ] && [ $((ticks - last_ticks)) -lt "$MIN_CPU_TICKS_PER_CHECK" ]; then
+            stalled_for=$((stalled_for + STALL_CHECK_INTERVAL))
+        else
+            stalled_for=0
+        fi
+        last_ticks=$ticks
+        if [ "$stalled_for" -ge "$STALL_GRACE_SECONDS" ]; then
+            echo "second screen stream appears stalled (no host-side session reachable?) — reconnecting" >&2
+            flatpak kill "$MOONLIGHT_ID" 2>/dev/null || true
+            break
+        fi
+    done
+    wait "$wrapper_pid" 2>/dev/null || true
+}
+
+while [ "$STOPPING" = 0 ]; do
+    run_stream_once "$@"
+done
+

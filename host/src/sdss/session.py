@@ -1,25 +1,58 @@
-"""Session lifecycle: patch configs, start sway + Sunshine, run the emulator, restore."""
+"""Session lifecycle: start sway + Sunshine, run the emulator, and tear processes down."""
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import logging
 import os
+import resource
+import signal
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import compositor, launch, paths, patch, runtime, stream
-from .compositor import CompositorSpec, OutputMode, environment, render_config
+from . import compositor, launch, paths, runtime, stream
+from .compositor import DECK_PANEL_RESOLUTION, CompositorSpec, OutputMode, environment, render_config
 from .profiles import Profile
 
 log = logging.getLogger("sdss.session")
 
-JOURNAL_NAME = "session"
 ENV_DUMP_TIMEOUT = 15.0
+KILL_REAP_TIMEOUT = 10.0
+CLEANUP_DEADLINE = 45.0
+COMPOSITOR_RENDERER_ENV = "SDSS_COMPOSITOR_RENDERER"
+DISABLE_STEAM_OVERLAY_ENV = "SDSS_DISABLE_STEAM_OVERLAY"
+DISABLE_SUNSHINE_ENV = "SDSS_DISABLE_SUNSHINE"
+
+
+def _disable_coredumps() -> None:
+    """`preexec_fn` that sets RLIMIT_CORE=0 in the about-to-exec child.
+
+    Every reproducible SIGBUS/SIGABRT cascade seen during teardown (sway, Xwayland,
+    sdss_inputd crashing together, or the emulator itself aborting on a severed X11
+    connection) produces a `systemd-coredump` invocation per crashing process: a full
+    stack-trace dump, a minidump, and a DrKonqi handoff attempt, all within about a
+    second — real, bursty journal volume relayed through Steam's own srt-logger
+    alongside everything else SDSS's session produces. This does not fix the
+    underlying crash (that investigation continues separately); it only stops each
+    crash from also generating a disproportionate burst of log writes on top of
+    itself, which is the more direct, testable lever on whether that log burst is
+    what actually pushes Steam's own log pipeline over the edge.
+    """
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ValueError, OSError):
+        pass
 
 
 class SessionError(Exception):
+    pass
+
+
+class SessionInterrupted(SessionError):
     pass
 
 
@@ -30,15 +63,15 @@ class Session:
     tv: OutputMode | None = None
     dry_run: bool = False
     _processes: list[subprocess.Popen] = field(default_factory=list, repr=False)
+    _emulator_proc: subprocess.Popen | None = field(default=None, repr=False)
+    _compositor_proc: subprocess.Popen | None = field(default=None, repr=False)
     _pin_keepalive_fd: int | None = field(default=None, repr=False)
+    _signal_handlers: dict[int, object] = field(default_factory=dict, repr=False)
+    _stopping: bool = field(default=False, repr=False)
 
     @property
     def runtime(self) -> Path:
         return paths.runtime_dir() / "session"
-
-    @property
-    def journal(self) -> patch.Journal:
-        return patch.Journal(paths.backup_dir(), JOURNAL_NAME)
 
     @staticmethod
     def _session_runtime_dir() -> str:
@@ -86,7 +119,7 @@ class Session:
             profile=self.profile,
             env_dump=str(dump),
             tv=tv,
-            second=OutputMode(*self.profile.second_size),
+            second=OutputMode(*DECK_PANEL_RESOLUTION),
             main_output=main_output,
         )
         config = runtime_dir / "sway.conf"
@@ -100,41 +133,169 @@ class Session:
             "sunshine_conf": sunshine.config_dir / "sunshine.conf",
         }
 
-    def patch_configs(self) -> list[Path]:
-        journal = self.journal
-        if journal.exists:
-            log.warning("stale journal found — restoring before starting")
-            journal.restore()
-        changed: list[Path] = []
-        for target in self.profile.configs:
-            path = target.resolve()
-            if patch.patch_file(path, target.format, target.edits, journal):
-                changed.append(path)
-        return changed
-
     # --- run -------------------------------------------------------------------------
 
     def run(self) -> int:
-        artifacts = self.write_artifacts()
         if self.dry_run:
+            self.write_artifacts()
             return 0
 
+        with self._session_lock():
+            self._install_signal_handlers()
+            try:
+                runtime.arm_parent_death_signal()
+                artifacts = self.write_artifacts()
+                sway_proc = self._start_sway(artifacts["sway_config"])
+                nested = self._await_nested_display(artifacts["sway_env"])
+                if os.environ.get(DISABLE_SUNSHINE_ENV) == "1":
+                    log.warning("%s=1 — skipping Sunshine (diagnostic)", DISABLE_SUNSHINE_ENV)
+                else:
+                    self._start_sunshine(nested["WAYLAND_DISPLAY"])
+                emulator = self._start_emulator(nested)
+                code = emulator.wait()
+                log.info("emulator exited with %s — tearing down the session", code)
+                return code
+            finally:
+                self._stopping = True
+                runtime.disarm_parent_death_watch()
+                try:
+                    self._cleanup_with_deadline()
+                finally:
+                    self._restore_signal_handlers()
+
+    @contextlib.contextmanager
+    def _session_lock(self):
+        lock_path = paths.session_lock_file()
+        handle = paths.ensure(lock_path.parent).joinpath(lock_path.name).open("w")
         try:
-            # Inside the try: a PatchError from the second of three config targets used to
-            # leave the first one patched with a populated journal and no restore, because
-            # this ran before the `finally` was armed.
-            self.patch_configs()
-            sway_proc = self._start_sway(artifacts["sway_config"])
-            nested = self._await_nested_display(artifacts["sway_env"])
-            self._start_sunshine(nested["WAYLAND_DISPLAY"])
-            emulator = self._start_emulator(nested)
-            code = emulator.wait()
-            log.info("emulator exited with %s — tearing down the session", code)
-            if sway_proc.poll() is None:
-                sway_proc.terminate()
-            return code
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise SessionError("another SDSS emulator session is already running") from exc
+            yield
         finally:
-            self.cleanup()
+            handle.close()
+
+    def _install_signal_handlers(self) -> None:
+        def interrupted(signum, _frame):
+            name = signal.Signals(signum).name
+            if self._stopping:
+                log.warning("received %s while already stopping — ignoring", name)
+                return
+            self._stopping = True
+            log.warning("received %s — stopping the SDSS session", name)
+            raise SessionInterrupted(f"session interrupted by {name}")
+
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            self._signal_handlers[signum] = signal.signal(signum, interrupted)
+
+    def _restore_signal_handlers(self) -> None:
+        for signum, handler in self._signal_handlers.items():
+            signal.signal(signum, handler)
+        self._signal_handlers.clear()
+
+    @staticmethod
+    def _terminate_process(proc: subprocess.Popen, *, graceful: bool = True) -> None:
+        """Stop a launched process and the wrappers it may have spawned.
+
+        ``graceful=False`` skips SIGTERM and sends SIGKILL immediately.
+
+        The emulator is now stopped with ``graceful=True`` (see cleanup()'s docstring
+        for the full history of why): an immediate SIGKILL denies it any chance to
+        release its GPU/X11 resources before the compositor is touched, which was
+        directly implicated in a reproducible sway/Xwayland SIGBUS. SIGTERM gives the
+        emulator its own 5s window to exit cleanly through its normal shutdown path;
+        the SIGKILL escalation below still guarantees the same worst-case bound as
+        before if it doesn't.
+        """
+        first_signal = signal.SIGTERM if graceful else signal.SIGKILL
+        # /proc/<pid>/status can block on a task in uninterruptible sleep, so this scan is
+        # itself a candidate for a hung teardown; log around it to pin that down.
+        log.info("terminate: scanning descendants of %s", proc.pid)
+        descendants = Session._descendant_pids(proc.pid)
+        log.info("terminate: %s has %d descendant(s)", proc.pid, len(descendants))
+        for pid in descendants:
+            try:
+                os.kill(pid, first_signal)
+            except (ProcessLookupError, PermissionError):
+                continue
+        try:
+            os.killpg(proc.pid, first_signal)
+        except ProcessLookupError:
+            return
+        except PermissionError as exc:
+            log.warning("could not terminate process group %s: %s", proc.pid, exc)
+            return
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError as exc:
+                log.warning("could not kill process group %s: %s", proc.pid, exc)
+            for pid in descendants:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    continue
+            try:
+                proc.wait(timeout=KILL_REAP_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                # A SIGKILLed process that still has not been reaped is stuck in
+                # uninterruptible sleep (Cemu's GPU teardown does this). Blocking here
+                # holds Steam's reaper open forever, so Steam's "exiting game" never
+                # completes; give up the wait and let cleanup continue.
+                log.warning(
+                    "process group %s still alive %.0fs after SIGKILL — continuing teardown",
+                    proc.pid,
+                    KILL_REAP_TIMEOUT,
+                )
+        else:
+            # Flatpak and container runtimes can move their init process into a
+            # separate process group; do not leave it holding Steam's reaper.
+            for pid in descendants:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    continue
+
+    @staticmethod
+    def _descendant_pids(root_pid: int) -> list[int]:
+        """Return a snapshot of all descendants, including escaped process groups."""
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return []
+        parents: dict[int, list[int]] = {}
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            try:
+                status = Path(f"/proc/{pid}/status").read_text()
+            except OSError:
+                continue
+            parent = next(
+                (
+                    int(line.split("\t", 1)[1])
+                    for line in status.splitlines()
+                    if line.startswith("PPid:\t")
+                ),
+                None,
+            )
+            if parent is not None:
+                parents.setdefault(parent, []).append(pid)
+
+        descendants: list[int] = []
+        pending = [root_pid]
+        while pending:
+            parent = pending.pop()
+            children = parents.get(parent, [])
+            descendants.extend(children)
+            pending.extend(children)
+        return descendants
 
     def _start_emulator(self, nested: dict[str, str]) -> subprocess.Popen:
         wayland_display = nested["WAYLAND_DISPLAY"]
@@ -144,37 +305,59 @@ class Session:
                 f"{self.profile.name} needs Xwayland but the compositor reported no DISPLAY"
             )
         runtime_dir = self._session_runtime_dir()
-        command = launch.build_command(self.command, wayland_display)
+        command = launch.build_command(
+            self.command, wayland_display, self.profile.launch_args
+        )
         env = launch.build_env(
             dict(os.environ),
             wayland_display,
             runtime_dir,
             x11_display=x11_display,
             prefer_x11=self.profile.needs_x11,
+            steam_overlay=self.profile.steam_overlay
+            and os.environ.get(DISABLE_STEAM_OVERLAY_ENV) != "1",
         )
         log.info(
             "launching emulator on %s", x11_display if self.profile.needs_x11 else wayland_display
         )
         try:
-            proc = subprocess.Popen(command, env=env)
+            proc = subprocess.Popen(
+                command, env=env, start_new_session=True, preexec_fn=_disable_coredumps
+            )
         except OSError as exc:
             raise SessionError(f"could not launch emulator {command[0]!r}: {exc}") from exc
         self._processes.append(proc)
+        self._emulator_proc = proc
         return proc
 
     def _start_sway(self, config: Path) -> subprocess.Popen:
         backend, parent = runtime.parent_display()
-        env = {**os.environ, **environment(backend, parent), **self.profile.extra_env}
+        env = launch.helper_env(
+            {**os.environ, **environment(backend, parent), **self.profile.extra_env}
+        )
+        if renderer := os.environ.get(COMPOSITOR_RENDERER_ENV):
+            env["WLR_RENDERER"] = renderer
         try:
             command = runtime.compositor_command(config, paths.runtime_dir().parent)
         except RuntimeError as exc:
             raise SessionError(str(exc)) from exc
         log.info("starting nested compositor on parent %s display %s", backend, parent)
+        # Must exist and be owned by us before the container mounts it over /tmp/.X11-unix,
+        # or wlroots refuses to start Xwayland and needs_x11 profiles get a black screen.
+        runtime.prepare_x11_bridge(paths.runtime_dir().parent)
+        # `podman run --replace` refuses to take over a container whose conmon died
+        # without cleaning up (a hard kill, or a crashed previous run): it reports
+        # "conmon exited prematurely" and the new container dies immediately. A forced
+        # remove first is the only thing that reliably clears that state.
+        runtime.remove_container()
         try:
-            proc = subprocess.Popen(command, env=env)
+            proc = subprocess.Popen(
+                command, env=env, start_new_session=True, preexec_fn=_disable_coredumps
+            )
         except OSError as exc:
             raise SessionError(f"could not start compositor {command[0]!r}: {exc}") from exc
         self._processes.append(proc)
+        self._compositor_proc = proc
         return proc
 
     def _await_nested_display(self, env_file: Path) -> dict[str, str]:
@@ -187,7 +370,13 @@ class Session:
                     for line in env_file.read_text().splitlines()
                     if "=" in line
                 )
-                if values.get("WAYLAND_DISPLAY"):
+                # `xwayland force` starts Xwayland at compositor init, so DISPLAY is
+                # normally already set by the time sway runs the env dump. Keep waiting
+                # rather than accepting a blank one, so a slow start surfaces as a timeout
+                # instead of "needs Xwayland but the compositor reported no DISPLAY".
+                if values.get("WAYLAND_DISPLAY") and not (
+                    self.profile.needs_x11 and not values.get("DISPLAY")
+                ):
                     log.info(
                         "nested compositor on %s (xwayland %s)",
                         values["WAYLAND_DISPLAY"],
@@ -204,7 +393,12 @@ class Session:
         keepalive_fd, child_fd = self._pin_fifo()
         started = False
         try:
-            proc = subprocess.Popen(command, stdin=child_fd)
+            proc = subprocess.Popen(
+                command,
+                env=launch.helper_env(dict(os.environ)),
+                stdin=child_fd,
+                start_new_session=True,
+            )
             started = True
         except OSError as exc:
             raise SessionError(f"could not start Sunshine {command[0]!r}: {exc}") from exc
@@ -238,27 +432,122 @@ class Session:
         child_fd = os.open(path, os.O_RDONLY)
         return keepalive_fd, child_fd
 
+    def _cleanup_with_deadline(self) -> None:
+        """Run cleanup(), but never let it hold Steam's reaper open indefinitely.
+
+        Every individual teardown step is bounded, but this is the backstop for a step
+        that blocks in a way no timeout covers (an unreapable process in uninterruptible
+        sleep, a wedged Podman client, a helper stuck on a kernel resource). SDSS runs as
+        a child of Steam's `reaper`; while this process lives, Steam still considers the
+        game running. A session that never finishes tearing down leaves Steam holding a
+        stale game, and the *next* launch then drives the 32-bit Steam client into a
+        runaway allocation and an OOM restart -- observed on hardware as "launching any
+        game after an SDSS exit crashes the Steam UI", including emulators SDSS never
+        touched. Exiting late-but-always is strictly better than blocking forever.
+        """
+        done = threading.Event()
+        error: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                self.cleanup()
+            except BaseException as exc:  # surfaced below on the main thread
+                error.append(exc)
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=run, name="sdss-cleanup", daemon=True)
+        worker.start()
+        if not done.wait(CLEANUP_DEADLINE):
+            log.error(
+                "cleanup did not finish within %.0fs — abandoning it so Steam's reaper "
+                "is released; the session may leave stray processes behind",
+                CLEANUP_DEADLINE,
+            )
+            return
+        if error:
+            raise error[0]
+
     def cleanup(self) -> None:
+        """Tear the session down: emulator (graceful), then compositor, then everything else.
+
+        Three orderings/signal combinations have now been tried on real hardware, and
+        each falsified in a different way, all captured with diagnostic logging in
+        place (see runtime.reap_orphaned_helpers()'s own log lines and
+        docs/hardware-test-report.md):
+
+        1. Emulator killed first with an *immediate* SIGKILL, then the compositor.
+           sway/Xwayland crashed with SIGBUS (signal 7) on the emulator's now-stale
+           GPU/SHM buffer — an abrupt SIGKILL gives the emulator no chance to release
+           its GPU context before sway/Xwayland go looking at it again.
+        2. Compositor killed first (sway/Xwayland/sdss_inputd), then the emulator.
+           This does stop the sway SIGBUS, but pushes the crash onto the *emulator*
+           instead: killing Xwayland out from under a still-running X11 client (Azahar)
+           makes it hit "X11 connection broke" and abort with SIGABRT instead of exiting
+           cleanly. Confirmed via coredump (signal 6, `terminate called without an
+           active exception`) at the exact moment reap_orphaned_helpers() kills
+           Xwayland. That crashed (not clean) emulator exit is also what makes Steam's
+           own game-process reaper stall for tens of seconds afterward — the "long
+           delay exiting a game" symptom is a direct side effect of this, not a
+           separate bug.
+
+        This ordering is the one combination not yet tried: send the emulator a real
+        SIGTERM and *wait for it to exit on its own* (the same graceful-then-SIGKILL
+        path used elsewhere, capped at 5s) before touching the compositor at all. A
+        clean SIGTERM gives the emulator the chance to release its X11/GPU resources
+        through its own shutdown path instead of either being killed abruptly (case 1)
+        or having its connection yanked out (case 2). Only once the emulator is
+        confirmed gone does the compositor get torn down, at which point there is no
+        longer a live X11 client depending on it. Unverified on hardware as of this
+        change — if a fresh SIGBUS or SIGABRT reproduces with this in place, that would
+        mean a graceful emulator exit does not reliably release the resource in time
+        either, and the underlying fix needs to move to the compositor's own shutdown
+        path instead of the ordering.
+        """
+        cleanup_start = time.monotonic()
+        compositor_proc = self._compositor_proc
+        emulator_proc = self._emulator_proc
+
+        if emulator_proc is not None and emulator_proc.poll() is None:
+            log.info("cleanup: terminating emulator pid=%s (graceful)", emulator_proc.pid)
+            self._terminate_process(emulator_proc, graceful=True)
+        log.info("cleanup: emulator down at +%.2fs", time.monotonic() - cleanup_start)
+
+        uses_native_sway = runtime.native_sway() is not None
+
+        if uses_native_sway:
+            if compositor_proc is not None and compositor_proc.poll() is None:
+                self._terminate_process(compositor_proc, graceful=True)
+            runtime.reap_orphaned_helpers()
+        else:
+            # Do not terminate the local `podman run` child first. With `--rm`, even that can
+            # make conmon begin container teardown before sway/Xwayland/sdss_inputd are gone.
+            # remove_container() owns that ordering: direct rootfs clients first, then Podman.
+            try:
+                runtime.remove_container()
+            except OSError as exc:
+                # cleanup() runs from a `finally`; never let teardown replace the real error.
+                log.warning("could not remove compositor container: %s", exc)
+            if compositor_proc is not None and compositor_proc.poll() is None:
+                self._terminate_process(compositor_proc, graceful=False)
+        log.info(
+            "cleanup: compositor teardown done at +%.2fs",
+            time.monotonic() - cleanup_start,
+        )
+
+        # Everything else (currently just Sunshine) gets its ordinary graceful shutdown
+        # only now — after the emulator/compositor pair that must die back-to-back.
         for proc in reversed(self._processes):
+            if proc is emulator_proc or proc is compositor_proc:
+                continue
             if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+                self._terminate_process(proc, graceful=True)
+
         self._processes.clear()
+        self._emulator_proc = None
+        self._compositor_proc = None
         if self._pin_keepalive_fd is not None:
             os.close(self._pin_keepalive_fd)
             self._pin_keepalive_fd = None
         pin_path = self.runtime / "pin"
         pin_path.unlink(missing_ok=True)
-        journal = self.journal
-        if journal.exists:
-            try:
-                restored = journal.restore()
-            except patch.PatchError as exc:
-                # cleanup() runs from a `finally`; raising here would replace whatever
-                # actually ended the session. The backups are still on disk either way.
-                log.error("could not restore config files: %s", exc)
-            else:
-                log.info("restored %d config file(s)", len(restored))

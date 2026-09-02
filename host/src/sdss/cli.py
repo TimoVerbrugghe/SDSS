@@ -12,10 +12,21 @@ import shutil
 import subprocess
 import sys
 
-from . import hooks, paths, patch, profiles, runtime, state, stream
+from . import (
+    hooks,
+    launch,
+    managed_config,
+    paths,
+    patch,
+    profiles,
+    runtime,
+    state,
+    stream,
+)
 from .session import Session, SessionError
 
 log = logging.getLogger("sdss")
+RECONCILE_ERRORS = (patch.PatchError, OSError, ValueError)
 
 
 def _split_command(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -64,9 +75,9 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     print("== state ==")
     current = state.load()
     print(f"  second screen mode: {'enabled' if current.enabled else 'disabled'}")
-    journal = patch.Journal(paths.backup_dir(), "session")
-    if journal.exists:
-        print("  WARNING: stale config journal — run `sdss restore`")
+    journals = managed_config.active_journals()
+    if managed_config.LEGACY_SESSION_JOURNAL in journals:
+        print("  WARNING: legacy session config journal — run `sdss restore`")
         problems += 1
 
     print(f"\n{problems} problem(s)")
@@ -92,9 +103,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     if profile is None:
         log.info("no SDSS profile matches this command — launching unchanged")
         return _exec_passthrough(args.command)
-    if not (current.enabled_for(profile.id) or args.force or args.dry_run):
+    if not (current.enabled_for(profile.id) or args.dry_run):
         log.info("second screen mode is off — launching %s unchanged", profile.id)
         return _exec_passthrough(args.command)
+
+    if not args.dry_run:
+        try:
+            with _reconcile_lock():
+                managed_config.migrate_legacy_journal()
+                managed_config.enable_profile(profile)
+        except RECONCILE_ERRORS as exc:
+            log.error("%s", exc)
+            return 1
 
     session = Session(profile=profile, command=args.command, dry_run=args.dry_run)
     try:
@@ -108,13 +128,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                 print(path.read_text())
             return 0
         return session.run()
-    except (SessionError, patch.PatchError) as exc:
+    except (SessionError, patch.PatchError, OSError, ValueError) as exc:
         log.error("%s", exc)
         return 1
 
 
 def _exec_passthrough(command: list[str]) -> int:
-    return subprocess.call(command)
+    return subprocess.call(
+        command, env=launch.restore_emulator_preload(dict(os.environ))
+    )
 
 
 def cmd_patch(args: argparse.Namespace) -> int:
@@ -123,10 +145,11 @@ def cmd_patch(args: argparse.Namespace) -> int:
     except KeyError as exc:
         print(exc.args[0], file=sys.stderr)
         return 2
-    session = Session(profile=profile, command=[])
     try:
-        changed = session.patch_configs()
-    except patch.PatchError as exc:
+        with _reconcile_lock():
+            managed_config.migrate_legacy_journal()
+            changed = managed_config.enable_profile(profile)
+    except RECONCILE_ERRORS as exc:
         log.error("%s", exc)
         return 1
     for path in changed:
@@ -137,17 +160,28 @@ def cmd_patch(args: argparse.Namespace) -> int:
 
 
 def cmd_restore(_: argparse.Namespace) -> int:
-    journal = patch.Journal(paths.backup_dir(), "session")
-    if not journal.exists:
+    previous = state.load()
+    current = _copy_state(previous)
+    current.enabled = False
+    try:
+        with _reconcile_lock():
+            restored = managed_config.restore_all()
+            _reconcile_hooks(current)
+            state.save(current)
+    except RECONCILE_ERRORS as exc:
+        _rollback_reconcile(previous)
+        log.error("%s", exc)
+        return 1
+    if not restored:
         print("nothing to restore")
-        return 0
-    for path in journal.restore():
+    for path in restored:
         print(f"restored {path}")
     return 0
 
 
 def cmd_enable(args: argparse.Namespace) -> int:
-    current = state.load()
+    previous = state.load()
+    current = _copy_state(previous)
     if args.profile:
         try:
             profiles.get(args.profile)
@@ -158,8 +192,15 @@ def cmd_enable(args: argparse.Namespace) -> int:
         current.profiles[args.profile] = args.value
     else:
         current.enabled = args.value
-    state.save(current)
-    _reconcile_hooks(current)
+    try:
+        with _reconcile_lock():
+            managed_config.reconcile(_effective_profiles(current))
+            _reconcile_hooks(current)
+            state.save(current)
+    except RECONCILE_ERRORS as exc:
+        _rollback_reconcile(previous)
+        log.error("%s", exc)
+        return 1
     if args.profile:
         print(f"{args.profile}: {'enabled' if args.value else 'disabled'}")
     else:
@@ -174,22 +215,45 @@ def _reconcile_hooks(current: state.State) -> None:
     Decky plugin calls whenever its panel opens, which is what makes this self-heal an
     EmuDeck update that silently overwrote a wrapper while SDSS was already enabled.
 
-    Held under an exclusive lock: each reconcile is a check-then-rename on a path Steam
-    also launches from, so two overlapping invocations (a panel open racing an enable, or
-    two panel opens) could otherwise interleave into shadowing an already-shadowed binary.
+    The caller holds `_reconcile_lock`, since config ownership and wrappers must move together.
     """
-    with _hooks_lock():
-        for profile in profiles.PROFILES:
-            if profile.launcher_path is None:
-                continue
-            try:
-                hooks.reconcile(profile, current.enabled_for(profile.id))
-            except OSError as exc:
-                log.warning("could not update launcher for %s: %s", profile.id, exc)
+    errors: list[str] = []
+    for profile in profiles.PROFILES:
+        if profile.launcher_path is None:
+            continue
+        try:
+            hooks.reconcile(profile, current.enabled_for(profile.id))
+        except OSError as exc:
+            errors.append(f"{profile.id}: {exc}")
+    if errors:
+        raise OSError("could not update launcher(s): " + "; ".join(errors))
+
+
+def _effective_profiles(current: state.State) -> dict[str, bool]:
+    return {
+        profile.id: current.enabled_for(profile.id)
+        for profile in profiles.PROFILES
+    }
+
+
+def _copy_state(current: state.State) -> state.State:
+    return state.State(
+        enabled=current.enabled,
+        profiles=dict(current.profiles),
+    )
+
+
+def _rollback_reconcile(previous: state.State) -> None:
+    try:
+        with _reconcile_lock():
+            managed_config.reconcile(_effective_profiles(previous))
+            _reconcile_hooks(previous)
+    except RECONCILE_ERRORS as exc:
+        log.error("could not roll back failed toggle reconciliation: %s", exc)
 
 
 @contextlib.contextmanager
-def _hooks_lock():
+def _reconcile_lock():
     lock_path = paths.hooks_lock_file()
     try:
         paths.ensure(lock_path.parent)
@@ -209,7 +273,12 @@ def _hooks_lock():
 
 def cmd_status(args: argparse.Namespace) -> int:
     current = state.load()
-    _reconcile_hooks(current)
+    try:
+        with _reconcile_lock():
+            _reconcile_hooks(current)
+    except OSError as exc:
+        log.error("%s", exc)
+        return 1
     if getattr(args, "json", False):
         # Consumed by the Decky plugin, so profile ids never have to be hardcoded there.
         print(
@@ -256,7 +325,6 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="launch an emulator with the second screen")
     run.add_argument("--profile", help="force a profile instead of detecting one")
     run.add_argument("--dry-run", action="store_true", help="print generated config and stop")
-    run.add_argument("--force", action="store_true", help="ignore the enabled toggle")
     run.set_defaults(func=cmd_run)
 
     patch_cmd = sub.add_parser("patch", help="apply a profile's config edits")
