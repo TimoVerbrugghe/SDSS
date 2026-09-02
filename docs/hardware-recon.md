@@ -895,3 +895,41 @@ real controller input untouched.
 
 This also explains why every previous hypothesis failed: teardown bounding, root-property
 cleanup, overlay preload, output redirection and encoder choice all left the probe intact.
+
+## Follow-up handoff (2026-09-02)
+
+This section is the short state-of-the-investigation summary for a new Copilot session. The
+earlier sections contain the command-level evidence and should remain the source of truth.
+
+### What is merged
+
+The following hardware-driven changes are now in `main`: fixed Deck-panel sizing for `HEADLESS-1`,
+unsigned 64-bit `rungameid` generation, user-owned X11 socket bridging, teardown ordering and
+timeouts, reduced routine Sunshine/libva logging, bounded graceful shutdown, core-dump suppression,
+and the `gamepad = xone` Sunshine fix. The old root-property cleanup is intentionally not present.
+
+### What remains open
+
+The gamepad probe explains the reproducible 32-bit Steam address-space explosion when a client
+connects, and the production fix is deployed in code. It does **not** prove that every intermittent
+Steam crash has the same cause, nor explain why first launches after boot often survive. The
+remaining crash must not be described as resolved without a new controlled reproduction and a
+successful control.
+
+The app-ID observation also remains useful but non-causal: the nested container's cgroup leaf can
+be a `libpod-*` directory, so gamescope's leaf-name parser does not match it. However,
+`GAMESCOPE_FOCUSED_APP` focus/app-ID state was absent on successful launches too, so this cannot alone
+explain the crash or justify changing the launch architecture.
+
+### Safe continuation procedure
+
+1. Read this document and `.github/copilot-instructions.md`; do not restart already disproved
+   root-property, log-volume, encoder-only, or input-bridge hypotheses without new evidence.
+2. For Game Mode, launch the generated Deck shortcut through Steam and source the live gamescope
+   environment for any SSH automation. Do not substitute a direct `sdss-connect` process.
+3. Capture Steam journal, `gameprocess_log.txt`, Sunshine/Moonlight state, process ancestry, and
+   RSS over the same time window. Preserve the Steam-launched tree until evidence is collected.
+4. If Steam reports that a game is already running after forced teardown, repair the Steam session
+   first; that state is not a valid crash reproduction.
+5. Add a dated subsection here with the exact control, result, and what it rules in or out. Redact
+   addresses, hostnames, Steam IDs, and credentials before committing.
