@@ -35,6 +35,7 @@ class WrapperInstallTest(unittest.TestCase):
         wrapper = self.launcher.read_text()
         save = 'export SDSS_EMULATOR_LD_PRELOAD="${LD_PRELOAD-}"'
         self.assertIn(save, wrapper)
+        self.assertNotIn("SDSS_SUNSHINE_ENCODER", wrapper)
         self.assertIn("unset LD_PRELOAD", wrapper)
         self.assertLess(wrapper.index(save), wrapper.index("exec "))
 

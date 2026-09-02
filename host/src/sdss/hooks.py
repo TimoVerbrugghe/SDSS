@@ -22,10 +22,14 @@ from pathlib import Path
 from .profiles import Profile
 
 _MARKER = "# sdss-wrapper:"
+_WRAPPER_REVISION = 3
 
 
 def _marker_line(profile_id: str) -> str:
-    return f"{_MARKER} {profile_id} — managed by sdss, do not edit. See host/src/sdss/hooks.py."
+    return (
+        f"{_MARKER} {profile_id} v{_WRAPPER_REVISION} — managed by sdss, do not edit. "
+        "See host/src/sdss/hooks.py."
+    )
 
 
 def _resolve(profile: Profile) -> Path | None:
