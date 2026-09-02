@@ -432,33 +432,6 @@ class Session:
         child_fd = os.open(path, os.O_RDONLY)
         return keepalive_fd, child_fd
 
-    @staticmethod
-    def _clear_x11_residue(parent_display: str) -> None:
-        """Clean up X11 resources left on a shared Xwayland after compositor teardown.
-
-        When SDSS's nested compositor attaches to gamescope's per-game Xwayland (e.g. :1),
-        it creates windows and sets properties on that server's root window. These persist
-        after the compositor dies because the server is long-lived and shared across game
-        launches. On the next game's launch (a different appid), steamcompmgr's base-layer
-        tracking (GAMESCOPECTRL_BASELAYER_WINDOW property) collides with stale state,
-        causing the Steam client to OOM and restart. Clear that property explicitly.
-        """
-        if not parent_display:
-            return
-        try:
-            # Delete GAMESCOPECTRL_BASELAYER_WINDOW from the root window so the next
-            # session starts with a clean slate. Use xprop's -remove if available, else
-            # set it to 0 as a fallback.
-            subprocess.run(
-                ["sh", "-c", f"DISPLAY={parent_display} xprop -root -remove GAMESCOPECTRL_BASELAYER_WINDOW 2>/dev/null || DISPLAY={parent_display} xprop -root -f GAMESCOPECTRL_BASELAYER_WINDOW 32c -set GAMESCOPECTRL_BASELAYER_WINDOW 0"],
-                capture_output=True,
-                timeout=5,
-                check=False,
-            )
-            log.info("cleared X11 residue on %s", parent_display)
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            log.warning("could not clear X11 residue on %s: %s", parent_display, exc)
-
     def _cleanup_with_deadline(self) -> None:
         """Run cleanup(), but never let it hold Steam's reaper open indefinitely.
 
@@ -561,13 +534,6 @@ class Session:
             "cleanup: compositor teardown done at +%.2fs",
             time.monotonic() - cleanup_start,
         )
-
-        # Clear X11 residue on the parent display (if using X11 backend).
-        # This prevents steamcompmgr's base-layer tracking from colliding with stale state
-        # when the next game launches.
-        if not uses_native_sway:
-            _, parent = runtime.parent_display()
-            self._clear_x11_residue(parent)
 
         # Everything else (currently just Sunshine) gets its ordinary graceful shutdown
         # only now — after the emulator/compositor pair that must die back-to-back.

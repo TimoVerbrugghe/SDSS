@@ -765,63 +765,133 @@ two — which is why four earlier hypotheses (crash cascade, log volume, hung te
 `ChangeProperty`/`BadAtom` error) all failed: they were all derived from SDSS-side logs,
 and the differing state is entirely outside SDSS, on the shared X server.
 
-## FIX: Explicit cleanup of X11 residue after compositor teardown
+### Disproved: root-property residue cleanup
 
-**Implemented 2026-08-28.**
+The proposed `xprop -root -remove GAMESCOPECTRL_BASELAYER_WINDOW` cleanup was tested on
+2026-08-29 and did **not** prevent the crash. Both Azahar runs completed, the third Cemu
+launch began with the property already at `0`, yet Steam OOMed 55 seconds after Cemu started:
 
-The fix is to explicitly delete `GAMESCOPECTRL_BASELAYER_WINDOW` from the root window of
-the parent display (`:1`) after the nested compositor terminates. This clears steamcompmgr's
-base-layer tracking before the next game launches, preventing the collision.
+    00:38:03  Cemu nested compositor starts on :1
+    00:38:58  Steam: OUT OF MEMORY
 
-### Implementation
+The Cemu session was still active when Steam restarted; the later nested-Xwayland
+`ConfigureWindow`/`ChangeProperty` errors were a consequence of Steam killing the session,
+not the precursor. The cleanup was removed: the property is gamescope-owned state, not
+evidence of an SDSS-owned stale resource.
 
-**File:** `host/src/sdss/session.py`
+### Capture-backend feasibility
 
-1. Added `Session._clear_x11_residue(parent_display: str)` static method (lines ~435-460):
-   - Runs `xprop -root -remove GAMESCOPECTRL_BASELAYER_WINDOW` via shell
-   - 5-second timeout to prevent hanging
-   - Fallback to setting the property to 0 if -remove is not available
-   - Catches and logs failures (does not crash teardown)
+Sunshine's `capture = x11` backend selects an XRandR monitor, not an individual X11
+window. The Steam Machine's parent Xwayland exposes only its 2560x1440 `gamescope`
+output, while the GamePad is a separate `HEADLESS-1` output in nested sway. It therefore
+cannot replace `capture = wlr` without streaming the wrong desktop. `kms` likewise cannot
+capture the nested virtual output because it has no DRM connector.
 
-2. Call site in `cleanup()` (lines ~565-570):
-   ```python
-   if not uses_native_sway:
-       _, parent = runtime.parent_display()
-       self._clear_x11_residue(parent)
-   ```
-   - Runs after compositor teardown completes
-   - Only when using X11 backend (gamescope's per-game Xwayland)
-   - Skipped for native sway sessions (no shared collision)
+A transient-user-service experiment was also disproved on 2026-08-29. Its fixed service
+name collided with the next launch while its previous instance was still shutting down;
+the next session then tore down its compositor and left Sunshine connected to the vanished
+socket, causing Moonlight error 503. The experiment was reverted rather than weakening
+the per-session capture lifecycle.
 
-### Testing methodology
+### Confirmed: Sunshine capture is required for the Steam failure
 
-To validate the fix on hardware:
+On 2026-08-29, a clean reboot was followed by several Steam-launched SDSS emulator runs
+with `SDSS_DISABLE_SUNSHINE=1`. Nested sway, the Steam launch tree, and the emulator
+wrappers were unchanged; only the Deck stream was disabled. Steam did not reproduce either
+the allocator OOM or stalled-pipe crash. The normal wrapper was restored immediately after
+the control. This confirms that Sunshine's `wlr` capture/encoding path, rather than the
+nested compositor alone, is a necessary condition for the observed Steam UI failure.
 
-1. **Reboot the Steam Machine** to get a pristine `:1` Xwayland
-2. **Launch first game** (any emulator, any ROM) — should be clean
-   - Watch RSS in `journalctl --user --since "-5 min" -f | grep -E "OUT OF|RSS"`
-   - Expect: flat RSS for the entire session (no growth)
-3. **Exit cleanly via Steam UI**, wait for `cleanup: compositor teardown done` in journal
-4. **Launch second game with different appid** — this is the critical test
-   - Before fix: RAM ramps ~65 MB/s, OOM in 20s
-   - After fix: RSS should stay flat (no collision, no reaper stall)
-5. **Check the cleanup log line** in journal:
-   - `journalctl --user --since "-2 min" | grep "cleared X11 residue"`
-   - Expected on every non-native-sway session
-6. **Repeat with different appid combinations** (same emulator, different ROM; different emulator) to confirm the fix holds
+The next control retains capture but redirects Sunshine's standard output/error to SDSS's
+per-session log rather than Steam's inherited `srt-logger` pipe. This is intentionally not
+a lifecycle change: Sunshine remains a child of the Steam-launched session so it retains
+access to the nested Wayland socket and is reaped with that session.
 
-### Edge cases handled
+That output-redirection control was disproved on 2026-08-29: the same second-Azahar launch
+still crashed Steam. The next control keeps `wlr` capture but uses Sunshine's documented
+`encoder = software` selection, removing VA-API hardware encoding from the pipeline while
+retaining the Deck stream. It is enabled only through the validated
+`SDSS_SUNSHINE_ENCODER=software` diagnostic override.
 
-- **xprop -remove not available**: falls back to setting property to 0 (achieves same effect)
-- **Property already gone**: xprop -remove succeeds on nonexistent properties (no-op)
-- **Timeout during cleanup**: logged and skipped, never blocks teardown (Steam's reaper is released)
-- **Native sway session**: skipped (no shared X server, no collision possible)
+That encoder control was also disproved on 2026-08-29. Sunshine logged
+`encoder = software` and `capture = wlr`, then peaked at 161 MB before Steam's launcher
+reported the same `tier0/memstd.cpp` out-of-memory fatal assertion. Software encoding is
+therefore not a remedy; the shared factor remains the `wlr` capture path or its Steam
+interaction. The production wrappers must not retain the diagnostic override.
 
-### Success criteria
+### Root cause: Sunshine's virtual gamepads (2026-08-30)
 
-All of the following must pass:
-- First launch: flat RSS throughout (~20-30 min gameplay with memory watcher running)
-- Second launch (different appid): flat RSS, no growth, no OOM
-- Multiple successive appid switches: all clean
-- Steam overlay: works throughout all games
-- Journal: contains `cleared X11 residue on :1` entries confirming cleanup ran
+The client/no-client control finally separated the two halves of the streaming path, and
+the result was unambiguous.
+
+**Control — Sunshine running, no Moonlight client.** Several launches across Azahar, Cemu
+and RetroArch. Sunshine started four times, bound `HEADLESS-1`, and initialised VA-API
+(`av1_vaapi`) each time. Steam never faulted. So capture-backend initialisation and
+encoder setup are *not* sufficient to trigger the crash.
+
+**Reproduction — same launches with the Deck connected.** Crashed on the third launch.
+
+A `/proc`-only RSS sampler (2 s interval) over the reproduction showed the 32-bit Steam
+client flat at ~280 MB for a minute, then:
+
+```
+15:50:59    284 MB     <- Sunshine starts for the final session
+15:51:09    879 MB
+15:51:19   1593 MB
+15:51:30   2266 MB
+15:51:40   2931 MB
+15:51:45   ***** OUT OF MEMORY! attempted allocation size: 65 ****
+```
+
+Two things follow from that shape. It is a 40-second explosion, not a slow leak across
+launches — so per-session teardown was never going to fix it. And the fatal allocation is
+65 bytes at ~3.2 GB in a **32-bit** process: this is address-space exhaustion in
+`ubuntu12_32/steam`, not system memory pressure. The machine had gigabytes free.
+
+The mechanism is uinput churn. Sunshine creates a fresh pair of virtual gamepads per
+client connection and destroys them on disconnect:
+
+```
+Aug 30 15:44:20 kernel: input: Sunshine Nintendo (virtual) pad as .../input76
+Aug 30 15:44:20 kernel: input: Sunshine X-Box One (virtual) pad as .../input77
+...
+Aug 30 15:51:04 kernel: input: Sunshine X-Box One (virtual) pad as .../input151
+```
+
+Seventy-five input indices in seven minutes. Steam Input re-enumerates and re-evaluates
+every input device on each hotplug, and the 32-bit client does not return that space.
+Note the unpaired creations at 15:50:05, 15:50:31 and 15:51:04 — those are *client
+connect* events, which is exactly why the no-client control stayed flat.
+
+**Fix:** `gamepad = xone` in the generated Sunshine config.
+
+`xone` rather than `x360` because this build's own auto-selection resolves an Xbox-type
+client to the Xbox One pad ("will be Xbox One controller (default)"), so pinning it changes
+only *when* the pad is created, not which one — and unlike the Xbox 360 pad it carries
+analogue triggers and a guide button, both of which the Deck has. The accepted values were
+read out of the installed build rather than the docs: the binary's own web config bundle
+lists `auto, ds4, ds5, switch, x360, xone` (no `xseries`, which upstream master has since
+added), and an invalid value is silently ignored rather than rejected — pinning a name this
+build does not know would have left `auto` in place with no error anywhere.
+
+The first attempt at this was `controller = disabled`, which did stop the crash but was
+wrong: it also removed the Deck's buttons, triggers and sticks, because the Deck's physical
+controls reach the game *through* Sunshine's virtual pad, not around it. Correlating the
+three log streams shows why that was unnecessary:
+
+```
+15:50:25 SUNSHINE-START
+15:50:25 pad input137     <- probe pad (Nintendo)
+15:50:25 pad input138     <- probe pad (X-Box One)
+15:50:31 pad input141     <- the real pad, created when the client connects
+```
+
+The *paired* pads at each startup are `probe_gamepads()`, which calls
+`supported_gamepads(&platf_input)` and instantiates one throwaway uinput device per
+candidate type just to detect capability. The *single* later pad is the actual controller.
+Left at its `auto` default that probe repeats on every Sunshine start, and SDSS restarts
+Sunshine for every game launch. Naming the type outright skips the probe while leaving
+real controller input untouched.
+
+This also explains why every previous hypothesis failed: teardown bounding, root-property
+cleanup, overlay preload, output redirection and encoder choice all left the probe intact.

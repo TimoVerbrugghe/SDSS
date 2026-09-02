@@ -6,6 +6,7 @@ It captures only sway's headless output and never streams audio — sound stays 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,8 @@ FLATPAK_ID = "dev.lizardbyte.app.Sunshine"
 # Moonlight's CLI takes only a host, with no way to address a custom port, so SDSS owns the
 # default port on the Steam Machine rather than running alongside another Sunshine.
 DEFAULT_PORT = 47989
+SUNSHINE_ENCODER_ENV = "SDSS_SUNSHINE_ENCODER"
+_ENCODERS = frozenset({"software", "vaapi"})
 
 
 @dataclass(frozen=True)
@@ -25,11 +28,16 @@ class SunshineSpec:
     port: int = DEFAULT_PORT
     name: str = "SDSS Second Screen"
     output: str = HEADLESS_OUTPUT
+    encoder: str | None = None
 
 
 def default_spec() -> SunshineSpec:
     """The one Sunshine config location every caller shares."""
-    return SunshineSpec(config_dir=paths.config_dir() / "sunshine")
+    encoder = os.environ.get(SUNSHINE_ENCODER_ENV)
+    if encoder is not None and encoder not in _ENCODERS:
+        supported = ", ".join(sorted(_ENCODERS))
+        raise ValueError(f"{SUNSHINE_ENCODER_ENV} must be one of: {supported}")
+    return SunshineSpec(config_dir=paths.config_dir() / "sunshine", encoder=encoder)
 
 
 def render_conf(spec: SunshineSpec) -> str:
@@ -46,6 +54,23 @@ def render_conf(spec: SunshineSpec) -> str:
         # surfaces anything Sunshine considers an actual problem (warning/error/fatal);
         # only the routine per-launch diagnostic chatter is cut.
         "min_log_level": "warning",
+        # Left at its "auto" default, Sunshine probes gamepad support on every startup by
+        # actually instantiating one virtual pad per candidate type through uinput
+        # ("Sunshine Nintendo (virtual) pad", "Sunshine X-Box One (virtual) pad") and
+        # tearing them down again. SDSS restarts Sunshine for every game launch, so that
+        # probe repeats every launch, and Steam Input re-enumerates every input device on
+        # each hotplug -- verified on hardware, the input index climbed from input34 to
+        # input123 across twelve launches, and the 32-bit Steam client went from ~280 MB
+        # to ~2.9 GB in 40s and died on a 65-byte allocation in tier0/memstd.cpp, which is
+        # address-space exhaustion in a 32-bit process rather than a true system OOM.
+        # Naming the type outright skips the probe entirely: only the single pad an
+        # actually-connected client needs is created, so the Deck keeps full button,
+        # trigger and stick input. "xone" is chosen over "x360" because it is what this
+        # build's own auto-selection resolves to for an Xbox-type client ("will be Xbox One
+        # controller (default)"), so pinning it changes only *when* the pad is created, not
+        # which one -- and unlike the Xbox 360 pad it carries analogue triggers and the
+        # guide button, both of which the Deck has.
+        "gamepad": "xone",
         "origin_web_ui_allowed": "lan",
         # There is no desktop shell in this headless bwrap sandbox for a tray icon to
         # attach to. Left at its "enabled" default, Sunshine still tries to create one on
@@ -62,6 +87,8 @@ def render_conf(spec: SunshineSpec) -> str:
         "credentials_file": str(spec.config_dir / "credentials.json"),
         "file_state": str(spec.config_dir / "state.json"),
     }
+    if spec.encoder is not None:
+        settings["encoder"] = spec.encoder
     return "".join(f"{key} = {value}\n" for key, value in settings.items())
 
 

@@ -1,8 +1,10 @@
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -19,6 +21,28 @@ class TestSunshineConfig(unittest.TestCase):
         conf = stream.render_conf(self.spec)
         self.assertIn("capture = wlr", conf)
         self.assertIn("output_name = HEADLESS-1", conf)
+        self.assertNotIn("encoder =", conf)
+
+    def test_keeps_controller_input_but_skips_the_gamepad_probe(self):
+        """Naming the pad type skips Sunshine's per-startup uinput probe, which Steam
+        Input re-enumerates until the 32-bit Steam client exhausts its address space.
+        Controller input itself must stay on, or the Deck loses buttons and triggers."""
+        conf = stream.render_conf(self.spec)
+        self.assertIn("gamepad = xone", conf)
+        self.assertNotIn("controller = disabled", conf)
+
+    def test_can_force_software_encoding_for_capture_diagnostics(self):
+        spec = stream.SunshineSpec(
+            config_dir=Path(self._tmp.name), encoder="software"
+        )
+        self.assertIn("encoder = software", stream.render_conf(spec))
+
+    def test_rejects_unknown_encoder_diagnostic(self):
+        with self.assertRaisesRegex(ValueError, "SDSS_SUNSHINE_ENCODER"):
+            with mock.patch.dict(
+                os.environ, {"SDSS_SUNSHINE_ENCODER": "unknown"}
+            ):
+                stream.default_spec()
 
     def test_audio_stays_on_the_tv(self):
         self.assertIn("stream_audio = disabled", stream.render_conf(self.spec))
