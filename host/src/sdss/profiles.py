@@ -122,7 +122,6 @@ class Profile:
     second_window: WindowMatch
     configs: tuple[ConfigTarget, ...] = ()
     files: tuple[FileTarget, ...] | Callable[[], tuple[FileTarget, ...]] = ()
-    second_size: tuple[int, int] = (1280, 800)
     notes: str = ""
     verified: bool = False
     # Profiles use nested Xwayland when their toolkit cannot safely use nested Wayland.
@@ -156,13 +155,15 @@ CEMU = Profile(
     files=_cemu_files,
     # Verified on hardware: "GamePad View - FPS: 60.10", class Cemu.
     second_window=WindowMatch(app_id=("Cemu",), title_regex="^GamePad View"),
-    second_size=(854, 480),
     verified=True,
     needs_x11=True,
     launcher_path="~/Applications/Cemu.AppImage",
-    notes="Separate GamePad view renders the Wii U GamePad screen at 854x480. The official "
-    "AppImage has no working GTK Wayland backend (cemu-project/Cemu#1809), so it runs on "
-    "the nested Xwayland.",
+    notes="Separate GamePad view renders the Wii U GamePad screen at 854x480. HEADLESS-1 "
+    "is always sized to the Deck's own panel resolution rather than this native size "
+    "(see compositor.DECK_PANEL_RESOLUTION); Cemu is expected to letterbox internally the "
+    "same way Azahar is confirmed to, though that hasn't been separately verified. The "
+    "official AppImage has no working GTK Wayland backend (cemu-project/Cemu#1809), so it "
+    "runs on the nested Xwayland.",
 )
 
 AZAHAR = Profile(
@@ -192,7 +193,6 @@ AZAHAR = Profile(
     second_window=WindowMatch(
         app_id=("org.azahar_emu.Azahar", "Azahar"), title_regex="Secondary Window$"
     ),
-    second_size=(320, 240),
     verified=True,
     needs_x11=True,
     launch_args=("-f",),
@@ -235,12 +235,15 @@ MELONDS = Profile(
     # The second-window title matcher is not verified on hardware; matching the complete
     # title suffix is safer than moving both indistinguishable melonDS windows to the Deck.
     second_window=WindowMatch(app_id=("melonDS",), title_regex="melonDS.*2"),
-    second_size=(256, 192),
     needs_x11=True,
     launcher_path="~/.local/share/flatpak/exports/bin/net.kuribo64.melonDS",
     launcher_command=("flatpak", "run", "net.kuribo64.melonDS"),
     notes="melonDS 1.x migrates melonDS.ini to melonDS.toml on first save. Like Cemu it "
-    "only maps windows on Xwayland. The second-window title match remains unverified.",
+    "only maps windows on Xwayland. The second-window title match remains unverified. "
+    "HEADLESS-1 is always sized to the Deck's own panel resolution rather than this "
+    "native 256x192 (see compositor.DECK_PANEL_RESOLUTION); melonDS is expected to "
+    "letterbox internally the same way Azahar is confirmed to, though that hasn't been "
+    "separately verified.",
 )
 
 PROFILES: tuple[Profile, ...] = (CEMU, AZAHAR, MELONDS)

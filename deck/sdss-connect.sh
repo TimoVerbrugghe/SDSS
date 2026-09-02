@@ -10,7 +10,11 @@ set -euo pipefail
 
 MOONLIGHT_ID="com.moonlight_stream.Moonlight"
 APP_NAME="Second Screen"
-# The Deck's panel; the host's headless output is configured to match.
+# Moonlight has no server-driven/native resolution mode (only fixed presets or an
+# explicit --resolution), so the client has to be told what size to request. The host
+# always sizes HEADLESS-1 to the Deck's own panel resolution (see
+# sdss.compositor.DECK_PANEL_RESOLUTION), which never varies, so this is a fixed
+# constant rather than something parsed out of the app name.
 RESOLUTION="${SDSS_RESOLUTION:-1280x800}"
 FPS="${SDSS_FPS:-60}"
 
@@ -41,7 +45,7 @@ fi
 # (flatpak-wrapped, slow) producer gets SIGPIPE, and under `pipefail` the status becomes
 # 141 — reporting a genuinely paired host as unpaired.
 apps="$(moonlight list "$host" 2>/dev/null || true)"
-if ! grep -qx "$APP_NAME" <<<"$apps"; then
+if ! grep -qxF "$APP_NAME" <<<"$apps"; then
     echo "host $host is not paired (or the SDSS session is not running)" >&2
     echo "pair first: $(basename "$0") $host --pair 1234" >&2
     exit 1
